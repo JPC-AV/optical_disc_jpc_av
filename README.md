@@ -30,7 +30,7 @@ A professional-grade Python utility for creating bit-perfect ISO backups from op
 
 `makeiso.py` creates archival-quality ISO images from optical discs while simultaneously verifying data integrity. It's designed for digital preservation workflows where verification and documentation are critical.
 
-The script reads directly from the raw device (bypassing filesystem caching) and calculates MD5 checksums during the copy process—eliminating the need for a separate verification pass and reducing total backup time by approximately 50%.
+The script reads directly from the raw device (bypassing filesystem caching) and calculates MD5 checksums during the copy process.
 
 ---
 
