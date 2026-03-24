@@ -1,14 +1,22 @@
-# makeiso.py
+# Optical Disc Preservation & Access Toolkit
 
-**Optical Disc to ISO Backup Utility for macOS**
+**Professional-grade utilities for optical disc archiving on macOS**
 
-A professional-grade Python utility for creating bit-perfect ISO backups from optical discs (CDs, DVDs, Blu-rays) with comprehensive verification, logging, and archival metadata generation.
+This repository contains two Python scripts for a complete optical disc digitization workflow:
+
+| Script | Purpose |
+|--------|---------|
+| **`makeiso.py`** | Creates bit-perfect ISO preservation masters from physical discs |
+| **`makeiso-video.py`** | Converts DVD-Video ISOs to MP4 access copies |
+
+Part of the Johnson Publishing Company Archive (JPCA) digitization initiative—a collaboration between the [Getty Research Institute](https://www.getty.edu/projects/johnson-publishing-company-archive/) and the [Smithsonian National Museum of African American History and Culture](https://www.searchablemuseum.com/johnson-publishing-company-image-power/).
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
+  - [Workflow Summary](#workflow-summary)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
@@ -18,19 +26,18 @@ A professional-grade Python utility for creating bit-perfect ISO backups from op
   - [Step 4: Clone the Repository](#step-4-clone-the-repository)
   - [Step 5: Install Required Tools](#step-5-install-required-tools)
   - [Step 6: Verify Setup](#step-6-verify-everything-is-ready)
-  - [Running the Script](#running-the-script)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-  - [Interactive Mode](#interactive-mode)
-  - [Command Line Options](#command-line-options)
-  - [Examples](#examples)
-- [Workflow](#workflow)
-- [Output Files](#output-files)
-- [Understanding the Output](#understanding-the-output)
-  - [Terminal Output](#terminal-output)
-  - [Progress Display](#progress-display)
-  - [Verification Output](#verification-output)
-  - [Exit Codes](#exit-codes)
+- [makeiso.py — Preservation Master Creation](#makeisopy--preservation-master-creation)
+  - [Quick Start](#quick-start)
+  - [Usage](#usage)
+  - [Workflow](#workflow)
+  - [Output Files](#output-files)
+  - [Understanding the Output](#understanding-the-output)
+- [makeiso-video.py — Access Copy Creation](#makeiso-videopy--access-copy-creation)
+  - [Quick Start](#quick-start-1)
+  - [Usage](#usage-1)
+  - [Disc Type Handling](#disc-type-handling)
+  - [Encoding Defaults](#encoding-defaults)
+  - [Output Files](#output-files-1)
 - [Troubleshooting](#troubleshooting)
 - [Technical Details](#technical-details)
   - [How Verification Works](#how-verification-works)
@@ -43,13 +50,35 @@ A professional-grade Python utility for creating bit-perfect ISO backups from op
 
 ## Overview
 
-`makeiso.py` creates archival-quality ISO images from optical discs while simultaneously verifying data integrity. It's designed for digital preservation workflows where verification and documentation are critical.
+This toolkit provides a two-stage workflow for optical disc digitization:
 
-The script reads directly from the raw device (bypassing filesystem caching) and calculates MD5 checksums during the copy process—eliminating the need for a separate verification pass and reducing total backup time by approximately 50%.
+1. **Preservation** (`makeiso.py`) — Create archival ISO images with comprehensive verification and metadata
+2. **Access** (`makeiso-video.py`) — Generate MP4 viewing copies from DVD-Video content
+
+### Workflow Summary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PRESERVATION WORKFLOW                         │
+├─────────────────────────────────────────────────────────────────┤
+│  Physical Disc  →  makeiso.py  →  .iso (preservation master)    │
+│                                    + manifest, log, tree         │
+├─────────────────────────────────────────────────────────────────┤
+│                      ACCESS WORKFLOW                             │
+├─────────────────────────────────────────────────────────────────┤
+│  .iso file  →  makeiso-video.py  →  .mp4 (access copy)          │
+│                                       + manifest, log            │
+│                                                                  │
+│     ~75-80% of discs: DVD-Video → MP4 conversion                │
+│     ~20-25% of discs: Skipped (data/audio/other)                │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Features
+
+### makeiso.py (Preservation)
 
 - **Bit-perfect copying** — Reads from raw device (`/dev/rdiskN`) for true sector-by-sector backup
 - **Parallel verification** — MD5 checksums calculated simultaneously during ISO creation
@@ -60,24 +89,35 @@ The script reads directly from the raw device (bypassing filesystem caching) and
 - **ISO structural analysis** — Validates ISO 9660/UDF structure via isolyzer
 - **Automatic disc handling** — Unmounts before backup, remounts and ejects after
 
+### makeiso-video.py (Access)
+
+- **Automatic content detection** — Analyzes mounted ISO to detect VIDEO_TS folders
+- **Intelligent skipping** — Gracefully handles non-video discs (data DVDs, photo discs, DVD-Audio)
+- **High-quality output** — Default CRF 18 produces visually lossless MP4 files
+- **Batch processing** — Process entire directories of ISOs with a single command
+- **Checksum verification** — MD5 hash of output for integrity verification
+- **Comprehensive logging** — Detailed logs and JSON manifests matching preservation conventions
+
 ---
 
 ## Requirements
 
 ### System
-- **macOS** (uses `diskutil` for disc management)
+- **macOS** (uses `diskutil` and `hdiutil` for disc/image management)
 - **Python 3.7+** (uses dataclasses, f-strings, type hints)
-- **sudo privileges** (required for raw device access)
+- **sudo privileges** (required for raw device access in `makeiso.py`)
 
 ### Dependencies
 
 **Included with macOS (no action needed):**
 - `diskutil` — Disc management
+- `hdiutil` — ISO mounting
 - `dd` — Raw device copying
 
 **Installed during setup (see [Installation](#installation)):**
 - `tree` — Generates directory listings
 - `isolyzer` — ISO structural analysis (optional but recommended)
+- `ffmpeg` — Video conversion (required for `makeiso-video.py`)
 
 ---
 
@@ -226,7 +266,7 @@ Then enter the project folder:
 cd optical_disc_jpc_av
 ```
 
-> **Note:** This is where the *script* lives, not where your backups will be saved. When you run `makeiso.py`, it will ask you to specify an output directory for the ISO files—that can be anywhere you like (e.g., an external drive, a NAS, `~/Backups/`, etc.).
+> **Note:** This is where the *scripts* live, not where your backups will be saved. When you run the scripts, they will ask you to specify an output directory—that can be anywhere you like (e.g., an external drive, a NAS, `~/Backups/`, etc.).
 
 ### Step 5: Install Required Tools
 
@@ -238,6 +278,12 @@ brew install tree
 ```
 `tree` generates directory listings of the disc contents before backup.
 
+**Install ffmpeg** (using Homebrew):
+```bash
+brew install ffmpeg
+```
+`ffmpeg` is required for `makeiso-video.py` to convert VIDEO_TS content to MP4.
+
 **Install isolyzer** (using pip):
 ```bash
 pip install isolyzer
@@ -245,7 +291,7 @@ pip install isolyzer
 
 > **What is pip?** `pip` is Python's package installer—it downloads and installs Python libraries from the internet. It was automatically installed when you installed Python 3 in Step 2. When your virtual environment is active, `pip install` puts packages into your `venv/lib/` folder, keeping them isolated from other projects.
 
-> **Note:** `isolyzer` is optional but recommended. It validates the structure of the created ISO file. The script will work without it, but ISO structural validation will be skipped.
+> **Note:** `isolyzer` is optional but recommended. It validates the structure of the created ISO file. `makeiso.py` will work without it, but ISO structural validation will be skipped.
 
 ### Step 6: Verify Everything is Ready
 
@@ -256,47 +302,47 @@ python3 --version
 # Check tree
 tree --version
 
+# Check ffmpeg
+ffmpeg -version
+
 # Check isolyzer
 isolyzer --version
 ```
 
 If all commands return version information, you're ready to go!
 
-### Running the Script
-
-**Important:** Always activate your virtual environment before running the script:
-
-```bash
-# Activate virtual environment (from anywhere)
-source ~/venv/bin/activate
-
-# Navigate to the project folder
-cd ~/Documents/optical_disc_jpc_av
-
-# Run the script (requires sudo for disc access)
-sudo python3 makeiso.py
-```
-
-> **Why `sudo`?** The script needs administrator privileges to read directly from the optical drive hardware. You'll be prompted for your Mac password.
-
 ---
 
-## Quick Start
+## makeiso.py — Preservation Master Creation
+
+Creates archival-quality ISO images from optical discs while simultaneously verifying data integrity. Designed for digital preservation workflows where verification and documentation are critical.
+
+The script reads directly from the raw device (bypassing filesystem caching) and calculates MD5 checksums during the copy process—eliminating the need for a separate verification pass and reducing total backup time by approximately 50%.
+
+### Quick Start
 
 1. Insert an optical disc
-2. Run the script with sudo:
+2. Activate your virtual environment:
+   ```bash
+   source ~/venv/bin/activate
+   ```
+3. Navigate to the project folder:
+   ```bash
+   cd ~/github/optical_disc_jpc_av
+   ```
+4. Run the script with sudo:
    ```bash
    sudo python3 makeiso.py
    ```
-3. Follow the prompts to select the disc and specify output location
-4. Wait for the backup to complete
-5. Find your ISO and documentation files in the output directory
+5. Follow the prompts to select the disc and specify output location
+6. Wait for the backup to complete
+7. Find your ISO and documentation files in the output directory
 
----
+> **Why `sudo`?** The script needs administrator privileges to read directly from the optical drive hardware. You'll be prompted for your Mac password.
 
-## Usage
+### Usage
 
-### Interactive Mode
+#### Interactive Mode
 
 Running without arguments launches interactive mode, which prompts for all required information:
 
@@ -311,7 +357,7 @@ The script will:
 4. Prompt for output filename and directory
 5. Prompt for operator name/initials
 
-### Command Line Options
+#### Command Line Options
 
 ```
 sudo python3 makeiso.py [options]
@@ -325,7 +371,7 @@ Options:
   --operator NAME         Operator name or initials for logging
 ```
 
-### Examples
+#### Examples
 
 **Fully interactive:**
 ```bash
@@ -347,73 +393,67 @@ sudo python3 makeiso.py --dry-run
 sudo python3 makeiso.py --operator ABC --dir ~/ISO_Archive
 ```
 
----
-
-## Workflow
+### Workflow
 
 The script executes the following steps:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  1. INITIALIZATION                                          │
-│     • Display available disks                               │
-│     • Collect user inputs (disk ID, filename, etc.)         │
-│     • Validate disk exists and is optical media             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  1. INITIALIZATION                                              │
+│     • Display available disks                                   │
+│     • Collect user inputs (disk ID, filename, etc.)             │
+│     • Validate disk exists and is optical media                 │
+└─────────────────────────────────────────────────────────────────┘
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│  2. TREE LISTING                                            │
-│     • Generate directory structure of mounted volume        │
-│     • Save to {filename}_tree.txt                           │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  2. TREE LISTING                                                │
+│     • Generate directory structure of mounted volume            │
+│     • Save to {filename}_tree.txt                               │
+└─────────────────────────────────────────────────────────────────┘
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│  3. UNMOUNT                                                 │
-│     • Safely unmount disc (required for raw access)         │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  3. UNMOUNT                                                     │
+│     • Safely unmount disc (required for raw access)             │
+└─────────────────────────────────────────────────────────────────┘
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│  4. ISO CREATION + VERIFICATION (parallel)                  │
-│     • Read from raw device (/dev/rdiskN)                    │
-│     • Write to ISO file                                     │
-│     • Calculate MD5 of written data                         │
-│     • Calculate MD5 of source stream                        │
-│     • Display real-time progress                            │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  4. ISO CREATION + VERIFICATION (parallel)                      │
+│     • Read from raw device (/dev/rdiskN)                        │
+│     • Write to ISO file                                         │
+│     • Calculate MD5 of written data                             │
+│     • Calculate MD5 of source stream                            │
+│     • Display real-time progress                                │
+└─────────────────────────────────────────────────────────────────┘
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│  5. STRUCTURAL ANALYSIS                                     │
-│     • Run isolyzer on created ISO                           │
-│     • Validate ISO 9660 / UDF structure                     │
-│     • Save raw XML to {filename}_isolyzer.xml               │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  5. STRUCTURAL ANALYSIS                                         │
+│     • Run isolyzer on created ISO                               │
+│     • Validate ISO 9660 / UDF structure                         │
+│     • Save raw XML to {filename}_isolyzer.xml                   │
+└─────────────────────────────────────────────────────────────────┘
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│  6. FINALIZATION                                            │
-│     • Remount disc                                          │
-│     • Eject disc                                            │
-│     • Generate formatted log file                           │
-│     • Generate JSON manifest                                │
-│     • Display summary                                       │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  6. FINALIZATION                                                │
+│     • Remount disc                                              │
+│     • Eject disc                                                │
+│     • Generate formatted log file                               │
+│     • Generate JSON manifest                                    │
+│     • Display summary                                           │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
----
+### Output Files
 
-## Output Files
-
-For a backup with filename `MyDisc`, the script creates a directory containing:
+For a backup with filename `JPC_AV_00001`, the script creates a directory containing:
 
 ```
-~/Backups/MyDisc/
-├── MyDisc.iso              # The ISO image
-├── MyDisc.iso.log.txt      # Human-readable operation log
-├── MyDisc_manifest.json    # Machine-readable metadata
-├── MyDisc_tree.txt         # Directory listing of source disc
-└── MyDisc_isolyzer.xml     # Raw ISO structural analysis
+~/Backups/JPC_AV_00001/
+├── JPC_AV_00001.iso              # The ISO image (preservation master)
+├── JPC_AV_00001.iso.log.txt      # Human-readable operation log
+├── JPC_AV_00001_manifest.json    # Machine-readable metadata
+├── JPC_AV_00001_tree.txt         # Directory listing of source disc
+└── JPC_AV_00001_isolyzer.xml     # Raw ISO structural analysis
 ```
-
-### File Descriptions
 
 | File | Purpose |
 |------|---------|
@@ -423,11 +463,9 @@ For a backup with filename `MyDisc`, the script creates a directory containing:
 | `*_tree.txt` | Complete directory listing with file sizes, permissions, and dates |
 | `*_isolyzer.xml` | ISO 9660/UDF structural validation from isolyzer tool |
 
----
+### Understanding the Output
 
-## Understanding the Output
-
-### Terminal Output
+#### Terminal Output
 
 During execution, you'll see color-coded status updates:
 
@@ -437,7 +475,7 @@ During execution, you'll see color-coded status updates:
 - 🟢 **Green** — Success messages
 - 🔴 **Red** — Errors
 
-### Progress Display
+#### Progress Display
 
 ```
 ISO Creation: 2048MB / 4096MB
@@ -446,7 +484,7 @@ Remaining: 0:01:24
 Avg Speed: 24.67MB/s
 ```
 
-### Verification Output
+#### Verification Output
 
 ```
 MD5 (ISO):      a1b2c3d4e5f6...
@@ -454,7 +492,7 @@ MD5 (Raw Disk): a1b2c3d4e5f6...
 Checksum match: ISO is a true bit-for-bit copy.
 ```
 
-### Exit Codes
+#### Exit Codes
 
 | Code | Meaning |
 |------|---------|
@@ -464,22 +502,222 @@ Checksum match: ISO is a true bit-for-bit copy.
 
 ---
 
+## makeiso-video.py — Access Copy Creation
+
+Converts DVD-Video content from ISO preservation files to MP4 access copies. Designed to work with the output from `makeiso.py` and handles the common case where ~75-80% of archived optical discs contain standard VIDEO_TS DVD-Video structures.
+
+### Quick Start
+
+1. Activate your virtual environment:
+   ```bash
+   source ~/venv/bin/activate
+   ```
+2. Navigate to the project folder:
+   ```bash
+   cd ~/github/optical_disc_jpc_av
+   ```
+3. Run the script:
+   ```bash
+   python3 makeiso-video.py -i /path/to/JPC_AV_00001.iso --operator JD
+   ```
+4. Find your MP4 in `access_JPC_AV_00001/` alongside the original ISO
+
+> **Note:** Unlike `makeiso.py`, this script does **not** require `sudo` because it reads from ISO files rather than raw hardware devices.
+
+### Usage
+
+#### Running with No Arguments
+
+Running with no arguments displays a brief usage message:
+
+```bash
+python3 makeiso-video.py
+```
+
+```
+MAKEISO-VIDEO - ISO TO MP4 ACCESS COPY UTILITY
+
+Usage:
+  python3 makeiso-video.py -i <iso_file> [options]
+  python3 makeiso-video.py --batch <directory> [options]
+
+Required (one of):
+  -i, --iso PATH    Path to ISO file
+  --batch PATH      Process all ISOs in directory
+
+Run python3 makeiso-video.py --help for full options.
+```
+
+#### Command Line Options
+
+```
+python3 makeiso-video.py [options]
+
+Required (one of):
+  -i, --iso PATH          Path to ISO file
+  --batch PATH            Process all ISOs in directory
+
+Output Options:
+  -o, --output PATH       Output directory (default: same directory as ISO)
+  --operator NAME         Operator name or initials
+
+Encoding Options:
+  --crf N                 Quality (0-51, default: 18 = visually lossless)
+                          CRF stands for Constant Rate Factor
+  
+  --preset NAME           Encoding speed (default: medium)
+                          ultrafast/fast/medium/slow/veryslow
+  
+  --audio-bitrate RATE    Audio bitrate (default: 192k)
+
+  CRF vs Preset:
+
+  CRF controls the target quality level. It tells the encoder "make the output
+  look this good" and lets the file size be whatever it needs to be to achieve
+  that quality. Lower CRF = higher quality = larger file.
+
+  Preset controls the encoding efficiency (how hard the encoder works to
+  compress). At the same CRF, a slower preset will produce a smaller file
+  because it spends more CPU time finding better compression opportunities.
+  A faster preset produces a larger file at the same visual quality because
+  it takes shortcuts.
+
+  Think of it this way: CRF sets the destination (quality), preset determines
+  how efficiently you get there (time vs. file size tradeoff).
+
+  Example: CRF 18 with --preset ultrafast might produce a 2GB file in 10
+  minutes. CRF 18 with --preset veryslow might produce a 1.4GB file in 2 hours.
+  Both look identical—the slow one just found more compression opportunities.
+
+Other Options:
+  -h, --help              Show help message
+  -n, --dry-run           Analyze without converting
+```
+
+#### Examples
+
+**Convert single ISO (output to same directory):**
+```bash
+python3 makeiso-video.py -i /path/to/JPC_AV_00001.iso --operator JD
+# Creates: /path/to/access_JPC_AV_00001/JPC_AV_00001.mp4
+```
+
+**Convert with custom output location:**
+```bash
+python3 makeiso-video.py -i disc.iso -o /path/to/access_copies --operator JD
+```
+
+**Batch convert all ISOs in a directory:**
+```bash
+python3 makeiso-video.py --batch /path/to/isos --operator JD
+```
+
+**Preview without converting (dry run):**
+```bash
+python3 makeiso-video.py -i disc.iso -n
+```
+
+**Higher quality, slower encoding:**
+```bash
+python3 makeiso-video.py -i disc.iso --crf 16 --preset slow --operator JD
+```
+
+### Disc Type Handling
+
+The script automatically detects disc content and handles different types appropriately:
+
+| Disc Type | Action | Notes |
+|-----------|--------|-------|
+| DVD-Video (VIDEO_TS) | ✅ Converted | Standard DVD movies/video content |
+| DVD-Audio (AUDIO_TS) | ⏭️ Skipped | Requires specialized audio extraction |
+| Data DVD | ⏭️ Skipped | Use file copy instead |
+| Photo/Image DVD | ⏭️ Skipped | Use file copy instead |
+| Empty/Unreadable | ⏭️ Skipped | Verify ISO integrity |
+
+Skipped discs generate a `*_skip_manifest.json` documenting why the disc was skipped.
+
+### Encoding Defaults
+
+The default encoding settings are optimized for archival access copies:
+
+| Setting | Default Value | Description |
+|---------|---------------|-------------|
+| **Video Codec** | libx264 (H.264) | Industry-standard, excellent compatibility |
+| **CRF Quality** | 18 | Visually lossless quality |
+| **Preset** | medium | Balanced speed/compression |
+| **Pixel Format** | yuv420p | Maximum compatibility |
+| **Audio Codec** | AAC | Standard audio codec |
+| **Audio Bitrate** | 192 kbps | High quality stereo audio |
+| **Container** | MP4 | Universal playback support |
+| **Faststart** | enabled | Enables streaming/seeking |
+
+#### CRF Quality Guide
+
+| CRF Value | Quality Level | Typical Use Case |
+|-----------|---------------|------------------|
+| 0 | Lossless | Archival masters (huge files) |
+| 16 | Near-lossless | High-end preservation |
+| **18** | **Visually lossless** | **Default — recommended for access** |
+| 23 | Good quality | General purpose |
+| 28 | Acceptable | Space-constrained |
+
+#### Preset Speed/Size Tradeoff
+
+| Preset | Speed | File Size | Use Case |
+|--------|-------|-----------|----------|
+| ultrafast | Fastest | Largest | Quick previews |
+| fast | Fast | Larger | Time-sensitive |
+| **medium** | **Balanced** | **Balanced** | **Default** |
+| slow | Slow | Smaller | Best compression |
+| veryslow | Slowest | Smallest | Maximum compression |
+
+### Output Files
+
+For a successfully converted ISO, the script creates:
+
+```
+/path/to/isos/
+├── JPC_AV_00001.iso                        # Original preservation ISO
+├── JPC_AV_00001/                           # Preservation metadata folder
+│   ├── JPC_AV_00001_manifest.json
+│   └── ...
+└── access_JPC_AV_00001/                    # Access copy folder
+    ├── JPC_AV_00001.mp4                    # The access copy
+    ├── JPC_AV_00001.mp4.log.txt            # Detailed conversion log
+    └── JPC_AV_00001_access_manifest.json   # JSON metadata
+```
+
+For skipped ISOs (non-VIDEO_TS content):
+
+```
+/path/to/isos/
+├── data_disc.iso
+└── access_JPC_AV_data_disc/
+    └── data_disc_skip_manifest.json        # Documents why disc was skipped
+```
+
+---
+
 ## Troubleshooting
 
-### "This script must be run with sudo"
+### General Issues
 
-Raw device access requires root privileges:
+#### "This script must be run with sudo"
+
+Raw device access requires root privileges (for `makeiso.py` only):
 ```bash
 sudo python3 makeiso.py
 ```
 
-### "Could not get disk info for diskN"
+#### "Could not get disk info for diskN"
 
 - Verify the disc is inserted and recognized
 - Check disk ID with `diskutil list`
 - Ensure you're using the correct disk identifier (e.g., `disk2`, not `disk2s1`)
 
-### "isolyzer not found"
+### makeiso.py Issues
+
+#### "isolyzer not found"
 
 Install isolyzer for ISO structural analysis:
 ```bash
@@ -487,20 +725,20 @@ pip install isolyzer
 ```
 The script will still work without it, but structural validation will be skipped.
 
-### "tree: command not found"
+#### "tree: command not found"
 
 Install tree for directory listings:
 ```bash
 brew install tree
 ```
 
-### Slow backup speed
+#### Slow backup speed
 
 - External USB 2.0 drives are limited to ~30 MB/s
 - USB 3.0 or Thunderbolt drives will be faster
 - Damaged discs may cause slowdowns due to read retries
 
-### Checksum mismatch
+#### Checksum mismatch
 
 This indicates the ISO is **not** identical to the source disc. Possible causes:
 - Disc read errors (scratches, degradation)
@@ -509,13 +747,46 @@ This indicates the ISO is **not** identical to the source disc. Possible causes:
 
 **Recommendation:** Re-run the backup. If mismatches persist, inspect the disc for physical damage.
 
+### makeiso-video.py Issues
+
+#### "ffmpeg not found"
+
+Install ffmpeg using Homebrew:
+```bash
+brew install ffmpeg
+```
+
+#### ISO won't mount
+
+1. Check ISO integrity: `hdiutil verify /path/to/disc.iso`
+2. Try mounting manually: `hdiutil attach /path/to/disc.iso`
+3. Verify the ISO was created correctly with `makeiso.py`
+
+#### Conversion fails partway through
+
+1. Check available disk space
+2. Verify ISO integrity
+3. Try with `-n` (dry run) first to analyze content
+4. Check the log file for detailed error messages
+
+#### Poor video quality
+
+Adjust encoding settings:
+```bash
+# Lower CRF = higher quality (and larger files)
+python3 makeiso-video.py -i disc.iso --crf 16
+
+# Slower preset = better compression at same quality
+python3 makeiso-video.py -i disc.iso --preset slow
+```
+
 ---
 
 ## Technical Details
 
 ### How Verification Works
 
-The script uses **parallel hash calculation** during the copy process:
+`makeiso.py` uses **parallel hash calculation** during the copy process:
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -540,7 +811,7 @@ This ensures both hashes are calculated from the same data stream in a single pa
 
 ### Manifest Structure
 
-The JSON manifest includes:
+The JSON manifest (`*_manifest.json`) includes:
 
 - `backup_metadata` — Run ID, UUID, timestamps, operator
 - `backup_status` — Success/failure, verification results
@@ -554,11 +825,20 @@ The JSON manifest includes:
 - `system_environment` — OS, Python version, hostname
 - `quality_assurance` — Verification levels and recommendations
 
+The access manifest (`*_access_manifest.json`) includes similar metadata plus:
+
+- `encoding_settings` — Video/audio codec, CRF, preset
+- `disc_analysis` — VIDEO_TS detection results, VOB file inventory
+- `video_technical_info` — Resolution, frame rate, duration
+- `archival_notes` — Purpose, preservation relationship
+
 ### Supported Media Types
 
 - CD-ROM / CD-R / CD-RW
 - DVD-ROM / DVD±R / DVD±RW
 - BD-ROM / BD-R / BD-RE (Blu-ray)
+
+For `makeiso-video.py`, only DVD-Video discs with VIDEO_TS folders are converted to MP4. Other disc types are detected and skipped with documentation.
 
 ---
 
