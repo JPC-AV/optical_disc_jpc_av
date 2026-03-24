@@ -1213,9 +1213,9 @@ def print_help():
   {colorize('green', '--operator NAME')}         Operator name or initials
 
 {colorize('yellow', 'ENCODING OPTIONS:')}
-  {colorize('green', '--crf N')}                 Quality (0-51, default: 18 = visually lossless)
-  {colorize('green', '--preset NAME')}           Encoding speed (ultrafast/fast/medium/slow/veryslow)
-  {colorize('green', '--audio-bitrate RATE')}    Audio bitrate (default: 192k)
+  {colorize('green', '--crf N')}                 Quality (0-51, script default: 18 = visually lossless)
+  {colorize('green', '--preset NAME')}           Encoding speed (ultrafast/fast/medium/slow/veryslow, script default: medium)
+  {colorize('green', '--audio-bitrate RATE')}    Audio bitrate (script default: 192k)
 
 {colorize('yellow', 'OTHER OPTIONS:')}
   {colorize('green', '-h, --help')}              Show this help message
@@ -1240,8 +1240,8 @@ def print_help():
 
 {colorize('yellow', 'CRF QUALITY GUIDE:')}
   0  = Lossless (huge file)
-  18 = Visually lossless (recommended)
-  23 = Default quality
+  18 = Visually lossless (script default)
+  23 = ffmpeg default (not this script's default)
   28 = Smaller file, some quality loss
 
 {colorize('yellow', 'DISC TYPES HANDLED:')}
