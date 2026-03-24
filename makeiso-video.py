@@ -424,6 +424,24 @@ class ISOToMP4Converter:
         self.start_time = datetime.datetime.now()
         mem_handler.clear()
         
+        # If a directory was passed, look for a single ISO inside it
+        if self.config.iso_path.is_dir():
+            iso_files = list(self.config.iso_path.glob("*.iso"))
+            if len(iso_files) == 1:
+                log(colorize("yellow", f"Directory provided — using ISO found inside: {iso_files[0].name}"))
+                self.config.iso_path = iso_files[0]
+            elif len(iso_files) == 0:
+                return ConversionResult(
+                    success=False,
+                    error_message=f"Directory provided but no .iso file found inside: {self.config.iso_path}"
+                )
+            else:
+                iso_list = ", ".join(f.name for f in iso_files)
+                return ConversionResult(
+                    success=False,
+                    error_message=f"Directory provided but multiple .iso files found — please specify one directly: {iso_list}"
+                )
+
         # Validate ISO exists
         if not self.config.iso_path.exists():
             return ConversionResult(
@@ -737,9 +755,9 @@ class ISOToMP4Converter:
         log_divider("Summary")
         
         log(colorize("cyan", f"Source ISO: {result.iso_path.name}"))
-        log(colorize("cyan", f"Output MP4: {result.mp4_path.name}"))
+        log(colorize("cyan", f"Output MP4: {result.mp4_path.name if result.mp4_path else 'N/A'}"))
         log(colorize("cyan", f"Source size: {format_bytes(result.source_size)}"))
-        log(colorize("cyan", f"Output size: {format_bytes(result.output_size)}"))
+        log(colorize("cyan", f"Output size: {format_bytes(result.output_size) if result.output_size else 'N/A'}"))
         
         if result.compression_ratio:
             log(colorize("cyan", f"Compression ratio: {result.compression_ratio}:1"))
@@ -799,9 +817,9 @@ class ISOToMP4Converter:
             
             f.write("OUTPUT INFORMATION\n")
             f.write("-" * 20 + "\n")
-            f.write(f"MP4 File:         {result.mp4_path.name}\n")
-            f.write(f"MP4 Path:         {result.mp4_path}\n")
-            f.write(f"MP4 Size:         {format_bytes(result.output_size)}\n")
+            f.write(f"MP4 File:         {result.mp4_path.name if result.mp4_path else 'N/A (conversion did not complete)'}\n")
+            f.write(f"MP4 Path:         {result.mp4_path if result.mp4_path else 'N/A'}\n")
+            f.write(f"MP4 Size:         {format_bytes(result.output_size) if result.output_size else 'N/A'}\n")
             
             if result.video_duration:
                 f.write(f"Duration:         {format_timecode(result.video_duration)}\n")
