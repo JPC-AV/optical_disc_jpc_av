@@ -1376,6 +1376,21 @@ def main():
     
     # Single file mode
     iso_path = Path(args.iso).expanduser()
+
+    # If a directory was passed, look for a single ISO inside it
+    if iso_path.is_dir():
+        iso_files = list(iso_path.glob("*.iso"))
+        if len(iso_files) == 1:
+            log(colorize("yellow", f"Directory provided — using ISO found inside: {iso_files[0].name}"))
+            iso_path = iso_files[0]
+        elif len(iso_files) == 0:
+            log(colorize("red", f"Error: Directory provided but no .iso file found inside: {iso_path}"))
+            sys.exit(1)
+        else:
+            iso_list = ", ".join(f.name for f in iso_files)
+            log(colorize("red", f"Error: Multiple .iso files found — please specify one directly: {iso_list}"))
+            sys.exit(1)
+
     if not iso_path.exists():
         log(colorize("red", f"Error: ISO file not found: {iso_path}"))
         sys.exit(1)
