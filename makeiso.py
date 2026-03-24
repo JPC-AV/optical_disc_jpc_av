@@ -425,6 +425,15 @@ class OpticalDiscBackup:
         # Create output directory
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Fix ownership — since we're running under sudo, the dir would be owned
+        # by root. Chown it back to the real user so other scripts can write into it.
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            try:
+                subprocess.run(["chown", "-R", sudo_user, str(self.config.output_dir)], check=True)
+            except subprocess.CalledProcessError as e:
+                log(colorize("yellow", f"Warning: Could not set ownership of output directory: {e}"))
+        
         # Generate tree listing (this is the first divider after user inputs)
         self._generate_tree_listing()
         
