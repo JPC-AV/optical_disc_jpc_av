@@ -175,14 +175,6 @@ def run_cmd(cmd: List[str], capture_output: bool = True, plist: bool = False) ->
         result = subprocess.run(cmd, capture_output=capture_output, text=True, check=True)
         return result.stdout
 
-def save_clean_log(log_path: Path, mem_handler: MemoryLogHandler):
-    """Save log buffer to file with ANSI codes removed and better formatting"""
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    
-    with open(log_path, "w") as f:
-        # Skip the raw log entries - we'll create a formatted version instead
-        pass
-
 ### === FORMATTED LOG WITH ISOLYZER ===
 
 def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult, 
@@ -346,38 +338,21 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         if disk_info:
             f.write("DETAILED DISK METADATA\n")
             f.write("-" * 25 + "\n")
-            # Format the diskutil info more readably
-            key_fields = [
-                ('Device Identifier', 'Device Identifier'),
-                ('Device / Media Name', 'Drive Model'),
-                ('Optical Drive Type', 'Drive Capabilities'),
-                ('Protocol', 'Connection'),
-                ('Disk Size', 'Physical Size'),
-                ('Volume Total Space', 'Volume Capacity'),
-                ('Volume Used Space', 'Used Space'),
-                ('File System Personality', 'File System'),
-                ('Media Read-Only', 'Read-Only Status'),
-                ('Optical Media Erasable', 'Erasable')
-            ]
             
-            # Extract and clean diskutil info
-            diskutil_text = ""
-            for entry in mem_handler.buffer:
-                if " - Full diskutil info:" in entry:
-                    # Found the start, capture subsequent lines
-                    continue
-                if " - " in entry and entry.split(" - ", 1)[1].startswith("  "):
-                    line = entry.split(" - ", 1)[1].strip()
-                    # Only include meaningful lines
-                    if ":" in line and line:
-                        key, value = line.split(":", 1)
-                        key = key.strip()
-                        value = value.strip()
-                        
-                        # Find matching display name
-                        display_name = next((display for orig, display in key_fields if orig == key), None)
-                        if display_name:
-                            f.write(f"{display_name:20} {value}\n")
+            def fmt_field(label: str, value) -> None:
+                if value not in (None, '', 'Unknown'):
+                    f.write(f"{label:20} {value}\n")
+            
+            fmt_field("Device Identifier", disk_info.get('DeviceIdentifier'))
+            fmt_field("Drive Model",        disk_info.get('MediaName', disk_info.get('IORegistryEntryName')))
+            fmt_field("Drive Capabilities", disk_info.get('OpticalDeviceType'))
+            fmt_field("Connection",         disk_info.get('BusProtocol'))
+            fmt_field("Physical Size",      disk_info.get('TotalSize'))
+            fmt_field("Volume Capacity",    disk_info.get('VolumeSize'))
+            fmt_field("Used Space",         disk_info.get('VolumeSize'))
+            fmt_field("File System",        disk_info.get('FilesystemName', disk_info.get('FilesystemType')))
+            fmt_field("Read-Only Status",   disk_info.get('Writable') is False and 'Yes' or 'No')
+            fmt_field("Erasable",           'Yes' if disk_info.get('OpticalMediaErasable') else 'No')
             f.write("\n")
         
         # === FOOTER ===
@@ -831,8 +806,6 @@ class OpticalDiscBackup:
     
     def _create_manifest(self, result: BackupResult, disk_info: Dict[str, Any], iso_analysis: Dict[str, Any]):
         """Create comprehensive manifest file with improved organization"""
-        from uuid import uuid4
-        
         # Get current timestamp
         now = datetime.datetime.now()
         
@@ -1250,14 +1223,6 @@ class OpticalDiscBackup:
         except Exception as e:
             return {"error": str(e)}
     
-    def _get_log_preview(self) -> List[str]:
-        """Get preview of log tail"""
-        try:
-            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-            return [ansi_escape.sub('', entry.split(' - ', 1)[1]) for entry in mem_handler.buffer[-10:]]
-        except Exception as e:
-            return [f"Log preview error: {str(e)}"]
-
 ### === HELPER FUNCTIONS ===
 
 def get_volume_name(disk_id: str) -> str:

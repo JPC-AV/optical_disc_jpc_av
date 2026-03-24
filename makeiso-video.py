@@ -10,7 +10,6 @@ Smithsonian National Museum of African American History and Culture.
 """
 
 import subprocess
-import os
 import sys
 import datetime
 import time
@@ -20,8 +19,6 @@ import platform
 import argparse
 import json
 import logging
-import tempfile
-import shutil
 import plistlib
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
@@ -892,7 +889,7 @@ class ISOToMP4Converter:
             
             "source_iso": {
                 "filename": result.iso_path.name if result.iso_path else None,
-                "full_path": str(result.iso_path) if result.iso_path else None,
+                "origin_path": str(result.iso_path) if result.iso_path else None,
                 "size_bytes": result.source_size,
                 "size_formatted": format_bytes(result.source_size)
             },
@@ -910,7 +907,7 @@ class ISOToMP4Converter:
             
             "output_mp4": {
                 "filename": result.mp4_path.name if result.mp4_path else None,
-                "full_path": str(result.mp4_path) if result.mp4_path else None,
+                "origin_path": str(result.mp4_path) if result.mp4_path else None,
                 "size_bytes": result.output_size,
                 "size_formatted": format_bytes(result.output_size),
                 "duration_seconds": result.video_duration,
@@ -992,7 +989,7 @@ class ISOToMP4Converter:
             
             "source_iso": {
                 "filename": result.iso_path.name if result.iso_path else None,
-                "full_path": str(result.iso_path) if result.iso_path else None,
+                "origin_path": str(result.iso_path) if result.iso_path else None,
                 "size_bytes": result.source_size,
                 "size_formatted": format_bytes(result.source_size)
             },
@@ -1041,7 +1038,7 @@ class ISOToMP4Converter:
             
             "source_iso": {
                 "filename": result.iso_path.name if result.iso_path else None,
-                "full_path": str(result.iso_path) if result.iso_path else None,
+                "origin_path": str(result.iso_path) if result.iso_path else None,
                 "size_bytes": result.source_size,
                 "size_formatted": format_bytes(result.source_size)
             },
