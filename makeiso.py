@@ -782,7 +782,18 @@ class OpticalDiscBackup:
             # Compile warnings
             warnings = []
             if not tests.get('size_as_expected', True):
-                warnings.append(f"File size differs from expected by {tests.get('size_difference', 0)} bytes")
+                size_diff = tests.get('size_difference', 0)
+                sectors = tests.get('size_difference_sectors', 0)
+                if tests.get('smaller_than_expected', False):
+                    warnings.append(
+                        f"File size is smaller than expected by {size_diff} bytes ({sectors} sectors). "
+                        f"This may indicate a truncated read — verify the ISO carefully before use."
+                    )
+                else:
+                    warnings.append(
+                        f"File size is {size_diff} bytes ({sectors} sectors) larger than the filesystem declares. "
+                        f"This is normal for optical media — extra sectors are lead-out/padding and do not indicate data loss."
+                    )
             
             # Build result
             result = {
