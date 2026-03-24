@@ -186,7 +186,8 @@ def save_clean_log(log_path: Path, mem_handler: MemoryLogHandler):
 ### === FORMATTED LOG WITH ISOLYZER ===
 
 def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult, 
-                        start_time: datetime.datetime, disk_info: Dict[str, Any]):
+                        start_time: datetime.datetime, disk_info: Dict[str, Any],
+                        iso_analysis: Dict[str, Any] = None):
     """Create a properly formatted log file"""
     
     def format_duration(seconds: float) -> str:
@@ -299,35 +300,30 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
             f.write(f"  Tool:    isolyzer\n")
             f.write(f"  Output:  {config.isolyzer_path.name}\n")
             
-            # Try to extract test results from the buffer for the log
-            test_results = {}
-            for entry in mem_handler.buffer:
-                if " - " in entry:
-                    line = entry.split(" - ", 1)[1].strip()
-                    if line.startswith("  Contains Known File System:"):
-                        test_results["contains_known_filesystem"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("  Expected Size:"):
-                        test_results["expected_size"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("  Actual Size:"):
-                        test_results["actual_size"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("  Size Difference:"):
-                        test_results["size_difference"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("  Size as Expected:"):
-                        test_results["size_as_expected"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("  Smaller Than Expected:"):
-                        test_results["smaller_than_expected"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("  Valid ISO 9660:"):
-                        test_results["valid_iso9660"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("  Contains UDF:"):
-                        test_results["contains_udf"] = line.split(":", 1)[1].strip()
-            
-            # Add test results to log if available
-            if test_results:
+            if iso_analysis and 'error' not in iso_analysis:
                 f.write("  Results:\n")
-                for key, value in test_results.items():
-                    # Convert key to more readable format
-                    label = key.replace("_", " ").title()
-                    f.write(f"    {label}: {value}\n")
+                f.write(f"    Contains Known File System: {iso_analysis.get('contains_known_filesystem', 'Unknown')}\n")
+                f.write(f"    Valid ISO 9660:             {iso_analysis.get('valid_iso9660', 'Unknown')}\n")
+                f.write(f"    Contains UDF:               {iso_analysis.get('has_udf', 'Unknown')}\n")
+                f.write(f"    Expected Size:              {iso_analysis.get('size_expected', 0)} bytes\n")
+                f.write(f"    Actual Size:                {iso_analysis.get('size_actual', 0)} bytes\n")
+                f.write(f"    Size Difference:            {iso_analysis.get('size_difference_bytes', 0)} bytes ({iso_analysis.get('size_difference_sectors', 0)} sectors)\n")
+                f.write(f"    Size as Expected:           {iso_analysis.get('size_as_expected', 'Unknown')}\n")
+                f.write(f"    Smaller Than Expected:      {iso_analysis.get('smaller_than_expected', 'Unknown')}\n")
+                
+                # Contextual size difference note
+                size_diff = iso_analysis.get('size_difference_bytes', 0)
+                smaller = iso_analysis.get('smaller_than_expected', False)
+                size_as_expected = iso_analysis.get('size_as_expected', True)
+                
+                if size_as_expected:
+                    f.write(f"  Size check: ISO size matches expected size exactly.\n")
+                elif smaller:
+                    f.write(f"  Size check: WARNING — ISO is smaller than expected by {size_diff} bytes.\n")
+                    f.write(f"  This may indicate a truncated read. Verify the ISO carefully before use.\n")
+                else:
+                    f.write(f"  Size check: ISO is {size_diff} bytes ({iso_analysis.get('size_difference_sectors', 0)} sectors) larger than the filesystem declares.\n")
+                    f.write(f"  This is normal for optical media — extra sectors are lead-out/padding and do not indicate data loss.\n")
             
             f.write("  Status:  Complete\n\n")
         
@@ -469,7 +465,7 @@ class OpticalDiscBackup:
         self._generate_summary(result)
         
         # Save formatted log with all the details
-        create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info)
+        create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info, iso_analysis)
         
         self._create_manifest(result, disk_info, iso_analysis)
         
@@ -1156,10 +1152,19 @@ class OpticalDiscBackup:
             log(colorize("cyan", "  Valid ISO 9660:") + " " + colorize("yellow", str(analysis.get('valid_iso9660', 'Unknown'))))
             log(colorize("cyan", "  Contains UDF:") + " " + colorize("yellow", str(analysis.get('has_udf', 'Unknown'))))
             
-            # Show any warnings or issues
-            if analysis.get('warnings'):
-                for warning in analysis['warnings']:
-                    log(colorize("yellow", f"Warning: {warning}"))
+            # Show size difference note / warning
+            size_diff = analysis.get('size_difference_bytes', 0)
+            smaller = analysis.get('smaller_than_expected', False)
+            size_as_expected = analysis.get('size_as_expected', True)
+
+            if size_as_expected:
+                log(colorize("green", "  Size check: ISO size matches expected size exactly."))
+            elif smaller:
+                log(colorize("red",    f"  Size check: WARNING — ISO is smaller than expected by {size_diff} bytes ({analysis.get('size_difference_sectors', 0)} sectors)."))
+                log(colorize("red",    "  This may indicate a truncated read. Verify the ISO carefully before use."))
+            else:
+                log(colorize("yellow", f"  Size check: ISO is {size_diff} bytes ({analysis.get('size_difference_sectors', 0)} sectors) larger than the filesystem declares."))
+                log(colorize("yellow",  "  This is normal for optical media — extra sectors are lead-out/padding and do not indicate data loss."))
             
             return analysis
             
@@ -1215,15 +1220,21 @@ class OpticalDiscBackup:
             with open(self.config.tree_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
                 for line in reversed(lines):
-                    if line.strip().startswith("Total") and "directories" in line:
-                        match = re.search(r"(\d+)\s+directories,\s+(\d+)\s+files,\s+(.+)", line.strip())
+                    stripped = line.strip()
+                    if "directories" in stripped and "files" in stripped:
+                        # Matches both formats:
+                        #   "X used in N directories, M files"  (tree --si)
+                        #   "Total: N directories, M files, X"  (tree default)
+                        match = re.search(r"(\d+)\s+directories,\s+(\d+)\s+files", stripped)
+                        size_match = re.search(r"([\d.]+\s*\w+)\s+used in", stripped)
                         if match:
-                            return {
+                            result = {
                                 "total_directories": int(match.group(1)),
                                 "total_files": int(match.group(2)),
-                                "reported_size": match.group(3)
                             }
-                        break
+                            if size_match:
+                                result["reported_size"] = size_match.group(1)
+                            return result
             return {}
         except Exception as e:
             return {"error": str(e)}
