@@ -634,6 +634,26 @@ The script automatically detects disc content and handles different types approp
 
 Skipped discs generate a `*_skip_manifest.json` documenting why the disc was skipped.
 
+### Menu VOBs Are Intentionally Excluded
+
+> **Note:** During conversion you will see output like:
+> ```
+> Skipping 1 menu VOB(s):
+>   - VIDEO_TS.VOB (menu VOB, 8.0 KB)
+> Including 2 content VOB(s):
+>   + VTS_01_1.VOB (1024.0 MB)
+>   + VTS_01_2.VOB (833.2 MB)
+> ```
+> This is expected and correct behavior — not an error.
+
+DVD-Video discs contain two categories of VOB files:
+
+- **Menu VOBs** (`VIDEO_TS.VOB`, `VTS_*_0.VOB`) — contain interactive navigation data: button layouts, highlight graphics, menu audio loops, and DVD player commands. This data is designed to be driven by a DVD player's menu system and cannot be included in a linear MP4 stream. Attempting to include it causes ffmpeg errors or corrupted output.
+
+- **Content VOBs** (`VTS_*_1.VOB`, `VTS_*_2.VOB`, etc.) — contain the actual linear video content: everything you would see by pressing Play All on the disc.
+
+The script automatically skips menu VOBs and concatenates only the content VOBs. **No video content is lost.** The full disc — including all menu structure, navigation data, logos, and interactive elements — remains intact in the preservation ISO, which can be mounted on any computer to experience the disc exactly as originally authored, menus and all.
+
 ### Encoding Defaults
 
 The default encoding settings are optimized for archival access copies:
