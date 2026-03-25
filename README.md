@@ -104,7 +104,7 @@ This toolkit provides a two-stage workflow for optical disc digitization:
 
 ### System
 - **macOS** (uses `diskutil` and `hdiutil` for disc/image management)
-- **Python 3.7+** (uses dataclasses, f-strings, type hints)
+- **Python 3.9+** (uses dataclasses, f-strings, type hints)
 - **sudo privileges** (required for raw device access in `makeiso.py`)
 
 ### Dependencies
@@ -164,9 +164,7 @@ If you see `command not found` or a version older than 3.9, install Python:
 brew install python
 ```
 
-> **How does this work?** Running `brew install python` automatically installs the latest stable version of Python 3 that Homebrew supports. Homebrew may lag slightly behind the newest Python release, but it will always install a recent, maintained version.
->
-> As of this README (January 2025), the latest Python version is **3.14.2** (released December 5, 2025). Homebrew will install this or a very recent version.
+> **How does this work?** Running `brew install python` automatically installs the latest stable version of Python 3 that Homebrew supports. It will always install a recent, maintained version.
 
 Verify the installation:
 
@@ -174,7 +172,7 @@ Verify the installation:
 python3 --version
 ```
 
-You should see something like `Python 3.13.x` or higher.
+You should see `Python 3.9.x` or higher.
 
 ### Step 3: Set Up a Python Virtual Environment (Recommended)
 
@@ -365,7 +363,7 @@ sudo python3 makeiso.py [options]
 Options:
   -h, --help              Show help message and exit
   --dry-run               Run without creating ISO (test mode)
-  --no-verification       Skip MD5 checksum verification
+  --no-verification       Skip recording of MD5 verification results (checksums are still calculated during creation)
   --filename NAME         ISO filename (without .iso extension)
   --dir PATH              Output directory (supports ~)
   --operator NAME         Operator name or initials for logging
@@ -843,6 +841,8 @@ For `makeiso-video.py`, only DVD-Video discs with VIDEO_TS folders are converted
 ---
 
 ## License
+
+MIT License — use freely for any purpose, with or without attribution.
 
 This project is part of the Johnson Publishing Company Archive (JPCA) digitization and preservation initiative, a collaboration between the [Getty Research Institute (GRI)](https://www.getty.edu/projects/johnson-publishing-company-archive/) and the [Smithsonian National Museum of African American History and Culture (NMAAHC)](https://www.searchablemuseum.com/johnson-publishing-company-image-power/).
 
