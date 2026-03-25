@@ -101,48 +101,22 @@ def colorize(color: str, text: str) -> str:
 
 ### === LOGGING SETUP ===
 
-class MemoryLogHandler(logging.Handler):
-    """Log handler that stores messages in memory for later file output"""
-    def __init__(self):
-        super().__init__()
-        self.buffer = []
-    
-    def emit(self, record):
-        now = datetime.datetime.now()
-        timestamp = now.strftime('%Y-%m-%dT%H:%M:%S') + f".{now.microsecond // 1000:03d}"
-        msg = self.format(record)
-        self.buffer.append(f"{timestamp} - {msg}")
-
-def setup_logging() -> Tuple[logging.Logger, MemoryLogHandler]:
-    """Setup dual logging - console and memory buffer"""
+def setup_logging() -> logging.Logger:
+    """Setup console logging"""
     logger = logging.getLogger("iso_backup")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    
-    # Console handler
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(logging.Formatter('%(message)s'))
     logger.addHandler(stream_handler)
-    
-    # Memory handler for clean file output
-    mem_handler = MemoryLogHandler()
-    mem_handler.setFormatter(logging.Formatter('%(message)s'))
-    logger.addHandler(mem_handler)
-    
-    return logger, mem_handler
+    return logger
 
 # Global logger instance
-logger, mem_handler = setup_logging()
+logger = setup_logging()
 
 def log(msg: str):
-    """Log a message to console and memory buffer"""
+    """Log a message to console"""
     logger.info(msg)
-
-def log_to_file_only(msg: str):
-    """Log a message only to the log file (memory buffer), not console"""
-    now = datetime.datetime.now()
-    timestamp = now.strftime('%Y-%m-%dT%H:%M:%S') + f".{now.microsecond // 1000:03d}"
-    mem_handler.buffer.append(f"{timestamp} - {msg}")
 
 def log_divider(title: Optional[str] = None):
     """Log a divider with optional title"""
@@ -177,15 +151,40 @@ def run_cmd(cmd: List[str], capture_output: bool = True, plist: bool = False) ->
 
 ### === FORMATTED LOG WITH ISOLYZER ===
 
+def format_duration(seconds: float) -> str:
+    """Format duration as human-readable string"""
+    if seconds == 0:
+        return "0 seconds"
+    minutes = int(seconds) // 60
+    remaining_seconds = round(seconds % 60, 2)
+    if minutes > 0:
+        return f"{minutes}m {remaining_seconds:.2f}s"
+    return f"{remaining_seconds:.2f}s"
+
+def format_bytes(bytes_val: int) -> str:
+    """Format bytes as human-readable size (1024-based, e.g. 1.5 GB)"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes_val < 1024.0:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.1f} TB"
+
+def fmt_diskutil_size(bytes_val: int, total_bytes: int = None) -> str:
+    """Format bytes in diskutil verbose style (1000-based GB, with byte count and optional %)"""
+    if not bytes_val:
+        return None
+    gb = bytes_val / (1000 ** 3)
+    units_512 = bytes_val // 512
+    result = f"{gb:.1f} GB ({bytes_val} Bytes) (exactly {units_512} 512-Byte-Units)"
+    if total_bytes:
+        pct = (bytes_val / total_bytes) * 100
+        result += f" ({pct:.1f}%)"
+    return result
+
 def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult, 
                         start_time: datetime.datetime, disk_info: Dict[str, Any],
                         iso_analysis: Dict[str, Any] = None):
     """Create a properly formatted log file"""
-    
-    def format_duration(seconds: float) -> str:
-        minutes = int(seconds) // 60
-        remaining_seconds = round(seconds % 60, 2)
-        return f"{minutes}m {remaining_seconds}s"
     
     end_time = datetime.datetime.now()
     total_duration = (end_time - start_time).total_seconds()
@@ -214,27 +213,9 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"Disk ID:          {config.disk_id}\n")
         f.write(f"Volume Name:      {config.volume_name}\n")
         f.write(f"Volume Size:      {result.disk_size / (1024 * 1024):.0f} MB ({result.disk_size / (1024 * 1024 * 1024):.1f} GB)\n")
-        
-        # Extract info from the logged metadata since disk_info might be empty here
-        # Parse from the detailed metadata that we know exists
-        media_type = "Unknown"
-        filesystem = "Unknown" 
-        device_name = "Unknown"
-        
-        # Look through the memory buffer for diskutil info
-        for entry in mem_handler.buffer:
-            if " - " in entry:
-                line = entry.split(" - ", 1)[1].strip()
-                if "Optical Media Type:" in line:
-                    media_type = line.split(":", 1)[1].strip()
-                elif "File System Personality:" in line:
-                    filesystem = line.split(":", 1)[1].strip()
-                elif "Device / Media Name:" in line:
-                    device_name = line.split(":", 1)[1].strip()
-        
-        f.write(f"Media Type:       {media_type}\n")
-        f.write(f"File System:      {filesystem}\n")
-        f.write(f"Device:           {device_name}\n")
+        f.write(f"Media Type:       {disk_info.get('OpticalMediaType', 'Unknown')}\n")
+        f.write(f"File System:      {disk_info.get('FilesystemName', disk_info.get('FilesystemType', 'Unknown'))}\n")
+        f.write(f"Device:           {disk_info.get('MediaName', disk_info.get('IORegistryEntryName', 'Unknown'))}\n")
         f.write("\n")
         
         # === OUTPUT FILES ===
@@ -345,13 +326,16 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
             
             fmt_field("Device Identifier", disk_info.get('DeviceIdentifier'))
             fmt_field("Drive Model",        disk_info.get('MediaName', disk_info.get('IORegistryEntryName')))
-            fmt_field("Drive Capabilities", disk_info.get('OpticalDeviceType'))
-            fmt_field("Connection",         disk_info.get('BusProtocol'))
-            fmt_field("Physical Size",      disk_info.get('TotalSize'))
-            fmt_field("Volume Capacity",    disk_info.get('VolumeSize'))
-            fmt_field("Used Space",         disk_info.get('VolumeSize'))
             fmt_field("File System",        disk_info.get('FilesystemName', disk_info.get('FilesystemType')))
-            fmt_field("Read-Only Status",   disk_info.get('Writable') is False and 'Yes' or 'No')
+            fmt_field("Connection",         disk_info.get('BusProtocol'))
+            # Physical Size = actual ISO/disc size; TotalSize in plist returns volume size on optical media
+            physical_size = result.iso_path.stat().st_size if result.iso_path.exists() else disk_info.get('TotalSize')
+            volume_size = disk_info.get('TotalSize')
+            fmt_field("Physical Size",      fmt_diskutil_size(physical_size))
+            fmt_field("Volume Capacity",    fmt_diskutil_size(volume_size))
+            fmt_field("Used Space",         fmt_diskutil_size(volume_size, physical_size))
+            fmt_field("Read-Only Status",   'Yes' if disk_info.get('Writable') is False else 'No')
+            fmt_field("Drive Capabilities", disk_info.get('OpticalDeviceType'))
             fmt_field("Erasable",           'Yes' if disk_info.get('OpticalMediaErasable') else 'No')
             f.write("\n")
         
@@ -385,9 +369,6 @@ class OpticalDiscBackup:
             return BackupResult(False, self.config.output_path, 0, error_message=f"Could not get disk info for {self.config.disk_id}")
         
         disk_size = disk_info.get("TotalSize", 0)
-        
-        # Log metadata (will only appear in log file, not terminal)
-        self._log_metadata(disk_info)
         
         # Check for existing file
         if self.config.output_path.exists() and not self._confirm_overwrite():
@@ -453,28 +434,6 @@ class OpticalDiscBackup:
         except subprocess.CalledProcessError as e:
             log(colorize("red", f"Failed to get disk info: {e}"))
             return {}
-    
-    def _log_metadata(self, disk_info: Dict[str, Any]):
-        """Log metadata only to log file (not terminal)"""
-        log_to_file_only(f"Operator: {self.config.operator}")
-        log_to_file_only(f"Disk ID: {self.config.disk_id}")
-        log_to_file_only(f"Volume name: {self.config.volume_name}")
-        log_to_file_only(f"ISO filename: {self.config.output_path.name}")
-        log_to_file_only(f"Start time: {datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}")
-        log_to_file_only("System metadata:")
-        for key, value in [
-            ("OS", platform.system()),
-            ("OS Version", platform.version()),
-            ("Release", platform.release()),
-            ("Machine", platform.machine()),
-            ("Processor", platform.processor()),
-            ("Python Version", platform.python_version())
-        ]:
-            log_to_file_only(f"  {key}: {value}")
-        log_to_file_only("Full diskutil info:")
-        diskutil_output = run_cmd(["diskutil", "info", self.config.disk_id])
-        for line in diskutil_output.strip().splitlines():
-            log_to_file_only(f"  {line}")
     
     def _confirm_overwrite(self) -> bool:
         """Confirm file overwrite"""
@@ -622,11 +581,6 @@ class OpticalDiscBackup:
         """Generate timing summary"""
         log_divider("Summary")
         if not self.config.dry_run:
-            def format_duration(seconds: float) -> str:
-                minutes = int(seconds) // 60
-                remaining_seconds = round(seconds % 60, 2)
-                return f"{minutes} minutes, {remaining_seconds:.2f} seconds"
-            
             elapsed = result.creation_time
             speed = result.speed_mb_s(elapsed)
             log(colorize("cyan", "Time to create + verify:") + " " + colorize("yellow", f"{elapsed:.2f} seconds") +
@@ -675,11 +629,10 @@ class OpticalDiscBackup:
                     'success': self._get_xml_text(status_element, 'iso:success', ns) == 'True'
                 }
             
-            # Tests - THIS IS THE KEY SECTION TO FIX
+            # Tests
             tests = {}
             tests_element = image.find('iso:tests', ns)
             if tests_element is not None:
-                # Properly parse all test values
                 contains_known_fs_text = self._get_xml_text(tests_element, 'iso:containsKnownFileSystem', ns)
                 size_expected_text = self._get_xml_text(tests_element, 'iso:sizeExpected', ns)
                 size_actual_text = self._get_xml_text(tests_element, 'iso:sizeActual', ns)
@@ -720,9 +673,6 @@ class OpticalDiscBackup:
                     'smaller_than_expected': smaller_than_expected_text == 'True'
                 }
                 
-                # Log the extracted values for debugging
-                log_to_file_only(f"Extracted from isolyzer XML - size_expected: {size_expected}, size_actual: {size_actual}")
-            
             # File systems
             filesystems = []
             fs_elements = image.findall('iso:fileSystems/iso:fileSystem', ns)
@@ -813,14 +763,6 @@ class OpticalDiscBackup:
         tree_summary = self._extract_tree_summary()
         
         # Calculate additional metrics
-        def format_bytes(bytes_val):
-            """Format bytes in human readable format"""
-            for unit in ['B', 'KB', 'MB', 'GB']:
-                if bytes_val < 1024.0:
-                    return f"{bytes_val:.1f} {unit}"
-                bytes_val /= 1024.0
-            return f"{bytes_val:.1f} TB"
-        
         # Get ISO file size
         iso_file_size = result.iso_path.stat().st_size if result.iso_path.exists() else None
         
@@ -911,7 +853,7 @@ class OpticalDiscBackup:
             "timing_performance": {
                 "iso_creation": {
                     "duration_seconds": result.creation_time,
-                    "duration_formatted": self._format_duration(result.creation_time),
+                    "duration_formatted": format_duration(result.creation_time),
                     "average_speed_mb_s": result.speed_mb_s(result.creation_time),
                     "average_speed_formatted": f"{result.speed_mb_s(result.creation_time):.2f} MB/s"
                 },
@@ -922,7 +864,7 @@ class OpticalDiscBackup:
                 },
                 "total_operation": {
                     "duration_seconds": result.creation_time,
-                    "duration_formatted": self._format_duration(result.creation_time),
+                    "duration_formatted": format_duration(result.creation_time),
                     "efficiency_note": "~50% time savings vs sequential read/verify operations"
                 }
             },
@@ -1187,17 +1129,6 @@ class OpticalDiscBackup:
             log(colorize("red", f"Unexpected error during ISO analysis: {e}"))
             return {"error": str(e), "error_type": "parsing_failed"}
         
-    def _format_duration(self, seconds: float) -> str:
-        """Format duration in human readable format"""
-        if seconds == 0:
-            return "0 seconds"
-        minutes = int(seconds) // 60
-        remaining_seconds = round(seconds % 60, 2)
-        if minutes > 0:
-            return f"{minutes} minutes, {remaining_seconds:.2f} seconds"
-        else:
-            return f"{remaining_seconds:.2f} seconds"
-    
     def _extract_tree_summary(self) -> Dict[str, Any]:
         """Extract summary from tree listing"""
         try:
