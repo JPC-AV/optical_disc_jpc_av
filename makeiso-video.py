@@ -45,17 +45,6 @@ class ConversionConfig:
         return self.iso_path.stem
     
     @property
-    def access_dir_name(self) -> str:
-        """Generate access directory name: access_JPC_AV_<id>"""
-        # Extract ID from filename (assumes format like JPC_AV_00001 or similar)
-        # If filename already starts with JPC_AV_, use as-is; otherwise prefix
-        name = self.iso_name
-        if name.upper().startswith("JPC_AV_"):
-            return f"access_{name}"
-        else:
-            return f"access_JPC_AV_{name}"
-    
-    @property
     def mp4_path(self) -> Path:
         return self.output_dir / f"{self.iso_name}.mp4"
     
@@ -133,52 +122,22 @@ def colorize(color: str, text: str) -> str:
 
 ### === LOGGING SETUP ===
 
-class MemoryLogHandler(logging.Handler):
-    """Log handler that stores messages in memory for later file output"""
-    def __init__(self):
-        super().__init__()
-        self.buffer: List[str] = []
-    
-    def emit(self, record):
-        now = datetime.datetime.now()
-        timestamp = now.strftime('%Y-%m-%dT%H:%M:%S') + f".{now.microsecond // 1000:03d}"
-        msg = self.format(record)
-        self.buffer.append(f"{timestamp} - {msg}")
-    
-    def clear(self):
-        """Clear the buffer"""
-        self.buffer.clear()
-
-def setup_logging() -> Tuple[logging.Logger, MemoryLogHandler]:
-    """Setup dual logging - console and memory buffer"""
+def setup_logging() -> logging.Logger:
+    """Setup console logging"""
     logger = logging.getLogger("iso_to_mp4")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    
-    # Console handler
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(logging.Formatter('%(message)s'))
     logger.addHandler(stream_handler)
-    
-    # Memory handler for clean file output
-    mem_handler = MemoryLogHandler()
-    mem_handler.setFormatter(logging.Formatter('%(message)s'))
-    logger.addHandler(mem_handler)
-    
-    return logger, mem_handler
+    return logger
 
 # Global logger instance
-logger, mem_handler = setup_logging()
+logger = setup_logging()
 
 def log(msg: str):
-    """Log a message to console and memory buffer"""
+    """Log a message to console"""
     logger.info(msg)
-
-def log_to_file_only(msg: str):
-    """Log a message only to the log file (memory buffer), not console"""
-    now = datetime.datetime.now()
-    timestamp = now.strftime('%Y-%m-%dT%H:%M:%S') + f".{now.microsecond // 1000:03d}"
-    mem_handler.buffer.append(f"{timestamp} - {msg}")
 
 def log_divider(title: Optional[str] = None):
     """Log a divider with optional title"""
@@ -419,26 +378,7 @@ class ISOToMP4Converter:
     def convert(self) -> ConversionResult:
         """Main entry point for conversion"""
         self.start_time = datetime.datetime.now()
-        mem_handler.clear()
         
-        # If a directory was passed, look for a single ISO inside it
-        if self.config.iso_path.is_dir():
-            iso_files = list(self.config.iso_path.glob("*.iso"))
-            if len(iso_files) == 1:
-                log(colorize("yellow", f"Directory provided — using ISO found inside: {iso_files[0].name}"))
-                self.config.iso_path = iso_files[0]
-            elif len(iso_files) == 0:
-                return ConversionResult(
-                    success=False,
-                    error_message=f"Directory provided but no .iso file found inside: {self.config.iso_path}"
-                )
-            else:
-                iso_list = ", ".join(f.name for f in iso_files)
-                return ConversionResult(
-                    success=False,
-                    error_message=f"Directory provided but multiple .iso files found — please specify one directly: {iso_list}"
-                )
-
         # Validate ISO exists
         if not self.config.iso_path.exists():
             return ConversionResult(
@@ -551,7 +491,7 @@ class ISOToMP4Converter:
             
             # Log VOB files to file only
             for vob in analysis.vob_files:
-                log_to_file_only(f"  VOB: {vob.name} ({format_bytes(vob.stat().st_size)})")
+                log(colorize("cyan", f"  VOB: {vob.name} ({format_bytes(vob.stat().st_size)})"))
         
         if analysis.ifo_files:
             log(colorize("cyan", f"IFO files found: {len(analysis.ifo_files)}"))
@@ -584,10 +524,6 @@ class ISOToMP4Converter:
         """Perform the actual VIDEO_TS to MP4 conversion"""
         log_divider("Converting VIDEO_TS to MP4")
         
-        video_ts_path = analysis.mount_point / "VIDEO_TS"
-        
-        # Build ffmpeg command
-        # Use concat demuxer with VIDEO_TS folder input
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",  # Overwrite output
@@ -1123,6 +1059,13 @@ class ISOToMP4Converter:
 
 ### === BATCH PROCESSING ===
 
+def _access_dir_name(iso_path: Path) -> str:
+    """Return the access directory name for a given ISO path"""
+    name = iso_path.stem
+    if name.upper().startswith("JPC_AV_"):
+        return f"access_{name}"
+    return f"access_JPC_AV_{name}"
+
 def process_batch(iso_dir: Path, output_dir: Path, operator: str, 
                   dry_run: bool = False, **encoding_kwargs) -> Dict[str, Any]:
     """Process multiple ISOs in a directory"""
@@ -1149,18 +1092,12 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
     for i, iso_path in enumerate(iso_files, 1):
         log_divider(f"Processing {i}/{len(iso_files)}: {iso_path.name}")
         
-        # Build access directory name
-        iso_name = iso_path.stem
-        if iso_name.upper().startswith("JPC_AV_"):
-            access_dir_name = f"access_{iso_name}"
-        else:
-            access_dir_name = f"access_JPC_AV_{iso_name}"
-        
-        # Create config for this ISO
-        # Place access folder next to the source ISO, not at batch root
+        # Create config for this ISO — access folder next to source ISO by default,
+        # or under output_dir if explicitly provided
+        base = output_dir if output_dir != iso_dir else iso_path.parent
         config = ConversionConfig(
             iso_path=iso_path,
-            output_dir=iso_path.parent / access_dir_name,
+            output_dir=base / _access_dir_name(iso_path),
             operator=operator,
             dry_run=dry_run,
             **encoding_kwargs
@@ -1376,7 +1313,7 @@ def main():
 
     # If a directory was passed, look for a single ISO inside it
     if iso_path.is_dir():
-        iso_files = list(iso_path.glob("*.iso"))
+        iso_files = sorted(p for p in iso_path.iterdir() if p.is_file() and p.suffix.lower() == ".iso")
         if len(iso_files) == 1:
             log(colorize("yellow", f"Directory provided — using ISO found inside: {iso_files[0].name}"))
             iso_path = iso_files[0]
@@ -1392,21 +1329,9 @@ def main():
         log(colorize("red", f"Error: ISO file not found: {iso_path}"))
         sys.exit(1)
     
-    # Determine output directory
-    # Default: same directory as ISO, in access_JPC_AV_<id>/ subfolder
-    if args.output:
-        output_base = Path(args.output).expanduser()
-    else:
-        output_base = iso_path.parent
-    
-    # Build the access directory name
-    iso_name = iso_path.stem
-    if iso_name.upper().startswith("JPC_AV_"):
-        access_dir_name = f"access_{iso_name}"
-    else:
-        access_dir_name = f"access_JPC_AV_{iso_name}"
-    
-    output_dir = output_base / access_dir_name
+    # Determine output directory — default: access folder next to the ISO
+    output_base = Path(args.output).expanduser() if args.output else iso_path.parent
+    output_dir = output_base / _access_dir_name(iso_path)
     
     # Create config
     config = ConversionConfig(
