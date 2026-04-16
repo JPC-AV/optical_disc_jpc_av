@@ -34,7 +34,8 @@ class BackupConfig:
     output_dir: Path
     dry_run: bool = False
     no_verification: bool = False
-    
+    media_type: str = "Unknown"
+
     @property
     def output_path(self) -> Path:
         return self.output_dir / f"{self.filename}.iso"
@@ -149,6 +150,32 @@ def run_cmd(cmd: List[str], capture_output: bool = True, plist: bool = False) ->
         result = subprocess.run(cmd, capture_output=capture_output, text=True, check=True)
         return result.stdout
 
+def calculate_disc_speed_multiplier(speed_mb_s: float, media_type: str) -> str:
+    """Calculate disc speed as Xx multiplier based on media type.
+
+    Baselines (1x):
+      CD:        150 KB/s  (0.150 MB/s)
+      DVD:     1,385 KB/s  (1.385 MB/s)
+      Blu-ray: 4,500 KB/s  (4.500 MB/s)
+    """
+    BASELINES = {
+        "cd":  0.150,
+        "dvd": 1.385,
+        "bd":  4.500,
+    }
+    media_lower = media_type.lower()
+    if "blu" in media_lower or "bd" in media_lower:
+        baseline = BASELINES["bd"]
+    elif "dvd" in media_lower:
+        baseline = BASELINES["dvd"]
+    else:
+        baseline = BASELINES["cd"]
+
+    if speed_mb_s <= 0:
+        return "N/A"
+    multiplier = speed_mb_s / baseline
+    return f"{multiplier:.1f}x"
+
 ### === FORMATTED LOG WITH ISOLYZER ===
 
 def format_duration(seconds: float) -> str:
@@ -255,7 +282,9 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"  Command: dd if=/dev/r{config.disk_id} of={result.iso_path} bs=4m\n")
         f.write(f"  Method:  Parallel processing (creation + hashing)\n")
         f.write(f"  Duration: {format_duration(result.creation_time)}\n")
-        f.write(f"  Speed:    {result.speed_mb_s(result.creation_time):.2f} MB/s\n")
+        speed = result.speed_mb_s(result.creation_time)
+        multiplier = calculate_disc_speed_multiplier(speed, config.media_type)
+        f.write(f"  Speed:    {speed:.2f} MB/s ({multiplier})\n")
         f.write(f"  Completed: {create_end.strftime('%H:%M:%S')}\n\n")
         
         # Hash verification results
@@ -369,8 +398,7 @@ class OpticalDiscBackup:
             return BackupResult(False, self.config.output_path, 0, error_message=f"Could not get disk info for {self.config.disk_id}")
         
         disk_size = disk_info.get("TotalSize", 0)
-        
-        # Check for existing file
+        self.config.media_type = disk_info.get("OpticalMediaType", "Unknown")
         if self.config.output_path.exists() and not self._confirm_overwrite():
             return BackupResult(False, self.config.output_path, disk_size, error_message="Aborted to avoid overwrite")
         
@@ -583,9 +611,10 @@ class OpticalDiscBackup:
         if not self.config.dry_run:
             elapsed = result.creation_time
             speed = result.speed_mb_s(elapsed)
+            multiplier = calculate_disc_speed_multiplier(speed, self.config.media_type)
             log(colorize("cyan", "Time to create + verify:") + " " + colorize("yellow", f"{elapsed:.2f} seconds") +
                 f" ({format_duration(elapsed)})")
-            log(colorize("cyan", "Average speed:") + " " + colorize("yellow", f"{speed:.2f} MB/s"))
+            log(colorize("cyan", "Average speed:") + " " + colorize("yellow", f"{speed:.2f} MB/s ({multiplier})"))
         else:
             log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "No timing summary available."))
     
@@ -855,7 +884,8 @@ class OpticalDiscBackup:
                     "duration_seconds": result.creation_time,
                     "duration_formatted": format_duration(result.creation_time),
                     "average_speed_mb_s": result.speed_mb_s(result.creation_time),
-                    "average_speed_formatted": f"{result.speed_mb_s(result.creation_time):.2f} MB/s"
+                    "average_speed_formatted": f"{result.speed_mb_s(result.creation_time):.2f} MB/s",
+                    "average_speed_multiplier": calculate_disc_speed_multiplier(result.speed_mb_s(result.creation_time), self.config.media_type)
                 },
                 "verification": {
                     "duration_seconds": 0.0,  # Done in parallel
@@ -1273,12 +1303,14 @@ def gather_user_inputs(args: argparse.Namespace) -> BackupConfig:
     volume_name = get_volume_name(disk_id)
     log(colorize("cyan", "Volume name detected:") + " " + colorize("yellow", volume_name))
     
-    # Get disk info to show volume size
+    # Get disk info to show volume size and media type
     try:
         disk_info = run_cmd(["diskutil", "info", "-plist", f"/dev/{disk_id}"], plist=True)
         disk_size = disk_info.get("TotalSize", 0)
         disk_size_mb = disk_size / (1024 * 1024)
         log(colorize("cyan", "Volume size:") + " " + colorize("yellow", f"{disk_size_mb:.0f} MB"))
+        media_type = disk_info.get("OpticalMediaType", "Unknown")
+        log(colorize("cyan", "Media type:") + " " + colorize("yellow", media_type))
     except:
         pass
     
