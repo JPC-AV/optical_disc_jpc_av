@@ -60,6 +60,18 @@ class ConversionConfig:
     def manifest_path(self) -> Path:
         return self.output_dir / f"{self.iso_name}_access_manifest.json"
 
+    @property
+    def skip_manifest_path(self) -> Path:
+        return self.output_dir / f"{self.iso_name}_skip_manifest.json"
+
+    @property
+    def error_manifest_path(self) -> Path:
+        return self.output_dir / f"{self.iso_name}_error_manifest.json"
+
+    @property
+    def aborted_manifest_path(self) -> Path:
+        return self.output_dir / f"{self.iso_name}_aborted_manifest.json"
+
 @dataclass
 class DiscContentAnalysis:
     """Analysis of ISO content structure"""
@@ -103,6 +115,7 @@ class TitleOutput:
     mapped_video_streams: int = 0
     mapped_audio_streams: int = 0
     error: Optional[str] = None
+    partial_path: Optional[Path] = None  # where a failed/interrupted output was quarantined
 
 @dataclass
 class ConversionResult:
@@ -122,20 +135,39 @@ class ConversionResult:
     skip_reason: Optional[str] = None
     titles: List[TitleOutput] = field(default_factory=list)  # per-titleset outcomes
     warnings: List[str] = field(default_factory=list)        # non-fatal problems (run still valid)
-    
+    aborted: bool = False        # operator declined to proceed (recorded as aborted, not error)
+    interrupted: bool = False    # Ctrl-C mid-run (batch processing stops)
+    records_unsafe: bool = False # record paths themselves are suspect (symlink guard); write nothing
+
     @property
     def compression_ratio(self) -> Optional[float]:
         """Calculate compression ratio (original/compressed)"""
         if self.source_size > 0 and self.output_size > 0:
             return round(self.source_size / self.output_size, 2)
         return None
-    
+
     @property
     def speed_factor(self) -> Optional[float]:
         """Calculate encoding speed relative to realtime"""
         if self.video_duration and self.conversion_time > 0:
             return round(self.video_duration / self.conversion_time, 2)
         return None
+
+@dataclass
+class RunContext:
+    """Identity and step timing for a single conversion run.
+
+    Generated once per run and shared by the log and manifest writers so
+    all records carry the same run_id/uuid and real step timestamps.
+    """
+    run_id: str
+    run_uuid: str
+    start_time: datetime.datetime
+    step_times: Dict[str, datetime.datetime] = field(default_factory=dict)
+
+    def mark(self, step: str):
+        """Record the moment a step actually happened"""
+        self.step_times[step] = datetime.datetime.now()
 
 ### === COLOR UTILITIES ===
 
@@ -423,6 +455,17 @@ def check_ffmpeg() -> Tuple[bool, Optional[str]]:
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False, None
 
+def check_ffprobe() -> Tuple[bool, Optional[str]]:
+    """Check if ffprobe is available and get version"""
+    try:
+        result = run_cmd(["ffprobe", "-version"])
+        first_line = result.stdout.split('\n')[0]
+        version_match = re.search(r'ffprobe version (\S+)', first_line)
+        version = version_match.group(1) if version_match else "unknown"
+        return True, version
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False, None
+
 def get_video_duration(target) -> Optional[float]:
     """Get duration in seconds via ffprobe; target may be a path or a concat: URL"""
     try:
@@ -434,7 +477,7 @@ def get_video_duration(target) -> Optional[float]:
             str(target)
         ])
         return float(result.stdout.strip())
-    except (subprocess.CalledProcessError, ValueError):
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         return None
 
 def probe_expected_duration(vobs: List[Path]) -> Optional[float]:
@@ -476,7 +519,7 @@ def get_video_info(target) -> Dict[str, Any]:
             str(target)
         ])
         return json.loads(result.stdout)
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
         return {}
 
 ### === MAIN CONVERTER CLASS ===
@@ -487,35 +530,97 @@ class ISOToMP4Converter:
     def __init__(self, config: ConversionConfig):
         self.config = config
         self.start_time: Optional[datetime.datetime] = None
-    
+        self.run: Optional[RunContext] = None
+
     def convert(self) -> ConversionResult:
         """Main entry point for conversion"""
         self.start_time = datetime.datetime.now()
-        
+        self.run = RunContext(
+            run_id=f"{self.start_time.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.iso_name}",
+            run_uuid=str(uuid4()),
+            start_time=self.start_time,
+        )
+
+        result = self._convert_inner()
+
+        # Generate records — every processed ISO gets a log and a manifest of
+        # some kind, unless the record paths themselves failed the symlink guard
+        if not result.records_unsafe:
+            if result.success and not result.skipped:
+                self._generate_summary(result)
+                self._create_log_file(result)
+                self._create_manifest(result)
+            elif result.skipped and not result.error_message:
+                self._create_skip_manifest(result)
+                self._create_log_file(result, dry_run=self.config.dry_run)
+            elif result.error_message:
+                self._create_error_manifest(result)
+                self._create_log_file(result, is_error=True)
+
+        return result
+
+    def _check_symlinks(self, paths: List[Path]) -> Optional[str]:
+        """Refuse pre-existing symlinks at planned output paths (writing
+        through one could clobber an arbitrary file elsewhere)"""
+        linked = [p.name for p in paths if p.is_symlink()]
+        if linked:
+            message = f"Symlink at planned output path(s): {', '.join(linked)}"
+            log(colorize("red", f"Refusing to continue: {message}"))
+            return message
+        return None
+
+    def _convert_inner(self) -> ConversionResult:
+        """Conversion flow; every return path gets records via convert()"""
         # Validate ISO exists
         if not self.config.iso_path.exists():
             return ConversionResult(
                 success=False,
+                iso_path=self.config.iso_path,
                 error_message=f"ISO file not found: {self.config.iso_path}"
             )
-        
-        # Check for ffmpeg
+
+        # Dependencies: ffmpeg (encode) AND ffprobe (analysis/verification)
+        # are both required before any disc activity
         ffmpeg_available, ffmpeg_version = check_ffmpeg()
         if not ffmpeg_available:
             return ConversionResult(
                 success=False,
+                iso_path=self.config.iso_path,
                 error_message="ffmpeg not found. Please install ffmpeg."
             )
+        ffprobe_available, _ = check_ffprobe()
+        if not ffprobe_available:
+            return ConversionResult(
+                success=False,
+                iso_path=self.config.iso_path,
+                error_message="ffprobe not found (it ships with ffmpeg). Please install ffmpeg."
+            )
         log(colorize("cyan", f"Using ffmpeg version: {ffmpeg_version}"))
-        
+
+        # Symlink guard, phase 1: statically-known record/output paths.
+        # (Per-title MP4 paths are guarded after titleset planning.)
+        static_paths = [self.config.mp4_path, self.config.log_path,
+                        self.config.dry_run_log_path, self.config.manifest_path,
+                        self.config.skip_manifest_path, self.config.error_manifest_path,
+                        self.config.aborted_manifest_path]
+        symlink_error = self._check_symlinks(static_paths)
+        if symlink_error:
+            return ConversionResult(
+                success=False,
+                iso_path=self.config.iso_path,
+                error_message=symlink_error,
+                records_unsafe=True  # record paths themselves are suspect
+            )
+
         # Get ISO size
         iso_size = self.config.iso_path.stat().st_size
         log(colorize("cyan", f"ISO size: {format_bytes(iso_size)}"))
-        
+
         # Mount and analyze ISO
         log_divider("Mounting ISO")
         result = None
-        
+        self.run.mark("mount")
+
         with ISOMount(self.config.iso_path) as mount_point:
             if not mount_point:
                 result = ConversionResult(
@@ -527,8 +632,9 @@ class ISOToMP4Converter:
             else:
                 # Analyze content
                 log_divider("Analyzing Disc Content")
+                self.run.mark("analyze")
                 analysis = analyze_iso_content(mount_point)
-                
+
                 self._log_analysis(analysis)
                 
                 # Check if this is a VIDEO_TS disc
@@ -558,7 +664,19 @@ class ISOToMP4Converter:
                     existing_outputs = [] if self.config.dry_run else \
                         [p.output_path for p in plans if p.output_path.exists()]
 
-                    if not plans:
+                    # Symlink guard, phase 2: per-title output paths are only
+                    # knowable now that titlesets are planned
+                    output_symlink_error = self._check_symlinks([p.output_path for p in plans])
+
+                    if output_symlink_error:
+                        result = ConversionResult(
+                            success=False,
+                            iso_path=self.config.iso_path,
+                            source_size=iso_size,
+                            disc_analysis=analysis,
+                            error_message=output_symlink_error
+                        )
+                    elif not plans:
                         # Menu-only structure: skip, never convert menus
                         skip_reason = "Menu-only VIDEO_TS structure (no content VOBs)"
                         log(colorize("yellow", f"Skipping: {skip_reason}"))
@@ -576,7 +694,8 @@ class ISOToMP4Converter:
                             iso_path=self.config.iso_path,
                             source_size=iso_size,
                             disc_analysis=analysis,
-                            error_message="Aborted to avoid overwrite"
+                            aborted=True,
+                            error_message="Aborted by operator to avoid overwrite"
                         )
                     elif self.config.dry_run:
                         log(colorize("cyan", "Dry run:") + " " +
@@ -599,19 +718,7 @@ class ISOToMP4Converter:
                         self.config.output_dir.mkdir(parents=True, exist_ok=True)
                         result = self._perform_conversion(analysis, iso_size, plans, unrecognized)
         
-        # Generate outputs (now guaranteed to run for all paths)
-        if result.success and not result.skipped:
-            self._generate_summary(result)
-            self._create_log_file(result)
-            self._create_manifest(result)
-        elif result.skipped and not result.error_message:
-            self._create_skip_manifest(result)
-            if self.config.dry_run:
-                self._create_log_file(result, dry_run=True)
-        elif result.error_message:
-            self._create_error_manifest(result)
-            self._create_log_file(result, is_error=True)
-        
+        self.run.mark("detach")
         return result
     
     def _log_analysis(self, analysis: DiscContentAnalysis):
@@ -713,7 +820,18 @@ class ISOToMP4Converter:
 
             # A failed titleset marks the whole run failed, but remaining
             # titlesets are still attempted so the record is complete.
-            self._encode_titleset(plan, title, result)
+            # Ctrl-C stops here: the interrupted title is recorded as failed
+            # and remaining titlesets stay "not_attempted".
+            if self.run:
+                self.run.mark(f"encode_vts_{plan.vts_number:02d}")
+            try:
+                self._encode_titleset(plan, title, result)
+            except KeyboardInterrupt:
+                result.success = False
+                result.interrupted = True
+                result.conversion_time += title.encode_time
+                log(colorize("red", "Remaining titleset(s) not attempted."))
+                break
             result.conversion_time += title.encode_time
             if title.status != "completed":
                 result.success = False
@@ -731,6 +849,17 @@ class ISOToMP4Converter:
                 f"{t.output_path.name}: {t.error}" for t in failed)
 
         return result
+
+    def _quarantine_partial(self, path: Path) -> Optional[Path]:
+        """Rename a partial/failed output so it can't pass for a finished
+        access copy; the random suffix means retries never overwrite it"""
+        if not path.exists():
+            return None
+        token = f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
+        marked = path.with_name(f"{path.stem}_{token}.mp4.partial")
+        path.rename(marked)
+        log(colorize("yellow", f"Partial output renamed to: {marked.name}"))
+        return marked
 
     def _encode_titleset(self, plan: TitlesetPlan, title: TitleOutput,
                          result: ConversionResult):
@@ -797,18 +926,23 @@ class ISOToMP4Converter:
                 log(colorize("red", f"ffmpeg error:\n{stderr_text}"))
                 title.status = "failed"
                 title.error = f"ffmpeg failed with return code {process.returncode}"
+                title.partial_path = self._quarantine_partial(plan.output_path)
                 return
 
         except KeyboardInterrupt:
             log(colorize("red", "\nConversion interrupted by user."))
             process.kill()
+            process.wait()
+            title.encode_time = time.time() - encode_start
             title.status = "failed"
             title.error = "Interrupted by operator (Ctrl-C)"
+            title.partial_path = self._quarantine_partial(plan.output_path)
             raise
         except Exception as e:
             title.encode_time = time.time() - encode_start
             title.status = "failed"
             title.error = str(e)
+            title.partial_path = self._quarantine_partial(plan.output_path)
             return
 
         # Verify output exists
@@ -841,6 +975,8 @@ class ISOToMP4Converter:
                 f"{plan.output_path.name}: duration comparison unavailable (source unprobeable)")
 
         # Calculate MD5
+        if self.run:
+            self.run.mark(f"checksum_vts_{plan.vts_number:02d}")
         log(colorize("cyan", "Calculating MD5 hash of output file..."))
         title.md5 = calculate_md5(plan.output_path)
 
@@ -899,27 +1035,46 @@ class ISOToMP4Converter:
             if dry_run:
                 f.write("ISO TO MP4 ACCESS COPY CONVERSION LOG (DRY RUN)\n")
             elif is_error:
-                f.write("ISO TO MP4 ACCESS COPY CONVERSION LOG (ERROR)\n")
+                f.write(f"ISO TO MP4 ACCESS COPY CONVERSION LOG ({'ABORTED' if result.aborted else 'ERROR'})\n")
+            elif result.skipped:
+                f.write("ISO TO MP4 ACCESS COPY CONVERSION LOG (SKIPPED)\n")
             else:
                 f.write("ISO TO MP4 ACCESS COPY CONVERSION LOG\n")
             f.write("=" * 70 + "\n\n")
             f.write("CONVERSION SUMMARY\n")
             f.write("-" * 20 + "\n")
-            f.write(f"Run ID:           {datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}_{self.config.operator}\n")
+            run_id = self.run.run_id if self.run else \
+                f"{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.iso_name}"
+            f.write(f"Run ID:           {run_id}\n")
             f.write(f"Operator:         {self.config.operator}\n")
             f.write(f"Start Time:       {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"End Time:         {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Total Duration:   {format_duration(total_duration)}\n")
-            if result.success:
+            if dry_run:
+                status = 'DRY RUN'
+            elif result.aborted:
+                status = 'ABORTED'
+            elif result.skipped and result.success:
+                status = 'SKIPPED'
+            elif result.success:
                 status = 'SUCCESS (WITH WARNINGS)' if result.warnings else 'SUCCESS'
             else:
                 status = 'FAILED'
             f.write(f"Status:           {status}\n")
+            if result.skip_reason:
+                f.write(f"Skip Reason:      {result.skip_reason}\n")
             if result.error_message:
                 f.write(f"Error:            {result.error_message}\n")
             for warning in result.warnings:
                 f.write(f"Warning:          {warning}\n")
             f.write("\n")
+
+            if self.run and self.run.step_times:
+                f.write("OPERATION TIMELINE\n")
+                f.write("-" * 20 + "\n")
+                for step, step_time in self.run.step_times.items():
+                    f.write(f"[{step_time.strftime('%H:%M:%S')}] {step}\n")
+                f.write("\n")
             
             f.write("SOURCE INFORMATION\n")
             f.write("-" * 20 + "\n")
@@ -999,6 +1154,42 @@ class ISOToMP4Converter:
         
         log(colorize("cyan", f"Log saved to: {log_path}"))
     
+    def _run_identity(self, now: datetime.datetime) -> Dict[str, str]:
+        """Shared run_id/uuid for all record writers"""
+        if self.run:
+            return {"run_id": self.run.run_id, "uuid": self.run.run_uuid}
+        return {"run_id": f"{now.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.iso_name}",
+                "uuid": str(uuid4())}
+
+    def _titlesets_section(self, result: ConversionResult) -> Dict[str, Any]:
+        """Per-titleset outcomes — identical in success, error, and skip manifests
+        so a mixed run (one title completed, one failed) loses nothing"""
+        return {
+            "count": len(result.titles),
+            "note": ("Titleset-aware (grouped by VTS number): a single titleset may still "
+                     "contain multiple programs/PGCs/angles — this is not DVD-player title "
+                     "parsing. Subtitle streams are recorded but deliberately not encoded "
+                     "(DVD bitmap subtitles are not MP4-compatible)."),
+            "outputs": [
+                {
+                    "vts_number": t.vts_number,
+                    "filename": t.output_path.name,
+                    "is_main": i == 0,
+                    "status": t.status,
+                    "size_bytes": t.output_size,
+                    "duration_seconds": t.video_duration,
+                    "expected_duration_seconds": t.expected_duration,
+                    "encode_time_seconds": t.encode_time,
+                    "md5_checksum": t.md5,
+                    "source_audio_streams": t.source_audio_streams,
+                    "source_subtitle_streams": t.source_subtitle_streams,
+                    "mapped_audio_streams": t.mapped_audio_streams,
+                    "partial_renamed_to": t.partial_path.name if t.partial_path else None,
+                    "error": t.error
+                } for i, t in enumerate(result.titles)
+            ]
+        }
+
     def _create_manifest(self, result: ConversionResult):
         """Create comprehensive JSON manifest"""
         now = datetime.datetime.now()
@@ -1011,15 +1202,14 @@ class ISOToMP4Converter:
         
         manifest = {
             "conversion_metadata": {
-                "run_id": f"{now.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}",
-                "uuid": str(uuid4()),
+                **self._run_identity(now),
                 "tool_name": "ISO to MP4 Access Copy Utility",
                 "tool_version": "v1.0",
                 "created": now.isoformat(timespec="seconds"),
                 "operator": self.config.operator,
                 "dry_run": self.config.dry_run
             },
-            
+
             "conversion_status": {
                 "overall_status": (("success_with_warnings" if result.warnings else "success")
                                    if result.success else "failed"),
@@ -1059,30 +1249,7 @@ class ISOToMP4Converter:
                 "compression_ratio": result.compression_ratio
             },
 
-            "titlesets": {
-                "count": len(result.titles),
-                "note": ("Titleset-aware (grouped by VTS number): a single titleset may still "
-                         "contain multiple programs/PGCs/angles — this is not DVD-player title "
-                         "parsing. Subtitle streams are recorded but deliberately not encoded "
-                         "(DVD bitmap subtitles are not MP4-compatible)."),
-                "outputs": [
-                    {
-                        "vts_number": t.vts_number,
-                        "filename": t.output_path.name,
-                        "is_main": i == 0,
-                        "status": t.status,
-                        "size_bytes": t.output_size,
-                        "duration_seconds": t.video_duration,
-                        "expected_duration_seconds": t.expected_duration,
-                        "encode_time_seconds": t.encode_time,
-                        "md5_checksum": t.md5,
-                        "source_audio_streams": t.source_audio_streams,
-                        "source_subtitle_streams": t.source_subtitle_streams,
-                        "mapped_audio_streams": t.mapped_audio_streams,
-                        "error": t.error
-                    } for i, t in enumerate(result.titles)
-                ]
-            },
+            "titlesets": self._titlesets_section(result),
             
             "encoding_settings": {
                 "video_codec": self.config.video_codec,
@@ -1137,107 +1304,127 @@ class ISOToMP4Converter:
         log(colorize("cyan", f"Manifest saved to: {self.config.manifest_path}"))
     
     def _create_skip_manifest(self, result: ConversionResult):
-        """Create manifest for skipped files"""
+        """Create manifest for skipped files (and dry runs)"""
         now = datetime.datetime.now()
-        
+
         manifest = {
             "conversion_metadata": {
-                "run_id": f"{now.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}",
-                "uuid": str(uuid4()),
+                **self._run_identity(now),
                 "tool_name": "ISO to MP4 Access Copy Utility",
                 "tool_version": "v1.0",
                 "created": now.isoformat(timespec="seconds"),
-                "operator": self.config.operator
+                "operator": self.config.operator,
+                "dry_run": self.config.dry_run
             },
-            
+
             "conversion_status": {
-                "overall_status": "skipped",
+                "overall_status": "dry_run" if self.config.dry_run else "skipped",
                 "skipped": True,
-                "skip_reason": result.skip_reason
+                "skip_reason": result.skip_reason,
+                "warnings": result.warnings
             },
-            
+
             "source_iso": {
                 "filename": result.iso_path.name if result.iso_path else None,
                 "origin_path": str(result.iso_path) if result.iso_path else None,
                 "size_bytes": result.source_size,
                 "size_formatted": format_bytes(result.source_size)
             },
-            
+
             "disc_analysis": {
                 "disc_type": result.disc_analysis.disc_type if result.disc_analysis else None,
                 "has_video_ts": result.disc_analysis.has_video_ts if result.disc_analysis else False,
                 "has_audio_ts": result.disc_analysis.has_audio_ts if result.disc_analysis else False,
-                "recommendation": self._get_skip_recommendation(result.disc_analysis)
+                "recommendation": self._get_skip_recommendation(result.disc_analysis, result.skip_reason)
             },
-            
+
+            "titlesets": self._titlesets_section(result),
+
             "archival_notes": {
                 "note": result.skip_reason if result.skip_reason else "Skipped",
                 "project": "Johnson Publishing Company Archive (JPCA)"
             }
         }
-        
-        # Save to a skip manifest file
-        skip_manifest_path = self.config.output_dir / f"{self.config.iso_name}_skip_manifest.json"
+
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        with open(skip_manifest_path, "w") as f:
+        with open(self.config.skip_manifest_path, "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
-        
-        log(colorize("cyan", f"Skip manifest saved to: {skip_manifest_path}"))
+
+        log(colorize("cyan", f"Skip manifest saved to: {self.config.skip_manifest_path}"))
     
     def _create_error_manifest(self, result: ConversionResult):
-        """Create manifest for failed conversions"""
+        """Create manifest for failed or operator-aborted conversions.
+
+        Carries the full per-titleset record so a mixed run (one title
+        completed, another failed) loses nothing machine-readable."""
         now = datetime.datetime.now()
-        
+        status = "aborted" if result.aborted else "error"
+
         manifest = {
             "conversion_metadata": {
-                "run_id": f"{now.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}",
-                "uuid": str(uuid4()),
+                **self._run_identity(now),
                 "tool_name": "ISO to MP4 Access Copy Utility",
                 "tool_version": "v1.0",
                 "created": now.isoformat(timespec="seconds"),
-                "operator": self.config.operator
+                "operator": self.config.operator,
+                "dry_run": self.config.dry_run
             },
-            
+
             "conversion_status": {
-                "overall_status": "error",
+                "overall_status": status,
                 "skipped": False,
+                "interrupted": result.interrupted,
+                "warnings": result.warnings,
                 "error_message": result.error_message
             },
-            
+
             "source_iso": {
                 "filename": result.iso_path.name if result.iso_path else None,
                 "origin_path": str(result.iso_path) if result.iso_path else None,
                 "size_bytes": result.source_size,
                 "size_formatted": format_bytes(result.source_size)
             },
-            
+
             "disc_analysis": {
                 "disc_type": result.disc_analysis.disc_type if result.disc_analysis else None,
                 "has_video_ts": result.disc_analysis.has_video_ts if result.disc_analysis else False,
                 "has_audio_ts": result.disc_analysis.has_audio_ts if result.disc_analysis else False,
                 "error": result.disc_analysis.error if result.disc_analysis else None
             },
-            
+
+            "titlesets": self._titlesets_section(result),
+
             "archival_notes": {
-                "note": "This ISO encountered an error during processing",
+                "note": ("Conversion aborted by operator before any encoding"
+                         if result.aborted else
+                         "This ISO encountered an error during processing"),
                 "project": "Johnson Publishing Company Archive (JPCA)"
             }
         }
-        
-        error_manifest_path = self.config.output_dir / f"{self.config.iso_name}_error_manifest.json"
+
+        manifest_path = self.config.aborted_manifest_path if result.aborted \
+            else self.config.error_manifest_path
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        with open(error_manifest_path, "w") as f:
+
+        with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
-        
-        log(colorize("cyan", f"Error manifest saved to: {error_manifest_path}"))
+
+        log(colorize("cyan", f"{'Aborted' if result.aborted else 'Error'} manifest saved to: {manifest_path}"))
     
-    def _get_skip_recommendation(self, analysis: Optional[DiscContentAnalysis]) -> str:
+    def _get_skip_recommendation(self, analysis: Optional[DiscContentAnalysis],
+                                 skip_reason: Optional[str] = None) -> str:
         """Get recommendation for handling skipped discs"""
+        # Menu-only discs report disc_type dvd_video (VIDEO_TS exists), so the
+        # skip reason must take precedence over the disc type here
+        if skip_reason and skip_reason.startswith("Menu-only"):
+            return ("Menu-only VIDEO_TS structure — nothing to convert; "
+                    "menus remain intact in the preservation ISO")
+        if skip_reason == "Dry run mode":
+            return "Dry run — rerun without --dry-run to convert"
+
         if not analysis:
             return "Unknown disc type - manual review recommended"
-        
+
         if analysis.disc_type == "dvd_video":
             return "DVD-Video disc - ready for conversion"
         elif analysis.disc_type == "mixed":
@@ -1357,9 +1544,14 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
             "iso": iso_path.name,
             "success": result.success,
             "skipped": result.skipped,
+            "aborted": result.aborted,
             "error": result.error_message,
             "skip_reason": result.skip_reason
         })
+
+        if result.interrupted:
+            log(colorize("red", "Batch interrupted by operator — stopping."))
+            break
     
     # Summary
     log_divider("Batch Summary")
@@ -1369,7 +1561,7 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
     else:
         log(colorize("green", f"Successfully converted: {results['success']}"))
     if results["skipped"] > 0:
-        log(colorize("yellow", f"Skipped (non-VIDEO_TS): {results['skipped']}"))
+        log(colorize("yellow", f"Skipped (no convertible content): {results['skipped']}"))
     log(colorize("red", f"Failed: {results['failed']}"))
     
     return results
@@ -1589,6 +1781,9 @@ def main():
         else:
             log(colorize("green", "Conversion completed successfully!"))
             sys.exit(0)
+    elif result.aborted:
+        log(colorize("yellow", f"Aborted: {result.error_message}"))
+        sys.exit(1)
     else:
         log(colorize("red", f"Conversion failed: {result.error_message}"))
         sys.exit(1)

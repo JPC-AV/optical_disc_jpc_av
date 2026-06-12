@@ -11,10 +11,12 @@ structures, and packs each into an ISO image.
 *** design — but if this script fails on Linux/Windows, that's why.
 
 Fixtures produced (in --out, default tests/fixtures/):
-  single_title.iso  VIDEO_TS with one titleset  (VTS_01_1/2 + menus)
-  multi_title.iso   VIDEO_TS with two titlesets (VTS_01_*, VTS_02_*)
-  menu_only.iso     VIDEO_TS containing only menu VOBs (no content)
-  data_only.iso     no VIDEO_TS at all (plain data files)
+  single_title.iso   VIDEO_TS with one titleset  (VTS_01_1/2 + menus)
+  multi_title.iso    VIDEO_TS with two titlesets (VTS_01_*, VTS_02_*)
+  menu_only.iso      VIDEO_TS containing only menu VOBs (no content)
+  data_only.iso      no VIDEO_TS at all (plain data files)
+  broken_title2.iso  VTS_01 valid, VTS_02 is garbage bytes — exercises the
+                     mixed-failure path (title 1 completes, title 2 fails)
 
 Content VOBs carry one video stream and TWO audio streams (440 Hz and
 880 Hz sine), so stream-mapping behavior is testable.
@@ -26,6 +28,7 @@ Requires: ffmpeg (Homebrew), hdiutil (macOS built-in). No sudo needed.
 """
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -122,7 +125,15 @@ def build_fixtures(out_dir: Path, duration: float):
                 "readme.txt": "fixture data disc — no VIDEO_TS\n",
                 "photo_list.csv": "id,name\n1,test\n",
             }),
+            "broken_title2": lay_out("broken_title2", {
+                "VTS_01_1.VOB": content_vob,
+            }),
         }
+
+        # broken_title2: VTS_02 is garbage so ffmpeg fails on it after VTS_01
+        # succeeds — the mixed-failure regression case
+        broken_vts = tmp / "broken_title2" / "VIDEO_TS"
+        (broken_vts / "VTS_02_1.VOB").write_bytes(os.urandom(512 * 1024))
 
         for name, disc_dir in fixtures.items():
             iso = out_dir / f"{name}.iso"
