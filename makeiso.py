@@ -210,9 +210,9 @@ def fmt_diskutil_size(bytes_val: int, total_bytes: int = None) -> str:
         result += f" ({pct:.1f}%)"
     return result
 
-def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult, 
+def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult,
                         start_time: datetime.datetime, disk_info: Dict[str, Any],
-                        iso_analysis: Dict[str, Any] = None):
+                        iso_analysis: Dict[str, Any] = None, manifest_path: Path = None):
     """Create a properly formatted log file"""
     
     end_time = datetime.datetime.now()
@@ -231,7 +231,8 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"Start Time:       {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"End Time:         {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total Duration:   {format_duration(total_duration)}\n")
-        f.write(f"Status:           {'SUCCESS' if result.success else 'FAILED'}\n")
+        status = 'SUCCESS' if result.success else ('VERIFICATION FAILED' if result.checksum_match is False else 'FAILED')
+        f.write(f"Status:           {status}\n")
         if result.checksum_match is not None:
             f.write(f"Verification:     {'PASS' if result.checksum_match else 'FAIL'}\n")
         f.write("\n")
@@ -252,10 +253,10 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write("-" * 20 + "\n")
         f.write(f"ISO File:         {result.iso_path.name}\n")
         f.write(f"Output Directory: {config.output_dir}\n")
-        f.write(f"Log File:         {config.log_path.name}\n")
+        f.write(f"Log File:         {log_path.name}\n")
         f.write(f"Tree File:        {config.tree_path.name}\n")
         f.write(f"Isolyzer File:    {config.isolyzer_path.name}\n")
-        f.write(f"Manifest File:    {config.manifest_path.name}\n")
+        f.write(f"Manifest File:    {(manifest_path or config.manifest_path).name}\n")
         if result.iso_path.exists():
             iso_size = result.iso_path.stat().st_size
             f.write(f"ISO File Size:    {iso_size / (1024 * 1024):.0f} MB\n")
@@ -433,38 +434,34 @@ class OpticalDiscBackup:
         # Generate tree listing (this is the first divider after user inputs)
         self._generate_tree_listing()
         
-        # Unmount disk; abort rather than dd a device that is still mounted
+        # Unmount disk; record the failure rather than dd a mounted device.
+        # The disc is left as-is (no remount/eject) since it never unmounted.
+        backup_error = None
         if not self.config.dry_run:
             if not self._unmount_disk():
-                return BackupResult(False, self.config.output_path, disk_size,
-                                    error_message=f"Failed to unmount /dev/{self.config.disk_id}")
-        
+                backup_error = f"Failed to unmount /dev/{self.config.disk_id}"
+
         # Create ISO (with in-stream source hashing), then verify by re-reading it.
         # Wrapped so the disc is always remounted/ejected and the run is always
         # documented, even when the copy or verification fails partway.
-        backup_error = None
-        try:
-            if self.config.dry_run:
-                creation_time, verification_time, md5_iso, md5_raw = 0.0, 0.0, None, None
-                iso_analysis = {"skipped": True, "reason": "dry run"}
-                log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Skipping .iso creation and verification."))
-            else:
-                creation_time, verification_time, md5_iso, md5_raw = self._create_and_verify_iso(disk_size)
-                # Analyze ISO structure
-                iso_analysis = self._analyze_iso_structure(self.config.output_path)
-        except Exception as e:
-            backup_error = str(e)
-            creation_time, verification_time, md5_iso, md5_raw = 0.0, 0.0, None, None
-            iso_analysis = {"skipped": True, "reason": f"backup failed: {e}"}
-            log(colorize("red", f"Backup failed: {e}"))
-            # Don't leave a truncated image that could pass for a finished master
-            if self.config.output_path.exists():
-                partial_path = self.config.output_path.with_name(self.config.output_path.name + ".partial")
-                self.config.output_path.rename(partial_path)
-                log(colorize("yellow", f"Partial ISO renamed to: {partial_path.name}"))
-        finally:
-            # Remount and eject the disc even if the backup failed
-            self._finalize_disk()
+        creation_time, verification_time, md5_iso, md5_raw = 0.0, 0.0, None, None
+        iso_analysis = {"skipped": True, "reason": backup_error or "not started"}
+        if backup_error is None:
+            try:
+                if self.config.dry_run:
+                    iso_analysis = {"skipped": True, "reason": "dry run"}
+                    log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Skipping .iso creation and verification."))
+                else:
+                    creation_time, verification_time, md5_iso, md5_raw = self._create_and_verify_iso(disk_size)
+                    # Analyze ISO structure
+                    iso_analysis = self._analyze_iso_structure(self.config.output_path)
+            except Exception as e:
+                backup_error = str(e)
+                iso_analysis = {"skipped": True, "reason": f"backup failed: {e}"}
+                log(colorize("red", f"Backup failed: {e}"))
+            finally:
+                # Remount and eject the disc even if the backup failed
+                self._finalize_disk()
 
         # Create result
         result = BackupResult(
@@ -477,14 +474,35 @@ class OpticalDiscBackup:
             verification_time=verification_time,
             error_message=backup_error
         )
+
+        # A checksum mismatch is a failed preservation run (distinct exit code 2 in main)
+        if result.checksum_match is False:
+            result.success = False
+            result.error_message = "Checksum mismatch: written ISO does not match source stream"
+
+        # Failed or aborted runs write their records under failure-marked names,
+        # so they are obvious in the output directory and a retry can never
+        # overwrite the evidence of a previous attempt.
+        log_path = self.config.log_path
+        manifest_path = self.config.manifest_path
+        if not result.success:
+            fail_token = datetime.datetime.now().strftime('failed-%Y%m%dT%H%M%S')
+            if self.config.output_path.exists():
+                marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
+                marked_path = self.config.output_dir / f"{self.config.filename}_{fail_token}{marker}"
+                self.config.output_path.rename(marked_path)
+                result.iso_path = marked_path
+                log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
+            log_path = self.config.output_dir / f"{self.config.filename}_{fail_token}.iso.log.txt"
+            manifest_path = self.config.output_dir / f"{self.config.filename}_{fail_token}_manifest.json"
         
         # Generate outputs
         self._generate_summary(result)
         
         # Save formatted log with all the details
-        create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info, iso_analysis)
-        
-        self._create_manifest(result, disk_info, iso_analysis)
+        create_formatted_log(log_path, self.config, result, start_time, disk_info, iso_analysis, manifest_path)
+
+        self._create_manifest(result, disk_info, iso_analysis, manifest_path, log_path)
         
         return result
     
@@ -863,8 +881,11 @@ class OpticalDiscBackup:
         found = element.find(path, namespaces)
         return found.text.strip() if found is not None and found.text else ""
     
-    def _create_manifest(self, result: BackupResult, disk_info: Dict[str, Any], iso_analysis: Dict[str, Any]):
+    def _create_manifest(self, result: BackupResult, disk_info: Dict[str, Any], iso_analysis: Dict[str, Any],
+                         manifest_path: Path = None, log_path: Path = None):
         """Create comprehensive manifest file with improved organization"""
+        manifest_path = manifest_path or self.config.manifest_path
+        log_path = log_path or self.config.log_path
         # Get current timestamp
         now = datetime.datetime.now()
         
@@ -888,7 +909,7 @@ class OpticalDiscBackup:
             },
             
             "backup_status": {
-                "overall_status": "success" if result.success else "failed",
+                "overall_status": "success" if result.success else ("verification_failed" if result.checksum_match is False else "failed"),
                 "iso_created": iso_file_size is not None,
                 "verification_performed": not self.config.no_verification and not self.config.dry_run,
                 "verification_passed": result.checksum_match if result.checksum_match is not None else "skipped",
@@ -923,10 +944,10 @@ class OpticalDiscBackup:
                 "iso_file_size_bytes": iso_file_size,
                 "iso_file_size_formatted": format_bytes(iso_file_size) if iso_file_size else None,
                 "output_directory": str(self.config.output_dir),
-                "log_filename": self.config.log_path.name,
+                "log_filename": log_path.name,
                 "tree_filename": self.config.tree_path.name,
                 "isolyzer_filename": self.config.isolyzer_path.name,
-                "manifest_filename": self.config.manifest_path.name
+                "manifest_filename": manifest_path.name
             },
             
             "operations_performed": {
@@ -1113,10 +1134,10 @@ class OpticalDiscBackup:
         }
         
         # Write manifest with proper formatting
-        with open(self.config.manifest_path, "w") as f:
+        with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
-        
-        log(colorize("cyan", "Manifest saved to:") + " " + colorize("yellow", str(self.config.manifest_path)))
+
+        log(colorize("cyan", "Manifest saved to:") + " " + colorize("yellow", str(manifest_path)))
     
     def _extract_filesystem_info(self, iso_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract filesystem information from isolyzer analysis"""
@@ -1446,12 +1467,11 @@ def main():
     
     # Exit with appropriate code
     if result.success:
-        if result.checksum_match is False:
-            log(colorize("yellow", "Warning: Checksum mismatch detected!"))
-            sys.exit(2)  # Warning exit code
-        else:
-            log(colorize("green", "Backup completed successfully!"))
-            sys.exit(0)
+        log(colorize("green", "Backup completed successfully!"))
+        sys.exit(0)
+    elif result.checksum_match is False:
+        log(colorize("red", "Backup failed verification: checksum mismatch!"))
+        sys.exit(2)  # Distinct exit code for verification failure
     else:
         log(colorize("red", f"Backup failed: {result.error_message}"))
         sys.exit(1)

@@ -462,6 +462,19 @@ For a backup with filename `JPC_AV_00001`, the script creates a directory contai
 | `*_tree.txt` | Complete directory listing with file sizes, permissions, and dates |
 | `*_isolyzer.xml` | ISO 9660/UDF structural validation from isolyzer tool |
 
+#### Failed Run Naming
+
+Failed or aborted runs are renamed so they can never be mistaken for finished masters. All artifacts from a failed attempt share a `failed-<timestamp>` token, and retries never overwrite them:
+
+```
+JPC_AV_00001_failed-20260612T140322.iso.partial    # copy aborted partway
+JPC_AV_00001_failed-20260612T140322.iso.mismatch   # completed but failed verification
+JPC_AV_00001_failed-20260612T140322.iso.log.txt    # log for that attempt
+JPC_AV_00001_failed-20260612T140322_manifest.json  # manifest for that attempt
+```
+
+Successful runs use the standard names above.
+
 ### Understanding the Output
 
 #### Terminal Output
@@ -497,7 +510,7 @@ Checksum match: ISO on disk is a true bit-for-bit copy.
 |------|---------|
 | `0` | Success — backup completed and verified |
 | `1` | Failure — backup failed (see error message) |
-| `2` | Warning — backup completed but checksum mismatch detected |
+| `2` | Verification failed — written ISO does not match the source (run is marked failed) |
 
 ---
 
