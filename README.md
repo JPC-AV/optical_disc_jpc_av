@@ -471,6 +471,8 @@ JPC_AV_00001_failed-20260612T140322.iso.partial    # copy aborted partway
 JPC_AV_00001_failed-20260612T140322.iso.mismatch   # completed but failed verification
 JPC_AV_00001_failed-20260612T140322.iso.log.txt    # log for that attempt
 JPC_AV_00001_failed-20260612T140322_manifest.json  # manifest for that attempt
+JPC_AV_00001_failed-20260612T140322_tree.txt       # tree listing for that attempt
+JPC_AV_00001_failed-20260612T140322_isolyzer.xml   # structural analysis, if it ran
 ```
 
 Successful runs use the standard names above.

@@ -37,6 +37,13 @@ class BackupConfig:
     no_verification: bool = False
     force: bool = False
     media_type: str = "Unknown"
+    # Set when a run fails; sidecar paths then resolve to failure-marked names
+    # so a retry can never overwrite the failed attempt's records.
+    failure_token: Optional[str] = None
+
+    def _named(self, suffix: str) -> Path:
+        token = f"_{self.failure_token}" if self.failure_token else ""
+        return self.output_dir / f"{self.filename}{token}{suffix}"
 
     @property
     def output_path(self) -> Path:
@@ -44,19 +51,19 @@ class BackupConfig:
     
     @property
     def log_path(self) -> Path:
-        return self.output_dir / f"{self.filename}.iso.log.txt"
+        return self._named(".iso.log.txt")
     
     @property
     def manifest_path(self) -> Path:
-        return self.output_dir / f"{self.filename}_manifest.json"
+        return self._named("_manifest.json")
     
     @property
     def tree_path(self) -> Path:
-        return self.output_dir / f"{self.filename}_tree.txt"
+        return self._named("_tree.txt")
     
     @property
     def isolyzer_path(self) -> Path:
-        return self.output_dir / f"{self.filename}_isolyzer.xml"
+        return self._named("_isolyzer.xml")
 
 @dataclass
 class BackupResult:
@@ -69,6 +76,8 @@ class BackupResult:
     creation_time: float = 0.0
     verification_time: float = 0.0
     error_message: Optional[str] = None
+    unmount_ok: Optional[bool] = None  # None = unmount not attempted (dry run)
+    finalized: bool = False            # remount/eject step ran
     
     @property
     def checksum_match(self) -> Optional[bool]:
@@ -212,7 +221,7 @@ def fmt_diskutil_size(bytes_val: int, total_bytes: int = None) -> str:
 
 def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult,
                         start_time: datetime.datetime, disk_info: Dict[str, Any],
-                        iso_analysis: Dict[str, Any] = None, manifest_path: Path = None):
+                        iso_analysis: Dict[str, Any] = None):
     """Create a properly formatted log file"""
     
     end_time = datetime.datetime.now()
@@ -256,7 +265,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"Log File:         {log_path.name}\n")
         f.write(f"Tree File:        {config.tree_path.name}\n")
         f.write(f"Isolyzer File:    {config.isolyzer_path.name}\n")
-        f.write(f"Manifest File:    {(manifest_path or config.manifest_path).name}\n")
+        f.write(f"Manifest File:    {config.manifest_path.name}\n")
         if result.iso_path.exists():
             iso_size = result.iso_path.stat().st_size
             f.write(f"ISO File Size:    {iso_size / (1024 * 1024):.0f} MB\n")
@@ -273,22 +282,31 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"  Output:  {config.tree_path.name}\n\n")
         
         # Disk unmount
+        if result.unmount_ok is None:
+            unmount_status = "Skipped (dry run)"
+        else:
+            unmount_status = "Success" if result.unmount_ok else "FAILED"
         f.write(f"[{start_time.strftime('%H:%M:%S')}] Disk Unmount\n")
         f.write(f"  Command: diskutil unmountDisk /dev/{config.disk_id}\n")
-        f.write(f"  Status:  Success\n\n")
+        f.write(f"  Status:  {unmount_status}\n\n")
         
         # ISO Creation and Verification
         create_start = start_time + datetime.timedelta(seconds=1)  # Approximate
         create_end = create_start + datetime.timedelta(seconds=result.creation_time)
         
         f.write(f"[{create_start.strftime('%H:%M:%S')}] ISO Creation\n")
-        f.write(f"  Command: dd if=/dev/r{config.disk_id} of={result.iso_path} bs=4m\n")
-        f.write(f"  Method:  Streamed copy with in-stream source (raw disk) hashing\n")
-        f.write(f"  Duration: {format_duration(result.creation_time)}\n")
-        speed = result.speed_mb_s(result.creation_time)
-        multiplier = calculate_disc_speed_multiplier(speed, config.media_type)
-        f.write(f"  Speed:    {speed:.2f} MB/s ({multiplier})\n")
-        f.write(f"  Completed: {create_end.strftime('%H:%M:%S')}\n\n")
+        if config.dry_run:
+            f.write(f"  Status:  Skipped (dry run)\n\n")
+        elif result.unmount_ok is False:
+            f.write(f"  Status:  Not started ({result.error_message or 'aborted before copy'})\n\n")
+        else:
+            f.write(f"  Command: dd if=/dev/r{config.disk_id} of={config.output_path} bs=4m\n")
+            f.write(f"  Method:  Streamed copy with in-stream source (raw disk) hashing\n")
+            f.write(f"  Duration: {format_duration(result.creation_time)}\n")
+            speed = result.speed_mb_s(result.creation_time)
+            multiplier = calculate_disc_speed_multiplier(speed, config.media_type)
+            f.write(f"  Speed:    {speed:.2f} MB/s ({multiplier})\n")
+            f.write(f"  Completed: {create_end.strftime('%H:%M:%S')}\n\n")
         
         # Hash verification results
         if result.md5_iso and result.md5_raw:
@@ -339,7 +357,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"[{final_time.strftime('%H:%M:%S')}] Finalization\n")
         f.write(f"  Remount: diskutil mount /dev/{config.disk_id}\n")
         f.write(f"  Eject:   diskutil eject /dev/{config.disk_id}\n")
-        f.write(f"  Status:  Complete\n\n")
+        f.write(f"  Status:  {'Complete' if result.finalized else 'Skipped (disc was never unmounted)'}\n\n")
         
         # === SYSTEM INFORMATION ===
         f.write("SYSTEM INFORMATION\n")
@@ -437,8 +455,11 @@ class OpticalDiscBackup:
         # Unmount disk; record the failure rather than dd a mounted device.
         # The disc is left as-is (no remount/eject) since it never unmounted.
         backup_error = None
+        unmount_ok = None
+        finalized = False
         if not self.config.dry_run:
-            if not self._unmount_disk():
+            unmount_ok = self._unmount_disk()
+            if not unmount_ok:
                 backup_error = f"Failed to unmount /dev/{self.config.disk_id}"
 
         # Create ISO (with in-stream source hashing), then verify by re-reading it.
@@ -462,6 +483,7 @@ class OpticalDiscBackup:
             finally:
                 # Remount and eject the disc even if the backup failed
                 self._finalize_disk()
+                finalized = True
 
         # Create result
         result = BackupResult(
@@ -472,7 +494,9 @@ class OpticalDiscBackup:
             md5_raw=md5_raw,
             creation_time=creation_time,
             verification_time=verification_time,
-            error_message=backup_error
+            error_message=backup_error,
+            unmount_ok=unmount_ok,
+            finalized=finalized
         )
 
         # A checksum mismatch is a failed preservation run (distinct exit code 2 in main)
@@ -480,11 +504,9 @@ class OpticalDiscBackup:
             result.success = False
             result.error_message = "Checksum mismatch: written ISO does not match source stream"
 
-        # Failed or aborted runs write their records under failure-marked names,
-        # so they are obvious in the output directory and a retry can never
-        # overwrite the evidence of a previous attempt.
-        log_path = self.config.log_path
-        manifest_path = self.config.manifest_path
+        # Failed or aborted runs keep all their records under failure-marked
+        # names, so they are obvious in the output directory and a retry can
+        # never overwrite the evidence of a previous attempt.
         if not result.success:
             fail_token = datetime.datetime.now().strftime('failed-%Y%m%dT%H%M%S')
             if self.config.output_path.exists():
@@ -493,16 +515,24 @@ class OpticalDiscBackup:
                 self.config.output_path.rename(marked_path)
                 result.iso_path = marked_path
                 log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
-            log_path = self.config.output_dir / f"{self.config.filename}_{fail_token}.iso.log.txt"
-            manifest_path = self.config.output_dir / f"{self.config.filename}_{fail_token}_manifest.json"
+            # Move already-written sidecars (tree, isolyzer) to failure-marked
+            # names; setting failure_token also points the log and manifest
+            # writes below at failure-marked names.
+            tree_std, isolyzer_std = self.config.tree_path, self.config.isolyzer_path
+            self.config.failure_token = fail_token
+            for src, dst in ((tree_std, self.config.tree_path),
+                             (isolyzer_std, self.config.isolyzer_path)):
+                if src.exists():
+                    src.rename(dst)
+                    log(colorize("yellow", f"{src.name} renamed to: {dst.name}"))
         
         # Generate outputs
         self._generate_summary(result)
         
         # Save formatted log with all the details
-        create_formatted_log(log_path, self.config, result, start_time, disk_info, iso_analysis, manifest_path)
+        create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info, iso_analysis)
 
-        self._create_manifest(result, disk_info, iso_analysis, manifest_path, log_path)
+        self._create_manifest(result, disk_info, iso_analysis)
         
         return result
     
@@ -881,11 +911,8 @@ class OpticalDiscBackup:
         found = element.find(path, namespaces)
         return found.text.strip() if found is not None and found.text else ""
     
-    def _create_manifest(self, result: BackupResult, disk_info: Dict[str, Any], iso_analysis: Dict[str, Any],
-                         manifest_path: Path = None, log_path: Path = None):
+    def _create_manifest(self, result: BackupResult, disk_info: Dict[str, Any], iso_analysis: Dict[str, Any]):
         """Create comprehensive manifest file with improved organization"""
-        manifest_path = manifest_path or self.config.manifest_path
-        log_path = log_path or self.config.log_path
         # Get current timestamp
         now = datetime.datetime.now()
         
@@ -944,10 +971,10 @@ class OpticalDiscBackup:
                 "iso_file_size_bytes": iso_file_size,
                 "iso_file_size_formatted": format_bytes(iso_file_size) if iso_file_size else None,
                 "output_directory": str(self.config.output_dir),
-                "log_filename": log_path.name,
+                "log_filename": self.config.log_path.name,
                 "tree_filename": self.config.tree_path.name,
                 "isolyzer_filename": self.config.isolyzer_path.name,
-                "manifest_filename": manifest_path.name
+                "manifest_filename": self.config.manifest_path.name
             },
             
             "operations_performed": {
@@ -958,25 +985,25 @@ class OpticalDiscBackup:
                 },
                 "disk_unmount": {
                     "command": f"diskutil unmountDisk /dev/{self.config.disk_id}",
-                    "status": "success" if not self.config.dry_run else "skipped"
+                    "status": "skipped" if result.unmount_ok is None else ("success" if result.unmount_ok else "failed")
                 },
                 "iso_creation": {
-                    "command": f"dd if=/dev/r{self.config.disk_id} of={result.iso_path} bs=4m",
+                    "command": f"dd if=/dev/r{self.config.disk_id} of={self.config.output_path} bs=4m",
                     "method": "streamed copy with in-stream source hash calculation",
                     "block_size": "4MB",
-                    "performed": not self.config.dry_run
+                    "performed": result.unmount_ok is True
                 },
                 "verification": {
                     "method": "md5 hash comparison (written ISO re-read from disk vs raw device stream)",
                     "algorithm": "MD5",
                     "algorithm_bits": 128,
-                    "performed": not self.config.no_verification and not self.config.dry_run,
+                    "performed": result.md5_iso is not None,
                     "shell_equivalent": f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
                 },
                 "finalization": {
                     "remount_command": f"diskutil mount /dev/{self.config.disk_id}",
                     "eject_command": f"diskutil eject /dev/{self.config.disk_id}",
-                    "status": "completed" if not self.config.dry_run else "skipped"
+                    "status": "completed" if result.finalized and not self.config.dry_run else "skipped"
                 }
             },
             
@@ -1095,7 +1122,7 @@ class OpticalDiscBackup:
                 "backup_parameters": {
                     "dd_block_size": "4MB",
                     "read_device": f"/dev/r{self.config.disk_id}",
-                    "write_destination": str(result.iso_path),
+                    "write_destination": str(self.config.output_path),
                     "parallel_processing": True,
                     "verification_during_creation": False,
                     "error_handling": "standard dd error handling"
@@ -1134,10 +1161,10 @@ class OpticalDiscBackup:
         }
         
         # Write manifest with proper formatting
-        with open(manifest_path, "w") as f:
+        with open(self.config.manifest_path, "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
 
-        log(colorize("cyan", "Manifest saved to:") + " " + colorize("yellow", str(manifest_path)))
+        log(colorize("cyan", "Manifest saved to:") + " " + colorize("yellow", str(self.config.manifest_path)))
     
     def _extract_filesystem_info(self, iso_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract filesystem information from isolyzer analysis"""
