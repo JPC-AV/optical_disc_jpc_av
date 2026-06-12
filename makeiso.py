@@ -242,6 +242,8 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"Total Duration:   {format_duration(total_duration)}\n")
         status = 'SUCCESS' if result.success else ('VERIFICATION FAILED' if result.checksum_match is False else 'FAILED')
         f.write(f"Status:           {status}\n")
+        if result.error_message:
+            f.write(f"Error:            {result.error_message}\n")
         if result.checksum_match is not None:
             f.write(f"Verification:     {'PASS' if result.checksum_match else 'FAIL'}\n")
         f.write("\n")
@@ -302,11 +304,14 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         else:
             f.write(f"  Command: dd if=/dev/r{config.disk_id} of={config.output_path} bs=4m\n")
             f.write(f"  Method:  Streamed copy with in-stream source (raw disk) hashing\n")
-            f.write(f"  Duration: {format_duration(result.creation_time)}\n")
-            speed = result.speed_mb_s(result.creation_time)
-            multiplier = calculate_disc_speed_multiplier(speed, config.media_type)
-            f.write(f"  Speed:    {speed:.2f} MB/s ({multiplier})\n")
-            f.write(f"  Completed: {create_end.strftime('%H:%M:%S')}\n\n")
+            if result.md5_raw is None and result.error_message:
+                f.write(f"  Status:  FAILED ({result.error_message})\n\n")
+            else:
+                f.write(f"  Duration: {format_duration(result.creation_time)}\n")
+                speed = result.speed_mb_s(result.creation_time)
+                multiplier = calculate_disc_speed_multiplier(speed, config.media_type)
+                f.write(f"  Speed:    {speed:.2f} MB/s ({multiplier})\n")
+                f.write(f"  Completed: {create_end.strftime('%H:%M:%S')}\n\n")
         
         # Hash verification results
         if result.md5_iso and result.md5_raw:
@@ -357,7 +362,13 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"[{final_time.strftime('%H:%M:%S')}] Finalization\n")
         f.write(f"  Remount: diskutil mount /dev/{config.disk_id}\n")
         f.write(f"  Eject:   diskutil eject /dev/{config.disk_id}\n")
-        f.write(f"  Status:  {'Complete' if result.finalized else 'Skipped (disc was never unmounted)'}\n\n")
+        if result.finalized:
+            final_status = "Complete"
+        elif result.unmount_ok is False:
+            final_status = "Skipped (disc was never unmounted)"
+        else:
+            final_status = "FAILED (remount/eject error — see console output)"
+        f.write(f"  Status:  {final_status}\n\n")
         
         # === SYSTEM INFORMATION ===
         f.write("SYSTEM INFORMATION\n")
@@ -482,8 +493,7 @@ class OpticalDiscBackup:
                 log(colorize("red", f"Backup failed: {e}"))
             finally:
                 # Remount and eject the disc even if the backup failed
-                self._finalize_disk()
-                finalized = True
+                finalized = self._finalize_disk()
 
         # Create result
         result = BackupResult(
@@ -711,8 +721,8 @@ class OpticalDiscBackup:
             log(colorize("red", f"Failed to unmount:\n{e.stderr}"))
             return False
     
-    def _finalize_disk(self):
-        """Remount and eject disk"""
+    def _finalize_disk(self) -> bool:
+        """Remount and eject disk; returns True if all finalization commands succeeded"""
         log_divider("Finalizing")
         if self.config.dry_run:
             # Check if already mounted
@@ -724,12 +734,24 @@ class OpticalDiscBackup:
                 log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Mounting disk but skipping eject."))
                 log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil mount {self.config.disk_id}"))
                 subprocess.run(["diskutil", "mount", self.config.disk_id])
+            return True
         else:
+            ok = True
             log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil mount /dev/{self.config.disk_id}"))
-            subprocess.run(["diskutil", "mount", f"/dev/{self.config.disk_id}"])
+            mount_proc = subprocess.run(["diskutil", "mount", f"/dev/{self.config.disk_id}"],
+                                        capture_output=True, text=True)
+            if mount_proc.returncode != 0:
+                ok = False
+                log(colorize("yellow", f"Warning: remount failed: {mount_proc.stderr.strip() or mount_proc.stdout.strip()}"))
             log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil eject /dev/{self.config.disk_id}"))
-            subprocess.run(["diskutil", "eject", f"/dev/{self.config.disk_id}"])
-            log(colorize("green", "Disk remounted and ejected. All done."))
+            eject_proc = subprocess.run(["diskutil", "eject", f"/dev/{self.config.disk_id}"],
+                                        capture_output=True, text=True)
+            if eject_proc.returncode != 0:
+                ok = False
+                log(colorize("yellow", f"Warning: eject failed: {eject_proc.stderr.strip() or eject_proc.stdout.strip()}"))
+            if ok:
+                log(colorize("green", "Disk remounted and ejected. All done."))
+            return ok
     
     def _generate_summary(self, result: BackupResult):
         """Generate timing summary"""
@@ -938,7 +960,7 @@ class OpticalDiscBackup:
             "backup_status": {
                 "overall_status": "success" if result.success else ("verification_failed" if result.checksum_match is False else "failed"),
                 "iso_created": iso_file_size is not None,
-                "verification_performed": not self.config.no_verification and not self.config.dry_run,
+                "verification_performed": result.md5_iso is not None,
                 "verification_passed": result.checksum_match if result.checksum_match is not None else "skipped",
                 "errors": result.error_message if result.error_message else None
             },
@@ -1003,7 +1025,8 @@ class OpticalDiscBackup:
                 "finalization": {
                     "remount_command": f"diskutil mount /dev/{self.config.disk_id}",
                     "eject_command": f"diskutil eject /dev/{self.config.disk_id}",
-                    "status": "completed" if result.finalized and not self.config.dry_run else "skipped"
+                    "status": ("skipped" if self.config.dry_run or result.unmount_ok is False
+                               else ("completed" if result.finalized else "failed"))
                 }
             },
             
