@@ -97,6 +97,22 @@ class BackupResult:
             return round((self.disk_size / duration) / (1024 * 1024), 2)
         return 0.0
 
+@dataclass
+class RunContext:
+    """Identity and step timing for a single backup run.
+
+    Generated once per run and shared by the log and manifest writers so
+    both records carry the same run_id/uuid and real step timestamps.
+    """
+    run_id: str
+    run_uuid: str
+    start_time: datetime.datetime
+    step_times: Dict[str, datetime.datetime] = field(default_factory=dict)
+
+    def mark(self, step: str):
+        """Record the moment a step actually happened"""
+        self.step_times[step] = datetime.datetime.now()
+
 ### === COLOR UTILITIES ===
 
 COLOR = {
@@ -222,11 +238,16 @@ def fmt_diskutil_size(bytes_val: int, total_bytes: int = None) -> str:
 
 def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult,
                         start_time: datetime.datetime, disk_info: Dict[str, Any],
-                        iso_analysis: Dict[str, Any] = None):
+                        iso_analysis: Dict[str, Any] = None, run: RunContext = None):
     """Create a properly formatted log file"""
-    
+
     end_time = datetime.datetime.now()
     total_duration = (end_time - start_time).total_seconds()
+
+    def step_time(step: str, fallback: datetime.datetime) -> str:
+        """Real captured timestamp for a step, or the fallback if it never ran"""
+        t = run.step_times.get(step, fallback) if run else fallback
+        return t.strftime('%H:%M:%S')
     
     with open(log_path, "w") as f:
         # === HEADER SUMMARY ===
@@ -236,7 +257,8 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         
         f.write("BACKUP SUMMARY\n")
         f.write("-" * 20 + "\n")
-        f.write(f"Run ID:           {datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}_{config.operator}_{config.disk_id}\n")
+        run_id = run.run_id if run else f"{start_time.strftime('%Y%m%dT%H%M%S')}_{config.operator}_{config.disk_id}"
+        f.write(f"Run ID:           {run_id}\n")
         f.write(f"Operator:         {config.operator}\n")
         f.write(f"Start Time:       {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"End Time:         {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -285,7 +307,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write("-" * 20 + "\n")
         
         # Tree generation
-        f.write(f"[{start_time.strftime('%H:%M:%S')}] Tree Listing Generation\n")
+        f.write(f"[{step_time('tree', start_time)}] Tree Listing Generation\n")
         tree_target = config.mount_point or f"/Volumes/{config.volume_name}"
         f.write(f"  Command: tree -RapugD --si --du {tree_target}\n")
         f.write(f"  Output:  {config.tree_path.name}\n\n")
@@ -295,13 +317,14 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
             unmount_status = "Skipped (dry run)"
         else:
             unmount_status = "Success" if result.unmount_ok else "FAILED"
-        f.write(f"[{start_time.strftime('%H:%M:%S')}] Disk Unmount\n")
+        f.write(f"[{step_time('unmount', start_time)}] Disk Unmount\n")
         f.write(f"  Command: diskutil unmountDisk /dev/{config.disk_id}\n")
         f.write(f"  Status:  {unmount_status}\n\n")
         
-        # ISO Creation and Verification
-        create_start = start_time + datetime.timedelta(seconds=1)  # Approximate
-        create_end = create_start + datetime.timedelta(seconds=result.creation_time)
+        # ISO Creation and Verification (real captured times; approximation
+        # only as fallback for steps that never ran)
+        create_start = (run.step_times.get("copy_start") if run else None) or (start_time + datetime.timedelta(seconds=1))
+        create_end = (run.step_times.get("copy_end") if run else None) or (create_start + datetime.timedelta(seconds=result.creation_time))
         
         f.write(f"[{create_start.strftime('%H:%M:%S')}] ISO Creation\n")
         if config.dry_run:
@@ -333,7 +356,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         
         # ISO Structure Analysis
         if config.isolyzer_path.exists():
-            f.write(f"[{create_end.strftime('%H:%M:%S')}] ISO Structure Analysis\n")
+            f.write(f"[{step_time('isolyzer', create_end)}] ISO Structure Analysis\n")
             f.write(f"  Tool:    isolyzer\n")
             f.write(f"  Output:  {config.isolyzer_path.name}\n")
             
@@ -370,8 +393,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
                 f.write("  Status:  Complete\n\n")
         
         # Finalization
-        final_time = create_end + datetime.timedelta(seconds=1)
-        f.write(f"[{final_time.strftime('%H:%M:%S')}] Finalization\n")
+        f.write(f"[{step_time('finalize', create_end + datetime.timedelta(seconds=1))}] Finalization\n")
         f.write(f"  Remount: diskutil mount /dev/{config.disk_id}\n")
         f.write(f"  Eject:   diskutil eject /dev/{config.disk_id}\n")
         if result.finalized:
@@ -426,10 +448,16 @@ class OpticalDiscBackup:
     
     def __init__(self, config: BackupConfig):
         self.config = config
+        self.run: Optional[RunContext] = None
         
     def create_backup(self) -> BackupResult:
         """Main entry point for creating backup"""
         start_time = datetime.datetime.now()
+        self.run = RunContext(
+            run_id=f"{start_time.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.disk_id}",
+            run_uuid=str(uuid4()),
+            start_time=start_time,
+        )
         
         # No title divider here - already shown in main()
         
@@ -471,6 +499,7 @@ class OpticalDiscBackup:
             created_output_dir = False
         
         # Generate tree listing (this is the first divider after user inputs)
+        self.run.mark("tree")
         tree_ok = self._generate_tree_listing()
         
         # Unmount disk; record the failure rather than dd a mounted device.
@@ -479,6 +508,7 @@ class OpticalDiscBackup:
         unmount_ok = None
         finalized = False
         if not self.config.dry_run:
+            self.run.mark("unmount")
             unmount_ok = self._unmount_disk()
             if not unmount_ok:
                 backup_error = f"Failed to unmount /dev/{self.config.disk_id}"
@@ -503,6 +533,7 @@ class OpticalDiscBackup:
                 log(colorize("red", f"Backup failed: {backup_error}"))
             finally:
                 # Remount and eject the disc even if the backup failed
+                self.run.mark("finalize")
                 finalized = self._finalize_disk()
 
         # Create result
@@ -559,7 +590,7 @@ class OpticalDiscBackup:
         self._generate_summary(result)
         
         # Save formatted log with all the details
-        create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info, iso_analysis)
+        create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info, iso_analysis, self.run)
 
         self._create_manifest(result, disk_info, iso_analysis)
 
@@ -625,6 +656,8 @@ class OpticalDiscBackup:
         raw_hasher = hashlib.md5()
         bytes_written = 0
         start_time = time.time()
+        if self.run:
+            self.run.mark("copy_start")
 
         # Initialize progress display
         print("\n" * 4, end="")
@@ -668,6 +701,8 @@ class OpticalDiscBackup:
 
         creation_time = time.time() - start_time
         raw_hash = raw_hasher.hexdigest()
+        if self.run:
+            self.run.mark("copy_end")
 
         log(colorize("green", "ISO creation complete."))
         log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
@@ -684,6 +719,8 @@ class OpticalDiscBackup:
         iso_hasher = hashlib.md5()
         verify_start = time.time()
         bytes_read = 0
+        if self.run:
+            self.run.mark("verify_start")
 
         # Initialize progress display
         print("\n" * 4, end="")
@@ -705,6 +742,8 @@ class OpticalDiscBackup:
 
         verification_time = time.time() - verify_start
         iso_hash = iso_hasher.hexdigest()
+        if self.run:
+            self.run.mark("verify_end")
 
         log(colorize("cyan", "MD5 (ISO):") + " " + colorize("yellow", iso_hash))
         log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
@@ -976,8 +1015,8 @@ class OpticalDiscBackup:
         # Build comprehensive manifest
         manifest = {
             "backup_metadata": {
-                "run_id": f"{now.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.disk_id}",
-                "uuid": str(uuid4()),
+                "run_id": self.run.run_id if self.run else f"{now.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.disk_id}",
+                "uuid": self.run.run_uuid if self.run else str(uuid4()),
                 "tool_name": "Optical Disc ISO Backup Utility",
                 "tool_version": "v14-streamlined",
                 "created": now.isoformat(timespec="seconds"),
@@ -1254,6 +1293,8 @@ class OpticalDiscBackup:
     def _analyze_iso_structure(self, iso_path: Path) -> Dict[str, Any]:
         """Analyze ISO structure with isolyzer"""
         log_divider("Analyzing ISO Structure")
+        if self.run:
+            self.run.mark("isolyzer")
         log(colorize("cyan", "Running isolyzer analysis..."))
         
         try:
