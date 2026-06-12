@@ -17,6 +17,7 @@ import platform
 import argparse
 import json
 import logging
+import fcntl
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ class BackupConfig:
     output_dir: Path
     dry_run: bool = False
     no_verification: bool = False
+    force: bool = False
     media_type: str = "Unknown"
 
     @property
@@ -278,9 +280,9 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         create_start = start_time + datetime.timedelta(seconds=1)  # Approximate
         create_end = create_start + datetime.timedelta(seconds=result.creation_time)
         
-        f.write(f"[{create_start.strftime('%H:%M:%S')}] ISO Creation & Verification\n")
+        f.write(f"[{create_start.strftime('%H:%M:%S')}] ISO Creation\n")
         f.write(f"  Command: dd if=/dev/r{config.disk_id} of={result.iso_path} bs=4m\n")
-        f.write(f"  Method:  Parallel processing (creation + hashing)\n")
+        f.write(f"  Method:  Streamed copy with in-stream source (raw disk) hashing\n")
         f.write(f"  Duration: {format_duration(result.creation_time)}\n")
         speed = result.speed_mb_s(result.creation_time)
         multiplier = calculate_disc_speed_multiplier(speed, config.media_type)
@@ -291,10 +293,12 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         if result.md5_iso and result.md5_raw:
             f.write("VERIFICATION RESULTS\n")
             f.write("-" * 20 + "\n")
+            f.write(f"Method:         Written ISO re-read from disk, compared to streamed raw disk hash\n")
             f.write(f"MD5 (ISO):      {result.md5_iso}\n")
             f.write(f"MD5 (Raw Disk): {result.md5_raw}\n")
             f.write(f"Match:          {'YES' if result.checksum_match else 'NO'}\n")
-            f.write(f"Algorithm:      MD5 (128-bit)\n\n")
+            f.write(f"Algorithm:      MD5 (128-bit)\n")
+            f.write(f"Duration:       {format_duration(result.verification_time)}\n\n")
         
         # ISO Structure Analysis
         if config.isolyzer_path.exists():
@@ -399,6 +403,18 @@ class OpticalDiscBackup:
         
         disk_size = disk_info.get("TotalSize", 0)
         self.config.media_type = disk_info.get("OpticalMediaType", "Unknown")
+
+        # Safety guard: refuse to image anything diskutil does not identify as
+        # optical media, so a mistyped disk ID can't unmount and read an
+        # internal or external drive. --force overrides for drives that
+        # misreport their media type.
+        if not disk_info.get("OpticalMediaType") and not self.config.force:
+            device_desc = disk_info.get('MediaName', disk_info.get('IORegistryEntryName', 'unknown device'))
+            log(colorize("red", f"/dev/{self.config.disk_id} does not appear to be an optical disc "
+                                f"(device: {device_desc}). Refusing to continue. Use --force to override."))
+            return BackupResult(False, self.config.output_path, disk_size,
+                                error_message=f"/dev/{self.config.disk_id} is not optical media")
+
         if self.config.output_path.exists() and not self._confirm_overwrite():
             return BackupResult(False, self.config.output_path, disk_size, error_message="Aborted to avoid overwrite")
         
@@ -417,32 +433,49 @@ class OpticalDiscBackup:
         # Generate tree listing (this is the first divider after user inputs)
         self._generate_tree_listing()
         
-        # Unmount disk
+        # Unmount disk; abort rather than dd a device that is still mounted
         if not self.config.dry_run:
-            self._unmount_disk()
+            if not self._unmount_disk():
+                return BackupResult(False, self.config.output_path, disk_size,
+                                    error_message=f"Failed to unmount /dev/{self.config.disk_id}")
         
-        # Create and verify ISO (with parallel hashing unless dry run)
-        if self.config.dry_run:
-            creation_time, md5_iso, md5_raw = 0.0, "dry_run_hash", "dry_run_hash"
-            iso_analysis = {"skipped": True, "reason": "dry run"}
-            log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Skipping .iso creation and verification."))
-        else:
-            creation_time, md5_iso, md5_raw = self._create_and_verify_iso(disk_size)
-            # Analyze ISO structure
-            iso_analysis = self._analyze_iso_structure(self.config.output_path)
-        
-        # Remount and finalize
-        self._finalize_disk()
-        
+        # Create ISO (with in-stream source hashing), then verify by re-reading it.
+        # Wrapped so the disc is always remounted/ejected and the run is always
+        # documented, even when the copy or verification fails partway.
+        backup_error = None
+        try:
+            if self.config.dry_run:
+                creation_time, verification_time, md5_iso, md5_raw = 0.0, 0.0, None, None
+                iso_analysis = {"skipped": True, "reason": "dry run"}
+                log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Skipping .iso creation and verification."))
+            else:
+                creation_time, verification_time, md5_iso, md5_raw = self._create_and_verify_iso(disk_size)
+                # Analyze ISO structure
+                iso_analysis = self._analyze_iso_structure(self.config.output_path)
+        except Exception as e:
+            backup_error = str(e)
+            creation_time, verification_time, md5_iso, md5_raw = 0.0, 0.0, None, None
+            iso_analysis = {"skipped": True, "reason": f"backup failed: {e}"}
+            log(colorize("red", f"Backup failed: {e}"))
+            # Don't leave a truncated image that could pass for a finished master
+            if self.config.output_path.exists():
+                partial_path = self.config.output_path.with_name(self.config.output_path.name + ".partial")
+                self.config.output_path.rename(partial_path)
+                log(colorize("yellow", f"Partial ISO renamed to: {partial_path.name}"))
+        finally:
+            # Remount and eject the disc even if the backup failed
+            self._finalize_disk()
+
         # Create result
         result = BackupResult(
-            success=True,
+            success=backup_error is None,
             iso_path=self.config.output_path,
             disk_size=disk_size,
             md5_iso=md5_iso,
             md5_raw=md5_raw,
             creation_time=creation_time,
-            verification_time=0.0  # Verification is done during creation
+            verification_time=verification_time,
+            error_message=backup_error
         )
         
         # Generate outputs
@@ -482,28 +515,22 @@ class OpticalDiscBackup:
         except Exception as e:
             log(colorize("red", f"Tree generation failed: {e}"))
     
-    def _create_and_verify_iso(self, disk_size: int) -> Tuple[float, str, str]:
-        """Create ISO with parallel hash calculation"""
-        log_divider("Creating and Verifying ISO")
+    def _create_and_verify_iso(self, disk_size: int) -> Tuple[float, float, Optional[str], str]:
+        """Create ISO with in-stream source hashing, then verify by re-reading the written file"""
+        log_divider("Creating ISO")
         log(colorize("cyan", "Creating ISO from:") + " " + colorize("yellow", self.config.disk_id))
-        
+
         raw_disk = f"r{self.config.disk_id}"
         dd_command = f"dd if=/dev/{raw_disk} of={self.config.output_path} bs=4m"
         log(colorize("cyan", "Running command:") + " " + colorize("yellow", dd_command))
-        log(colorize("cyan", "Verifying using:") + " " + colorize("yellow", f"md5 {self.config.output_path.name} and streamed raw disk hash"))
-        
-        # Show shell equivalent
-        shell_equiv = f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
-        log(colorize("cyan", "Shell equivalent:") + " " + colorize("yellow", shell_equiv))
-        
-        iso_hasher = hashlib.md5()
+
         raw_hasher = hashlib.md5()
         bytes_written = 0
         start_time = time.time()
-        
+
         # Initialize progress display
         print("\n" * 4, end="")
-        
+
         try:
             with open(self.config.output_path, 'wb') as iso_file:
                 with subprocess.Popen(["dd", f"if=/dev/{raw_disk}", "bs=4m"],
@@ -512,45 +539,96 @@ class OpticalDiscBackup:
                         chunk = proc.stdout.read(4 * 1024 * 1024)  # 4MB chunks
                         if not chunk:
                             break
-                        
-                        # Write to file and update hashes
+
+                        # Write to file and update the streamed source hash
                         iso_file.write(chunk)
-                        iso_hasher.update(chunk)
                         raw_hasher.update(chunk)
                         bytes_written += len(chunk)
-                        
+
                         # Update progress (with "ISO Creation:" label to match expected output)
                         self._display_progress("ISO Creation", bytes_written, disk_size, start_time)
-                    
+
                     # Wait for dd to complete and get stderr (which contains the transfer stats)
                     _, stderr = proc.communicate()
                     if proc.returncode != 0:
                         raise RuntimeError(f"dd failed: {stderr.decode()}")
-                    
+
                     # Print dd output (records in/out, transfer stats) - decode and strip
                     if stderr:
                         # Decode bytes to string and clean up the output
                         dd_output = stderr.strip() if isinstance(stderr, str) else stderr.decode().strip()
                         log(dd_output)
-        
+
+                # Force data to physical media before the verification pass below;
+                # plain fsync on macOS stops at the drive cache, F_FULLFSYNC does not.
+                iso_file.flush()
+                try:
+                    fcntl.fcntl(iso_file.fileno(), fcntl.F_FULLFSYNC)
+                except (OSError, AttributeError):
+                    os.fsync(iso_file.fileno())
+
         except KeyboardInterrupt:
             log(colorize("red", "Operation interrupted by user."))
             sys.exit(1)
-        
+
         creation_time = time.time() - start_time
-        iso_hash = iso_hasher.hexdigest()
         raw_hash = raw_hasher.hexdigest()
-        
+
         log(colorize("green", "ISO creation complete."))
+        log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
+
+        if self.config.no_verification:
+            log(colorize("yellow", "Skipping verification (--no-verification)."))
+            return creation_time, 0.0, None, raw_hash
+
+        # Independent verification: re-read the written ISO from disk and hash it,
+        # so the comparison reflects the bytes that actually landed on disk.
+        log_divider("Verifying ISO")
+        log(colorize("cyan", "Verifying using:") + " " + colorize("yellow", f"md5 {self.config.output_path.name} (re-read from disk) vs streamed raw disk hash"))
+
+        # Show shell equivalent
+        shell_equiv = f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
+        log(colorize("cyan", "Shell equivalent:") + " " + colorize("yellow", shell_equiv))
+
+        iso_hasher = hashlib.md5()
+        verify_start = time.time()
+        bytes_read = 0
+
+        # Initialize progress display
+        print("\n" * 4, end="")
+
+        try:
+            with open(self.config.output_path, 'rb') as iso_file:
+                # Bypass the page cache so we hash what is on disk, not the
+                # copy of the data still sitting in memory from the write.
+                try:
+                    fcntl.fcntl(iso_file.fileno(), fcntl.F_NOCACHE, 1)
+                except (OSError, AttributeError):
+                    pass
+                while True:
+                    chunk = iso_file.read(4 * 1024 * 1024)  # 4MB chunks
+                    if not chunk:
+                        break
+                    iso_hasher.update(chunk)
+                    bytes_read += len(chunk)
+                    self._display_progress("Verification", bytes_read, bytes_written, verify_start)
+
+        except KeyboardInterrupt:
+            log(colorize("red", "Operation interrupted by user."))
+            sys.exit(1)
+
+        verification_time = time.time() - verify_start
+        iso_hash = iso_hasher.hexdigest()
+
         log(colorize("cyan", "MD5 (ISO):") + " " + colorize("yellow", iso_hash))
         log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
-        
+
         if iso_hash == raw_hash:
-            log(colorize("green", "Checksum match: ISO is a true bit-for-bit copy."))
+            log(colorize("green", "Checksum match: ISO on disk is a true bit-for-bit copy."))
         else:
-            log(colorize("red", "Checksum mismatch! ISO may not be identical."))
-        
-        return creation_time, iso_hash, raw_hash
+            log(colorize("red", "Checksum mismatch! ISO on disk does not match the source stream."))
+
+        return creation_time, verification_time, iso_hash, raw_hash
     
     def _display_progress(self, title: str, current: int, total: int, start_time: float):
         """Display progress information"""
@@ -609,12 +687,14 @@ class OpticalDiscBackup:
         """Generate timing summary"""
         log_divider("Summary")
         if not self.config.dry_run:
-            elapsed = result.creation_time
-            speed = result.speed_mb_s(elapsed)
+            speed = result.speed_mb_s(result.creation_time)
             multiplier = calculate_disc_speed_multiplier(speed, self.config.media_type)
-            log(colorize("cyan", "Time to create + verify:") + " " + colorize("yellow", f"{elapsed:.2f} seconds") +
-                f" ({format_duration(elapsed)})")
-            log(colorize("cyan", "Average speed:") + " " + colorize("yellow", f"{speed:.2f} MB/s ({multiplier})"))
+            log(colorize("cyan", "Time to create:") + " " + colorize("yellow", f"{result.creation_time:.2f} seconds") +
+                f" ({format_duration(result.creation_time)})")
+            if result.verification_time:
+                log(colorize("cyan", "Time to verify:") + " " + colorize("yellow", f"{result.verification_time:.2f} seconds") +
+                    f" ({format_duration(result.verification_time)})")
+            log(colorize("cyan", "Average creation speed:") + " " + colorize("yellow", f"{speed:.2f} MB/s ({multiplier})"))
         else:
             log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "No timing summary available."))
     
@@ -861,12 +941,12 @@ class OpticalDiscBackup:
                 },
                 "iso_creation": {
                     "command": f"dd if=/dev/r{self.config.disk_id} of={result.iso_path} bs=4m",
-                    "method": "parallel processing with simultaneous hash calculation",
+                    "method": "streamed copy with in-stream source hash calculation",
                     "block_size": "4MB",
                     "performed": not self.config.dry_run
                 },
                 "verification": {
-                    "method": "md5 hash comparison (ISO file vs raw device stream)",
+                    "method": "md5 hash comparison (written ISO re-read from disk vs raw device stream)",
                     "algorithm": "MD5",
                     "algorithm_bits": 128,
                     "performed": not self.config.no_verification and not self.config.dry_run,
@@ -888,14 +968,14 @@ class OpticalDiscBackup:
                     "average_speed_multiplier": calculate_disc_speed_multiplier(result.speed_mb_s(result.creation_time), self.config.media_type)
                 },
                 "verification": {
-                    "duration_seconds": 0.0,  # Done in parallel
-                    "duration_formatted": "Performed during creation",
-                    "note": "Verification performed during ISO creation (parallel processing)"
+                    "duration_seconds": result.verification_time,
+                    "duration_formatted": format_duration(result.verification_time),
+                    "note": "Written ISO re-read from disk and hashed after creation"
                 },
                 "total_operation": {
-                    "duration_seconds": result.creation_time,
-                    "duration_formatted": format_duration(result.creation_time),
-                    "efficiency_note": "~50% time savings vs sequential read/verify operations"
+                    "duration_seconds": result.total_time,
+                    "duration_formatted": format_duration(result.total_time),
+                    "efficiency_note": "Source hash computed in-stream during creation; verification adds one sequential read of the ISO"
                 }
             },
             
@@ -905,7 +985,7 @@ class OpticalDiscBackup:
                 "iso_hash": result.md5_iso,
                 "source_hash": result.md5_raw,
                 "hashes_match": result.checksum_match,
-                "verification_method": "Parallel hash calculation during creation",
+                "verification_method": "Source hashed in-stream during creation; written ISO re-read from disk (cache bypassed) and hashed",
                 "integrity_status": "verified" if result.checksum_match else ("failed" if result.checksum_match is False else "not_performed"),
                 "notes": "ISO verified as bit-perfect copy" if result.checksum_match else None
             },
@@ -996,7 +1076,7 @@ class OpticalDiscBackup:
                     "read_device": f"/dev/r{self.config.disk_id}",
                     "write_destination": str(result.iso_path),
                     "parallel_processing": True,
-                    "verification_during_creation": True,
+                    "verification_during_creation": False,
                     "error_handling": "standard dd error handling"
                 }
             },
@@ -1006,8 +1086,8 @@ class OpticalDiscBackup:
                     {
                         "type": "bit_perfect_copy",
                         "method": "MD5 hash comparison",
-                        "status": "verified" if result.checksum_match else "failed",
-                        "confidence": "100%" if result.checksum_match else "0%"
+                        "status": "verified" if result.checksum_match else ("failed" if result.checksum_match is False else "not_performed"),
+                        "confidence": "100%" if result.checksum_match else ("0%" if result.checksum_match is False else "n/a")
                     },
                     {
                         "type": "structural_integrity", 
@@ -1220,6 +1300,7 @@ def print_help():
   {colorize('green', '-h, --help')}              Show this help message and exit
   {colorize('green', '--dry-run')}               Run without writing ISO or verifying checksum
   {colorize('green', '--no-verification')}       Skip ISO checksum verification  
+  {colorize('green', '--force')}                 Skip the optical-media safety check
   {colorize('green', '--filename NAME')}         ISO filename (without extension)
   {colorize('green', '--dir PATH')}              Output directory path (can use ~)
   {colorize('green', '--operator NAME')}         Operator name or initials
@@ -1235,7 +1316,7 @@ def print_help():
   sudo python3 makeiso.py --dry-run
 
 {colorize('yellow', 'KEY FEATURES:')}
-  • {colorize('green', 'Parallel processing:')} Creates ISO while calculating checksums
+  • {colorize('green', 'Parallel processing:')} Creates ISO while calculating the source checksum
   • {colorize('green', 'Progress tracking:')} Real-time speed and remaining time
   • {colorize('green', 'Comprehensive logging:')} Detailed logs saved to .log.txt
   • {colorize('green', 'Metadata manifest:')} JSON file with complete backup metadata
@@ -1266,9 +1347,15 @@ def parse_args() -> argparse.Namespace:
     )
     
     parser.add_argument(
-        '--no-verification', 
-        action='store_true', 
+        '--no-verification',
+        action='store_true',
         help='Skip ISO checksum verification'
+    )
+
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Skip the optical-media safety check'
     )
     
     parser.add_argument(
@@ -1329,7 +1416,8 @@ def gather_user_inputs(args: argparse.Namespace) -> BackupConfig:
         operator=operator,
         output_dir=output_dir,
         dry_run=args.dry_run,
-        no_verification=args.no_verification
+        no_verification=args.no_verification,
+        force=args.force
     )
 
 ### === MAIN FUNCTION ===

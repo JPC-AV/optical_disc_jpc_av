@@ -81,7 +81,7 @@ This toolkit provides a two-stage workflow for optical disc digitization:
 ### makeiso.py (Preservation)
 
 - **Bit-perfect copying** — Reads from raw device (`/dev/rdiskN`) for true sector-by-sector backup
-- **Parallel verification** — MD5 checksums calculated simultaneously during ISO creation
+- **Independent verification** — source hashed in-stream during creation, then the written ISO is re-read from disk and compared
 - **Real-time progress** — Live display of speed, elapsed time, and ETA
 - **Comprehensive logging** — Detailed operation log with timestamps
 - **JSON manifest** — Machine-readable metadata for archival systems
@@ -315,7 +315,7 @@ If all commands return version information, you're ready to go!
 
 Creates archival-quality ISO images from optical discs while simultaneously verifying data integrity. Designed for digital preservation workflows where verification and documentation are critical.
 
-The script reads directly from the raw device (bypassing filesystem caching) and calculates MD5 checksums during the copy process—eliminating the need for a separate verification pass and reducing total backup time by approximately 50%.
+The script reads directly from the raw device (bypassing filesystem caching) and calculates the source MD5 checksum during the copy. After the copy completes, it verifies the backup by re-reading the written ISO from disk and comparing its hash against the source — so verification reflects the bytes that actually landed on disk, not the in-memory stream.
 
 ### Quick Start
 
@@ -363,7 +363,8 @@ sudo python3 makeiso.py [options]
 Options:
   -h, --help              Show help message and exit
   --dry-run               Run without creating ISO (test mode)
-  --no-verification       Skip recording of MD5 verification results (checksums are still calculated during creation)
+  --no-verification       Skip the post-write verification pass (the source checksum is still calculated during creation)
+  --force                 Skip the optical-media safety check (allows imaging devices diskutil does not report as optical)
   --filename NAME         ISO filename (without .iso extension)
   --dir PATH              Output directory (supports ~)
   --operator NAME         Operator name or initials for logging
@@ -415,11 +416,11 @@ The script executes the following steps:
 └─────────────────────────────────────────────────────────────────┘
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  4. ISO CREATION + VERIFICATION (parallel)                      │
+│  4. ISO CREATION + VERIFICATION (two-phase)                     │
 │     • Read from raw device (/dev/rdiskN)                        │
 │     • Write to ISO file                                         │
-│     • Calculate MD5 of written data                             │
 │     • Calculate MD5 of source stream                            │
+│     • Flush to disk, re-read ISO, verify MD5                    │
 │     • Display real-time progress                                │
 └─────────────────────────────────────────────────────────────────┘
                               ▼
@@ -487,7 +488,7 @@ Avg Speed: 24.67MB/s
 ```
 MD5 (ISO):      a1b2c3d4e5f6...
 MD5 (Raw Disk): a1b2c3d4e5f6...
-Checksum match: ISO is a true bit-for-bit copy.
+Checksum match: ISO on disk is a true bit-for-bit copy.
 ```
 
 #### Exit Codes
@@ -804,28 +805,34 @@ python3 makeiso-video.py -i disc.iso --preset slow
 
 ### How Verification Works
 
-`makeiso.py` uses **parallel hash calculation** during the copy process:
+`makeiso.py` verifies in **two phases**, so the two hashes being compared come from independent reads:
 
 ```
+Phase 1 — Creation (single pass over the disc)
+
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │  Raw Device  │────▶│  4MB Chunk   │────▶│   ISO File   │
 │ /dev/rdisk2  │     │              │     │              │
 └──────────────┘     └──────┬───────┘     └──────────────┘
-                           │
-                     ┌─────┴─────┐
-                     ▼           ▼
-              ┌──────────┐ ┌──────────┐
-              │ MD5 Hash │ │ MD5 Hash │
-              │  (raw)   │ │  (iso)   │
-              └──────────┘ └──────────┘
+                            │
+                            ▼
+                     ┌────────────┐
+                     │  MD5 Hash  │
+                     │   (raw)    │
+                     └────────────┘
+
+Phase 2 — Verification (after forcing the file to physical disk)
+
+┌──────────────┐     ┌──────────────┐     ┌────────────┐
+│   ISO File   │────▶│  4MB Chunk   │────▶│  MD5 Hash  │
+│  re-read,    │     │              │     │   (iso)    │
+│ cache bypass │     └──────────────┘     └────────────┘
+└──────────────┘
 ```
 
-Each 4MB chunk is:
-1. Read from the raw device
-2. Written to the ISO file
-3. Fed to **two** MD5 hashers simultaneously
+During creation, each 4MB chunk is read from the raw device, written to the ISO file, and fed to the source (raw) MD5 hasher. After the copy completes, the script forces the file to physical media (`F_FULLFSYNC`), then re-reads the written ISO from disk with the page cache bypassed (`F_NOCACHE`) and hashes it independently.
 
-This ensures both hashes are calculated from the same data stream in a single pass.
+Because the second hash comes from the bytes that actually landed on disk — not from the in-memory stream — a mismatch catches write errors, truncated writes, and destination-disk corruption. `--no-verification` skips Phase 2; the source hash is always calculated and recorded.
 
 ### Manifest Structure
 
