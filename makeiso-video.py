@@ -64,14 +64,6 @@ class ConversionConfig:
     def skip_manifest_path(self) -> Path:
         return self.output_dir / f"{self.iso_name}_skip_manifest.json"
 
-    @property
-    def error_manifest_path(self) -> Path:
-        return self.output_dir / f"{self.iso_name}_error_manifest.json"
-
-    @property
-    def aborted_manifest_path(self) -> Path:
-        return self.output_dir / f"{self.iso_name}_aborted_manifest.json"
-
 @dataclass
 class DiscContentAnalysis:
     """Analysis of ISO content structure"""
@@ -531,6 +523,16 @@ class ISOToMP4Converter:
         self.config = config
         self.start_time: Optional[datetime.datetime] = None
         self.run: Optional[RunContext] = None
+        self._failure_token: Optional[str] = None
+
+    def _get_failure_token(self, kind: str = "failed") -> str:
+        """One token per run names every failure artifact (quarantined
+        partials, failure log, failure manifest), so a failed attempt's
+        evidence groups together and retries can never overwrite it"""
+        if self._failure_token is None:
+            self._failure_token = (f"{kind}-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}"
+                                   f"-{uuid4().hex[:6]}")
+        return self._failure_token
 
     def convert(self) -> ConversionResult:
         """Main entry point for conversion"""
@@ -554,8 +556,9 @@ class ISOToMP4Converter:
                 self._create_skip_manifest(result)
                 self._create_log_file(result, dry_run=self.config.dry_run)
             elif result.error_message:
-                self._create_error_manifest(result)
-                self._create_log_file(result, is_error=True)
+                token = self._get_failure_token("aborted" if result.aborted else "failed")
+                self._create_error_manifest(result, token)
+                self._create_log_file(result, is_error=True, failure_token=token)
 
         return result
 
@@ -579,6 +582,10 @@ class ISOToMP4Converter:
                 error_message=f"ISO file not found: {self.config.iso_path}"
             )
 
+        # Stat the source early so every record (including dependency
+        # failures below) carries the real ISO size
+        iso_size = self.config.iso_path.stat().st_size
+
         # Dependencies: ffmpeg (encode) AND ffprobe (analysis/verification)
         # are both required before any disc activity
         ffmpeg_available, ffmpeg_version = check_ffmpeg()
@@ -586,6 +593,7 @@ class ISOToMP4Converter:
             return ConversionResult(
                 success=False,
                 iso_path=self.config.iso_path,
+                source_size=iso_size,
                 error_message="ffmpeg not found. Please install ffmpeg."
             )
         ffprobe_available, _ = check_ffprobe()
@@ -593,27 +601,27 @@ class ISOToMP4Converter:
             return ConversionResult(
                 success=False,
                 iso_path=self.config.iso_path,
+                source_size=iso_size,
                 error_message="ffprobe not found (it ships with ffmpeg). Please install ffmpeg."
             )
         log(colorize("cyan", f"Using ffmpeg version: {ffmpeg_version}"))
 
         # Symlink guard, phase 1: statically-known record/output paths.
-        # (Per-title MP4 paths are guarded after titleset planning.)
+        # (Per-title MP4 paths are guarded after titleset planning; failure
+        # records use unpredictable tokened names and need no guard.)
         static_paths = [self.config.mp4_path, self.config.log_path,
                         self.config.dry_run_log_path, self.config.manifest_path,
-                        self.config.skip_manifest_path, self.config.error_manifest_path,
-                        self.config.aborted_manifest_path]
+                        self.config.skip_manifest_path]
         symlink_error = self._check_symlinks(static_paths)
         if symlink_error:
             return ConversionResult(
                 success=False,
                 iso_path=self.config.iso_path,
+                source_size=iso_size,
                 error_message=symlink_error,
                 records_unsafe=True  # record paths themselves are suspect
             )
 
-        # Get ISO size
-        iso_size = self.config.iso_path.stat().st_size
         log(colorize("cyan", f"ISO size: {format_bytes(iso_size)}"))
 
         # Mount and analyze ISO
@@ -850,13 +858,16 @@ class ISOToMP4Converter:
 
         return result
 
-    def _quarantine_partial(self, path: Path) -> Optional[Path]:
+    def _quarantine_partial(self, path: Path, display_base: Optional[Path] = None) -> Optional[Path]:
         """Rename a partial/failed output so it can't pass for a finished
-        access copy; the random suffix means retries never overwrite it"""
+        access copy. Named from the run's shared failure token (and the final
+        output's stem, not the temp name) so all artifacts of one failed
+        attempt group together and retries never overwrite evidence."""
         if not path.exists():
             return None
-        token = f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
-        marked = path.with_name(f"{path.stem}_{token}.mp4.partial")
+        base = display_base or path
+        token = self._get_failure_token()
+        marked = path.with_name(f"{base.stem}_{token}.mp4.partial")
         path.rename(marked)
         log(colorize("yellow", f"Partial output renamed to: {marked.name}"))
         return marked
@@ -866,6 +877,16 @@ class ISOToMP4Converter:
         """Encode one titleset's content VOBs to MP4 and verify the output"""
         for vob in plan.content_vobs:
             log(colorize("cyan", f"  + {vob.name} ({format_bytes(vob.stat().st_size)})"))
+
+        # Encode to a run-private temp path; the final name is only ever
+        # written by an atomic replace() after the output verifies. ffmpeg
+        # never opens the final path, so a failed retry cannot damage a
+        # pre-existing good file there.
+        while True:
+            temp_path = plan.output_path.with_name(
+                f"{plan.output_path.stem}.encoding-{uuid4().hex[:6]}.mp4")
+            if not temp_path.exists():
+                break
 
         concat_input = "concat:" + "|".join(str(v) for v in plan.content_vobs)
         ffmpeg_cmd = [
@@ -882,7 +903,7 @@ class ISOToMP4Converter:
             "-b:a", self.config.audio_bitrate,
             "-movflags", "+faststart",  # Enable streaming
             "-pix_fmt", "yuv420p",  # Compatibility
-            str(plan.output_path)
+            str(temp_path)
         ]
         log(colorize("cyan", "Command:") + " " + colorize("yellow", " ".join(ffmpeg_cmd)))
 
@@ -926,7 +947,7 @@ class ISOToMP4Converter:
                 log(colorize("red", f"ffmpeg error:\n{stderr_text}"))
                 title.status = "failed"
                 title.error = f"ffmpeg failed with return code {process.returncode}"
-                title.partial_path = self._quarantine_partial(plan.output_path)
+                title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
                 return
 
         except KeyboardInterrupt:
@@ -936,26 +957,26 @@ class ISOToMP4Converter:
             title.encode_time = time.time() - encode_start
             title.status = "failed"
             title.error = "Interrupted by operator (Ctrl-C)"
-            title.partial_path = self._quarantine_partial(plan.output_path)
+            title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
             raise
         except Exception as e:
             title.encode_time = time.time() - encode_start
             title.status = "failed"
             title.error = str(e)
-            title.partial_path = self._quarantine_partial(plan.output_path)
+            title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
             return
 
-        # Verify output exists
-        if not plan.output_path.exists():
+        # Verify output exists (still at the temp path — promotion comes last)
+        if not temp_path.exists():
             title.status = "failed"
             title.error = "Output file was not created"
             return
 
-        title.output_size = plan.output_path.stat().st_size
-        title.video_duration = get_video_duration(plan.output_path)
+        title.output_size = temp_path.stat().st_size
+        title.video_duration = get_video_duration(temp_path)
 
         # Record what was actually mapped (closes the loop on stream loss)
-        output_counts = probe_stream_counts(plan.output_path)
+        output_counts = probe_stream_counts(temp_path)
         title.mapped_video_streams = output_counts.get("video", 0)
         title.mapped_audio_streams = output_counts.get("audio", 0)
         if title.source_audio_streams and title.mapped_audio_streams < title.source_audio_streams:
@@ -978,7 +999,11 @@ class ISOToMP4Converter:
         if self.run:
             self.run.mark(f"checksum_vts_{plan.vts_number:02d}")
         log(colorize("cyan", "Calculating MD5 hash of output file..."))
-        title.md5 = calculate_md5(plan.output_path)
+        title.md5 = calculate_md5(temp_path)
+
+        # Everything verified — atomically promote the temp onto the final
+        # name (replaces an operator-approved overwrite target in one step)
+        temp_path.replace(plan.output_path)
 
         title.status = "completed"
         log(colorize("green", f"{plan.output_path.name} complete "
@@ -1018,10 +1043,17 @@ class ISOToMP4Converter:
             log(colorize("yellow", f"Warning: {warning}"))
         log(colorize("green", "Conversion completed successfully!"))
     
-    def _create_log_file(self, result: ConversionResult, dry_run: bool = False, is_error: bool = False):
-        """Create formatted log file"""
+    def _create_log_file(self, result: ConversionResult, dry_run: bool = False,
+                         is_error: bool = False, failure_token: Optional[str] = None):
+        """Create formatted log file.
+
+        Failure/aborted logs are written under the run's failure token so a
+        failed retry never overwrites the log a prior success manifest
+        references (nor an earlier failure's log)."""
         if dry_run:
             log_path = self.config.dry_run_log_path
+        elif failure_token:
+            log_path = self.config.output_dir / f"{self.config.iso_name}_{failure_token}.log.txt"
         else:
             log_path = self.config.log_path
     
@@ -1184,7 +1216,8 @@ class ISOToMP4Converter:
                     "source_audio_streams": t.source_audio_streams,
                     "source_subtitle_streams": t.source_subtitle_streams,
                     "mapped_audio_streams": t.mapped_audio_streams,
-                    "partial_renamed_to": t.partial_path.name if t.partial_path else None,
+                    "final_intended_path": str(t.output_path),
+                    "partial_renamed_to": str(t.partial_path) if t.partial_path else None,
                     "error": t.error
                 } for i, t in enumerate(result.titles)
             ]
@@ -1352,11 +1385,13 @@ class ISOToMP4Converter:
 
         log(colorize("cyan", f"Skip manifest saved to: {self.config.skip_manifest_path}"))
     
-    def _create_error_manifest(self, result: ConversionResult):
+    def _create_error_manifest(self, result: ConversionResult, failure_token: str):
         """Create manifest for failed or operator-aborted conversions.
 
         Carries the full per-titleset record so a mixed run (one title
-        completed, another failed) loses nothing machine-readable."""
+        completed, another failed) loses nothing machine-readable. Written
+        under the run's failure token so retries never overwrite prior
+        evidence (the success manifest or earlier failures)."""
         now = datetime.datetime.now()
         status = "aborted" if result.aborted else "error"
 
@@ -1376,6 +1411,10 @@ class ISOToMP4Converter:
                 "interrupted": result.interrupted,
                 "warnings": result.warnings,
                 "error_message": result.error_message
+            },
+
+            "output_files": {
+                "log_file": str(self.config.output_dir / f"{self.config.iso_name}_{failure_token}.log.txt")
             },
 
             "source_iso": {
@@ -1402,8 +1441,7 @@ class ISOToMP4Converter:
             }
         }
 
-        manifest_path = self.config.aborted_manifest_path if result.aborted \
-            else self.config.error_manifest_path
+        manifest_path = self.config.output_dir / f"{self.config.iso_name}_{failure_token}_manifest.json"
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
         with open(manifest_path, "w") as f:

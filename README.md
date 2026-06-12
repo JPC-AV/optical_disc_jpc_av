@@ -675,6 +675,18 @@ Each encode uses explicit stream mapping (`-map 0:v:0 -map 0:a? -sn`):
 - **Subtitles are not encoded** — DVD bitmap subtitles are not MP4-compatible; their presence is recorded in the manifest, and they remain intact in the preservation ISO.
 - The manifest records both the source stream counts and the streams actually mapped into each output, plus a best-effort duration comparison that warns if an output is >5% shorter than expected (possible truncation).
 
+### Failed Conversion Naming
+
+Encodes write to a temporary `*.encoding-<random>.mp4` file that atomically replaces the final name only after the output verifies — a failed retry can never damage a pre-existing good MP4. All artifacts of one failed attempt share a `failed-<timestamp>-<random>` token (`aborted-…` for operator aborts) so retries never overwrite earlier evidence:
+
+```
+JPC_AV_00001_failed-20260612T150000-3f9a2c.mp4.partial   # quarantined partial encode
+JPC_AV_00001_failed-20260612T150000-3f9a2c.log.txt       # log for that attempt
+JPC_AV_00001_failed-20260612T150000-3f9a2c_manifest.json # manifest for that attempt
+```
+
+A hard kill (power loss, `kill -9`) may leave a `*.encoding-*.mp4` temp file behind; it is incomplete by definition and safe to delete.
+
 ### Menu VOBs Are Intentionally Excluded
 
 > **Note:** During conversion you will see output like:
