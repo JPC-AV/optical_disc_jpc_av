@@ -85,15 +85,16 @@ class BackupResult:
     
     @property
     def checksum_match(self) -> Optional[bool]:
-        """Whether checksums match (None if verification never produced ISO hashes).
+        """Whether checksums match.
 
-        Requires every recorded algorithm pair to match — MD5 always, and
-        SHA-256 too when present."""
-        if self.md5_iso and self.md5_raw:
-            match = self.md5_iso == self.md5_raw
-            if self.sha256_iso and self.sha256_raw:
-                match = match and self.sha256_iso == self.sha256_raw
-            return match
+        False if any recorded pair mismatches; True only when both the MD5
+        and SHA-256 pairs are present and match; None when verification
+        never produced a complete set of hashes."""
+        pairs = [(self.md5_iso, self.md5_raw), (self.sha256_iso, self.sha256_raw)]
+        if any(a and b and a != b for a, b in pairs):
+            return False
+        if all(a and b for a, b in pairs):
+            return True
         return None
     
     @property
@@ -424,7 +425,9 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         # Finalization
         f.write(f"[{step_time('finalize', create_end + datetime.timedelta(seconds=1))}] Finalization\n")
         f.write(f"  Eject:   diskutil eject /dev/{config.disk_id}\n")
-        if result.finalized:
+        if config.dry_run:
+            final_status = "Skipped (dry run)"
+        elif result.finalized:
             final_status = "Complete"
         elif result.unmount_ok is False:
             final_status = "Skipped (disc was never unmounted)"
@@ -526,6 +529,13 @@ class OpticalDiscBackup:
             created_output_dir = True
         except FileExistsError:
             created_output_dir = False
+        # A pre-existing path must be a real directory — a regular file or
+        # symlink here would fail late (mid-run, after the disc is unmounted)
+        if self.config.output_dir.is_symlink() or not self.config.output_dir.is_dir():
+            log(colorize("red", f"Output path {self.config.output_dir} exists but is not a real directory "
+                                f"(file or symlink). Refusing to continue."))
+            return BackupResult(False, self.config.output_path, disk_size,
+                                error_message=f"Output path {self.config.output_dir} is not a directory")
         
         # Generate tree listing (this is the first divider after user inputs)
         self.run.mark("tree")
@@ -592,6 +602,8 @@ class OpticalDiscBackup:
             result.warnings.append("disc finalization (eject) failed")
         if result.success and not tree_ok:
             result.warnings.append("tree listing failed or incomplete")
+        if result.success and not self.config.dry_run and iso_analysis.get('error'):
+            result.warnings.append(f"isolyzer structural analysis not performed ({iso_analysis['error']})")
 
         # Failed or aborted runs keep all their records under failure-marked
         # names, so they are obvious in the output directory and a retry can
@@ -749,7 +761,8 @@ class OpticalDiscBackup:
         log(colorize("cyan", "Verifying using:") + " " + colorize("yellow", f"md5 {self.config.output_path.name} (re-read from disk) vs streamed raw disk hash"))
 
         # Show shell equivalent
-        shell_equiv = f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
+        shell_equiv = (f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] '
+                       f'&& echo "MATCH" || echo "MISMATCH"  # MD5 shown; the script also compares SHA-256')
         log(colorize("cyan", "Shell equivalent:") + " " + colorize("yellow", shell_equiv))
 
         iso_hasher = hashlib.md5()
@@ -850,15 +863,14 @@ class OpticalDiscBackup:
         """Eject the disc; returns True if it ejected"""
         log_divider("Finalizing")
         if self.config.dry_run:
-            # Check if already mounted
-            mount_info = run_cmd(["diskutil", "info", self.config.disk_id])
-            already_mounted = any(re.match(r"\s*Mounted:\s*Yes", line) for line in mount_info.splitlines())
-            if already_mounted:
-                log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "No actions necessary. Disk already mounted."))
-            else:
-                log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Mounting disk but skipping eject."))
-                log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil mount {self.config.disk_id}"))
-                subprocess.run(["diskutil", "mount", self.config.disk_id])
+            # Inspect only — a dry run must not change system state
+            try:
+                mounted = bool(run_cmd(["diskutil", "info", "-plist", f"/dev/{self.config.disk_id}"],
+                                       plist=True).get("MountPoint"))
+                state = "mounted" if mounted else "not mounted"
+                log(colorize("cyan", "Dry run:") + " " + colorize("yellow", f"Disk is {state}; leaving as-is (no mount, no eject)."))
+            except Exception as e:
+                log(colorize("yellow", f"Dry run: could not read mount state: {e}"))
             return True
         else:
             # Eject directly — diskutil eject works on an unmounted disk, and
@@ -1142,7 +1154,8 @@ class OpticalDiscBackup:
                     "algorithms": ["MD5", "SHA-256"],
                     "algorithm_bits": 128,
                     "performed": result.md5_iso is not None,
-                    "shell_equivalent": f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
+                    "shell_equivalent": (f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] '
+                                         f'&& echo "MATCH" || echo "MISMATCH"  # MD5 shown; the script also compares SHA-256')
                 },
                 "finalization": {
                     "eject_command": f"diskutil eject /dev/{self.config.disk_id}",
@@ -1174,6 +1187,7 @@ class OpticalDiscBackup:
             "integrity_verification": {
                 "hash_algorithm": "MD5",
                 "hash_length_bits": 128,
+                "hash_algorithms": ["MD5", "SHA-256"],
                 "iso_hash": result.md5_iso,
                 "source_hash": result.md5_raw,
                 "sha256_iso_hash": result.sha256_iso,
@@ -1505,7 +1519,7 @@ def print_help():
   • {colorize('green', 'Comprehensive logging:')} Detailed logs saved to .log.txt
   • {colorize('green', 'Metadata manifest:')} JSON file with complete backup metadata
   • {colorize('green', 'Tree listing:')} Directory structure saved to .txt file
-  • {colorize('green', 'Cross-verification:')} Compares ISO and raw disk MD5 hashes
+  • {colorize('green', 'Cross-verification:')} Compares ISO and raw disk MD5 and SHA-256 hashes
 
 {colorize('red', 'IMPORTANT:')} This script must be run with sudo privileges.
 """
