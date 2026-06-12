@@ -34,7 +34,6 @@ class BackupConfig:
     operator: str
     output_dir: Path
     dry_run: bool = False
-    no_verification: bool = False
     force: bool = False
     media_type: str = "Unknown"
     mount_point: Optional[str] = None
@@ -463,9 +462,13 @@ class OpticalDiscBackup:
             return BackupResult(False, self.config.output_path, disk_size, error_message="Aborted to avoid overwrite")
         
         # Create output directory, remembering whether this run created it so
-        # we never chown a pre-existing directory we don't own (e.g. /tmp)
-        created_output_dir = not self.config.output_dir.exists()
-        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        # we never chown a pre-existing directory we don't own (e.g. /tmp).
+        # mkdir without exist_ok is atomic: no check-then-create race.
+        try:
+            self.config.output_dir.mkdir(parents=True)
+            created_output_dir = True
+        except FileExistsError:
+            created_output_dir = False
         
         # Generate tree listing (this is the first divider after user inputs)
         tree_ok = self._generate_tree_listing()
@@ -610,7 +613,7 @@ class OpticalDiscBackup:
             log(colorize("red", f"Tree generation failed: {e}"))
             return False
     
-    def _create_and_verify_iso(self, disk_size: int) -> Tuple[float, float, Optional[str], str]:
+    def _create_and_verify_iso(self, disk_size: int) -> Tuple[float, float, str, str]:
         """Create ISO with in-stream source hashing, then verify by re-reading the written file"""
         log_divider("Creating ISO")
         log(colorize("cyan", "Creating ISO from:") + " " + colorize("yellow", self.config.disk_id))
@@ -668,10 +671,6 @@ class OpticalDiscBackup:
 
         log(colorize("green", "ISO creation complete."))
         log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
-
-        if self.config.no_verification:
-            log(colorize("yellow", "Skipping verification (--no-verification)."))
-            return creation_time, 0.0, None, raw_hash
 
         # Independent verification: re-read the written ISO from disk and hash it,
         # so the comparison reflects the bytes that actually landed on disk.
@@ -1401,7 +1400,6 @@ def print_help():
 {colorize('yellow', 'OPTIONS:')}
   {colorize('green', '-h, --help')}              Show this help message and exit
   {colorize('green', '--dry-run')}               Run without writing ISO or verifying checksum
-  {colorize('green', '--no-verification')}       Skip ISO checksum verification  
   {colorize('green', '--force')}                 Skip the optical-media safety check
   {colorize('green', '--filename NAME')}         ISO filename (without extension)
   {colorize('green', '--dir PATH')}              Output directory path (can use ~)
@@ -1448,12 +1446,6 @@ def parse_args() -> argparse.Namespace:
         help='Run without writing ISO or verifying checksum'
     )
     
-    parser.add_argument(
-        '--no-verification',
-        action='store_true',
-        help='Skip ISO checksum verification'
-    )
-
     parser.add_argument(
         '--force',
         action='store_true',
@@ -1526,7 +1518,6 @@ def gather_user_inputs(args: argparse.Namespace) -> BackupConfig:
         operator=operator,
         output_dir=output_dir,
         dry_run=args.dry_run,
-        no_verification=args.no_verification,
         force=args.force
     )
 

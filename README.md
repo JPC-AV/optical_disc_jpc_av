@@ -363,7 +363,6 @@ sudo python3 makeiso.py [options]
 Options:
   -h, --help              Show help message and exit
   --dry-run               Run without creating ISO (test mode)
-  --no-verification       Skip the post-write verification pass (the source checksum is still calculated during creation)
   --force                 Skip the optical-media safety check (allows imaging devices diskutil does not report as optical)
   --filename NAME         ISO filename (without .iso extension)
   --dir PATH              Output directory (supports ~)
@@ -514,10 +513,9 @@ Checksum match: ISO on disk is a true bit-for-bit copy.
 | `1` | Failure — backup failed (see error message) |
 | `2` | Verification failed — written ISO does not match the source (run is marked failed) |
 
-> **Note:** Exit `0` covers three record states — the manifest's `overall_status` and the log header are the source of truth:
+> **Note:** Exit `0` covers two record states — the manifest's `overall_status` and the log header are the source of truth:
 > - `success` — verified master produced
 > - `success_with_warnings` — verified master, with a non-fatal problem recorded (e.g. a failed remount/eject or an incomplete tree listing; this workflow is operator-attended, so these don't change the exit code)
-> - `--no-verification` runs — master produced but verification was deliberately skipped (`verification_performed: false`, integrity status `not_performed`)
 
 ---
 
@@ -852,7 +850,7 @@ Phase 2 — Verification (after forcing the file to physical disk)
 
 During creation, each 4MB chunk is read from the raw device, written to the ISO file, and fed to the source (raw) MD5 hasher. After the copy completes, the script forces the file to physical media (`F_FULLFSYNC`), then re-reads the written ISO from disk with the page cache bypassed (`F_NOCACHE`) and hashes it independently.
 
-Because the second hash comes from the bytes that actually landed on disk — not from the in-memory stream — a mismatch catches write errors, truncated writes, and destination-disk corruption. `--no-verification` skips Phase 2; the source hash is always calculated and recorded.
+Because the second hash comes from the bytes that actually landed on disk — not from the in-memory stream — a mismatch catches write errors, truncated writes, and destination-disk corruption. Verification always runs; there is no option to skip it.
 
 ### Manifest Structure
 
