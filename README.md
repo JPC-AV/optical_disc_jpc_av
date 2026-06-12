@@ -87,7 +87,7 @@ This toolkit provides a two-stage workflow for optical disc digitization:
 - **JSON manifest** — Machine-readable metadata for archival systems
 - **Directory tree capture** — Complete file listing from source disc
 - **ISO structural analysis** — Validates ISO 9660/UDF structure via isolyzer
-- **Automatic disc handling** — Unmounts before backup, remounts and ejects after
+- **Automatic disc handling** — Unmounts before backup, ejects after
 
 ### makeiso-video.py (Access)
 
@@ -432,7 +432,6 @@ The script executes the following steps:
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  6. FINALIZATION                                                │
-│     • Remount disc                                              │
 │     • Eject disc                                                │
 │     • Generate formatted log file                               │
 │     • Generate JSON manifest                                    │
@@ -517,7 +516,7 @@ Checksum match: ISO on disk is a true bit-for-bit copy.
 
 > **Note:** Exit `0` covers two record states — the manifest's `overall_status` and the log header are the source of truth:
 > - `success` — verified master produced
-> - `success_with_warnings` — verified master, with a non-fatal problem recorded (e.g. a failed remount/eject or an incomplete tree listing; this workflow is operator-attended, so these don't change the exit code)
+> - `success_with_warnings` — verified master, with a non-fatal problem recorded (e.g. a failed eject or an incomplete tree listing; this workflow is operator-attended, so these don't change the exit code)
 
 ---
 

@@ -19,9 +19,10 @@ import json
 import logging
 import fcntl
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from uuid import uuid4
+from xml.sax.saxutils import escape as xml_escape
 
 ### === DATA STRUCTURES ===
 
@@ -79,7 +80,7 @@ class BackupResult:
     verification_time: float = 0.0
     error_message: Optional[str] = None
     unmount_ok: Optional[bool] = None  # None = unmount not attempted (dry run)
-    finalized: bool = False            # remount/eject step ran
+    finalized: bool = False            # disc eject succeeded
     warnings: List[str] = field(default_factory=list)  # non-fatal problems (run still valid)
     
     @property
@@ -142,8 +143,14 @@ COLOR = {
     "off": "\033[0m"
 }
 
+# ANSI output (color + progress cursor codes) only when stdout is a terminal
+# and NO_COLOR is unset (https://no-color.org). Decided once at import time.
+ANSI_ENABLED = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
 def colorize(color: str, text: str) -> str:
-    """Apply ANSI color to text"""
+    """Apply ANSI color to text (no-op when output is not a terminal)"""
+    if not ANSI_ENABLED:
+        return text
     return f"{COLOR[color]}{text}{COLOR['off']}"
 
 ### === LOGGING SETUP ===
@@ -416,14 +423,13 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         
         # Finalization
         f.write(f"[{step_time('finalize', create_end + datetime.timedelta(seconds=1))}] Finalization\n")
-        f.write(f"  Remount: diskutil mount /dev/{config.disk_id}\n")
         f.write(f"  Eject:   diskutil eject /dev/{config.disk_id}\n")
         if result.finalized:
             final_status = "Complete"
         elif result.unmount_ok is False:
             final_status = "Skipped (disc was never unmounted)"
         else:
-            final_status = "FAILED (remount/eject error — see console output)"
+            final_status = "FAILED (eject error — see console output)"
         f.write(f"  Status:  {final_status}\n\n")
         
         # === SYSTEM INFORMATION ===
@@ -471,6 +477,7 @@ class OpticalDiscBackup:
     def __init__(self, config: BackupConfig):
         self.config = config
         self.run: Optional[RunContext] = None
+        self._progress_marks = set()  # deciles already reported in non-TTY mode
         
     def create_backup(self) -> BackupResult:
         """Main entry point for creating backup"""
@@ -525,7 +532,7 @@ class OpticalDiscBackup:
         tree_ok = self._generate_tree_listing()
         
         # Unmount disk; record the failure rather than dd a mounted device.
-        # The disc is left as-is (no remount/eject) since it never unmounted.
+        # The disc is left as-is (no eject) since it never unmounted.
         backup_error = None
         unmount_ok = None
         finalized = False
@@ -536,7 +543,7 @@ class OpticalDiscBackup:
                 backup_error = f"Failed to unmount /dev/{self.config.disk_id}"
 
         # Create ISO (with in-stream source hashing), then verify by re-reading it.
-        # Wrapped so the disc is always remounted/ejected and the run is always
+        # Wrapped so the disc is always ejected and the run is always
         # documented, even when the copy or verification fails partway.
         iso_result = None
         iso_analysis = {"skipped": True, "reason": backup_error or "not started"}
@@ -554,7 +561,7 @@ class OpticalDiscBackup:
                 iso_analysis = {"skipped": True, "reason": f"backup failed: {backup_error}"}
                 log(colorize("red", f"Backup failed: {backup_error}"))
             finally:
-                # Remount and eject the disc even if the backup failed
+                # Eject the disc even if the backup failed
                 self.run.mark("finalize")
                 finalized = self._finalize_disk()
 
@@ -582,7 +589,7 @@ class OpticalDiscBackup:
         # Non-fatal problems on otherwise-valid runs: the master is good, but
         # the record should make these findable (success_with_warnings).
         if result.success and not self.config.dry_run and not result.finalized:
-            result.warnings.append("disc finalization (remount/eject) failed")
+            result.warnings.append("disc finalization (eject) failed")
         if result.success and not tree_ok:
             result.warnings.append("tree listing failed or incomplete")
 
@@ -685,7 +692,8 @@ class OpticalDiscBackup:
             self.run.mark("copy_start")
 
         # Initialize progress display
-        print("\n" * 4, end="")
+        if ANSI_ENABLED:
+            print("\n" * 4, end="")
 
         # A KeyboardInterrupt here propagates to create_backup(), which records
         # the interruption as a failed run and renames the partial ISO.
@@ -752,7 +760,8 @@ class OpticalDiscBackup:
             self.run.mark("verify_start")
 
         # Initialize progress display
-        print("\n" * 4, end="")
+        if ANSI_ENABLED:
+            print("\n" * 4, end="")
 
         with open(self.config.output_path, 'rb') as iso_file:
             # Bypass the page cache so we hash what is on disk, not the
@@ -797,6 +806,15 @@ class OpticalDiscBackup:
     
     def _display_progress(self, title: str, current: int, total: int, start_time: float):
         """Display progress information"""
+        if not ANSI_ENABLED:
+            # Redirected output: one plain line per ~10% instead of cursor codes
+            if total > 0:
+                decile = min(10, current * 10 // total)
+                key = (title, decile)
+                if decile > 0 and key not in self._progress_marks:
+                    self._progress_marks.add(key)
+                    log(f"{title}: {decile * 10}% ({current / (1024*1024):.0f}MB / {total / (1024*1024):.0f}MB)")
+            return
         elapsed = time.time() - start_time
         speed = current / elapsed if elapsed > 0 else 0
         remaining = max(0, total - current)
@@ -829,7 +847,7 @@ class OpticalDiscBackup:
             return False
     
     def _finalize_disk(self) -> bool:
-        """Remount and eject disk; returns True if all finalization commands succeeded"""
+        """Eject the disc; returns True if it ejected"""
         log_divider("Finalizing")
         if self.config.dry_run:
             # Check if already mounted
@@ -843,22 +861,16 @@ class OpticalDiscBackup:
                 subprocess.run(["diskutil", "mount", self.config.disk_id])
             return True
         else:
-            ok = True
-            log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil mount /dev/{self.config.disk_id}"))
-            mount_proc = subprocess.run(["diskutil", "mount", f"/dev/{self.config.disk_id}"],
-                                        capture_output=True, text=True)
-            if mount_proc.returncode != 0:
-                ok = False
-                log(colorize("yellow", f"Warning: remount failed: {mount_proc.stderr.strip() or mount_proc.stdout.strip()}"))
+            # Eject directly — diskutil eject works on an unmounted disk, and
+            # the goal of finalization is physical release of the disc.
             log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil eject /dev/{self.config.disk_id}"))
             eject_proc = subprocess.run(["diskutil", "eject", f"/dev/{self.config.disk_id}"],
                                         capture_output=True, text=True)
             if eject_proc.returncode != 0:
-                ok = False
                 log(colorize("yellow", f"Warning: eject failed: {eject_proc.stderr.strip() or eject_proc.stdout.strip()}"))
-            if ok:
-                log(colorize("green", "Disk remounted and ejected. All done."))
-            return ok
+                return False
+            log(colorize("green", "Disk ejected. All done."))
+            return True
     
     def _generate_summary(self, result: BackupResult):
         """Generate timing summary"""
@@ -1133,7 +1145,6 @@ class OpticalDiscBackup:
                     "shell_equivalent": f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
                 },
                 "finalization": {
-                    "remount_command": f"diskutil mount /dev/{self.config.disk_id}",
                     "eject_command": f"diskutil eject /dev/{self.config.disk_id}",
                     "status": ("skipped" if self.config.dry_run or result.unmount_ok is False
                                else ("completed" if result.finalized else "failed"))
@@ -1409,7 +1420,7 @@ class OpticalDiscBackup:
                 f.write('  <image>\n')
                 f.write('    <statusInfo>\n')
                 f.write('      <success>False</success>\n')
-                f.write(f'      <error>{str(e)}</error>\n')
+                f.write(f'      <error>{xml_escape(str(e))}</error>\n')
                 f.write('    </statusInfo>\n')
                 f.write('  </image>\n')
                 f.write('</isolyzer>\n')
@@ -1450,17 +1461,6 @@ class OpticalDiscBackup:
             return {"error": str(e)}
     
 ### === HELPER FUNCTIONS ===
-
-def get_volume_name(disk_id: str) -> str:
-    """Extract volume name from disk info"""
-    try:
-        info = run_cmd(["diskutil", "info", f"/dev/{disk_id}"])
-        for line in info.splitlines():
-            if "Volume Name:" in line:
-                return line.split(":", 1)[1].strip()
-    except subprocess.CalledProcessError:
-        pass
-    return "Unknown"
 
 def list_disks() -> str:
     """List available disks"""
@@ -1563,21 +1563,20 @@ def gather_user_inputs(args: argparse.Namespace) -> BackupConfig:
     """Gather all necessary inputs from user and command line"""
     # Get disk ID
     disk_id = get_input(colorize("cyan", "Enter disk ID (e.g. disk2): "))
-    
-    # Get volume name
-    volume_name = get_volume_name(disk_id)
-    log(colorize("cyan", "Volume name detected:") + " " + colorize("yellow", volume_name))
-    
-    # Get disk info to show volume size and media type
+
+    # One plist fetch covers volume name, size, and media type (the same
+    # structured source create_backup() uses, rather than scraping text output)
+    volume_name = "Unknown"
     try:
         disk_info = run_cmd(["diskutil", "info", "-plist", f"/dev/{disk_id}"], plist=True)
-        disk_size = disk_info.get("TotalSize", 0)
-        disk_size_mb = disk_size / (1024 * 1024)
+        volume_name = disk_info.get("VolumeName") or "Unknown"
+        log(colorize("cyan", "Volume name detected:") + " " + colorize("yellow", volume_name))
+        disk_size_mb = disk_info.get("TotalSize", 0) / (1024 * 1024)
         log(colorize("cyan", "Volume size:") + " " + colorize("yellow", f"{disk_size_mb:.0f} MB"))
         media_type = disk_info.get("OpticalMediaType", "Unknown")
         log(colorize("cyan", "Media type:") + " " + colorize("yellow", media_type))
-    except:
-        pass
+    except Exception:
+        log(colorize("yellow", f"Could not read disk info for /dev/{disk_id} (re-checked at backup start)."))
     
     # Get other inputs
     filename = args.filename or get_input(colorize("cyan", "Enter output ISO filename (no extension): "))
