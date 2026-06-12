@@ -514,6 +514,8 @@ Checksum match: ISO on disk is a true bit-for-bit copy.
 | `1` | Failure — backup failed (see error message) |
 | `2` | Verification failed — written ISO does not match the source (run is marked failed) |
 
+> **Note:** A failed disc remount/eject after a verified backup still exits `0` — this workflow is operator-attended, so a stuck disc is immediately visible at the drive. Such runs are recorded as `success_with_warnings` in the manifest and `SUCCESS (WITH WARNINGS)` in the log header, so they remain findable later.
+
 ---
 
 ## makeiso-video.py — Access Copy Creation

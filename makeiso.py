@@ -20,7 +20,7 @@ import logging
 import fcntl
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 ### === DATA STRUCTURES ===
@@ -78,6 +78,7 @@ class BackupResult:
     error_message: Optional[str] = None
     unmount_ok: Optional[bool] = None  # None = unmount not attempted (dry run)
     finalized: bool = False            # remount/eject step ran
+    warnings: List[str] = field(default_factory=list)  # non-fatal problems (run still valid)
     
     @property
     def checksum_match(self) -> Optional[bool]:
@@ -240,10 +241,15 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"Start Time:       {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"End Time:         {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total Duration:   {format_duration(total_duration)}\n")
-        status = 'SUCCESS' if result.success else ('VERIFICATION FAILED' if result.checksum_match is False else 'FAILED')
+        if result.success:
+            status = 'SUCCESS (WITH WARNINGS)' if result.warnings else 'SUCCESS'
+        else:
+            status = 'VERIFICATION FAILED' if result.checksum_match is False else 'FAILED'
         f.write(f"Status:           {status}\n")
         if result.error_message:
             f.write(f"Error:            {result.error_message}\n")
+        for warning in result.warnings:
+            f.write(f"Warning:          {warning}\n")
         if result.checksum_match is not None:
             f.write(f"Verification:     {'PASS' if result.checksum_match else 'FAIL'}\n")
         f.write("\n")
@@ -513,6 +519,11 @@ class OpticalDiscBackup:
         if result.checksum_match is False:
             result.success = False
             result.error_message = "Checksum mismatch: written ISO does not match source stream"
+
+        # Non-fatal problems on otherwise-valid runs: the master is good, but
+        # the record should make these findable (success_with_warnings).
+        if result.success and not self.config.dry_run and not result.finalized:
+            result.warnings.append("disc finalization (remount/eject) failed")
 
         # Failed or aborted runs keep all their records under failure-marked
         # names, so they are obvious in the output directory and a retry can
@@ -958,10 +969,12 @@ class OpticalDiscBackup:
             },
             
             "backup_status": {
-                "overall_status": "success" if result.success else ("verification_failed" if result.checksum_match is False else "failed"),
+                "overall_status": (("success_with_warnings" if result.warnings else "success") if result.success
+                                   else ("verification_failed" if result.checksum_match is False else "failed")),
                 "iso_created": iso_file_size is not None,
                 "verification_performed": result.md5_iso is not None,
                 "verification_passed": result.checksum_match if result.checksum_match is not None else "skipped",
+                "warnings": result.warnings,
                 "errors": result.error_message if result.error_message else None
             },
             
