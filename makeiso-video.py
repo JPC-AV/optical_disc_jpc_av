@@ -74,6 +74,37 @@ class DiscContentAnalysis:
     error: Optional[str] = None
 
 @dataclass
+class TitlesetPlan:
+    """One titleset's planned encode.
+
+    Titleset-aware, not title-aware: grouping is by VTS number only. A single
+    titleset may still contain multiple programs/PGCs/angles — this is not
+    DVD-player-equivalent title parsing.
+    """
+    vts_number: int          # 0 = pseudo-titleset of unrecognized VOB names
+    content_vobs: List[Path] = field(default_factory=list)
+    output_path: Optional[Path] = None
+    total_size: int = 0
+    is_main: bool = False    # lowest-numbered content titleset; keeps unsuffixed name
+
+@dataclass
+class TitleOutput:
+    """Outcome of one titleset's encode"""
+    vts_number: int
+    output_path: Path
+    status: str = "not_attempted"   # planned | completed | failed | not_attempted
+    output_size: int = 0
+    video_duration: Optional[float] = None
+    expected_duration: Optional[float] = None
+    encode_time: float = 0.0
+    md5: Optional[str] = None
+    source_audio_streams: Optional[int] = None
+    source_subtitle_streams: Optional[int] = None
+    mapped_video_streams: int = 0
+    mapped_audio_streams: int = 0
+    error: Optional[str] = None
+
+@dataclass
 class ConversionResult:
     """Result of conversion operation"""
     success: bool
@@ -89,6 +120,8 @@ class ConversionResult:
     disc_analysis: Optional[DiscContentAnalysis] = None
     skipped: bool = False
     skip_reason: Optional[str] = None
+    titles: List[TitleOutput] = field(default_factory=list)  # per-titleset outcomes
+    warnings: List[str] = field(default_factory=list)        # non-fatal problems (run still valid)
     
     @property
     def compression_ratio(self) -> Optional[float]:
@@ -323,6 +356,59 @@ def analyze_iso_content(mount_point: Path) -> DiscContentAnalysis:
     
     return analysis
 
+### === TITLESET PLANNING ===
+
+MENU_VOB_RE = re.compile(r'VTS_(\d+)_0\.VOB$', re.IGNORECASE)
+CONTENT_VOB_RE = re.compile(r'VTS_(\d+)_([1-9])\.VOB$', re.IGNORECASE)
+
+def plan_titlesets(vob_files: List[Path], output_dir: Path, iso_name: str
+                   ) -> Tuple[List[TitlesetPlan], List[Path], List[Path]]:
+    """Group content VOBs by titleset (VTS_NN) and assign output paths.
+
+    Returns (plans, menu_vobs, unrecognized_vobs). The lowest-numbered
+    content titleset is "main" and keeps the unsuffixed output name; others
+    get _titleNN suffixes matching their VTS number. Titleset-aware only —
+    a titleset may still contain multiple programs/PGCs.
+    """
+    groups: Dict[int, List[Path]] = {}
+    menu_vobs: List[Path] = []
+    unrecognized: List[Path] = []
+
+    for vob in vob_files:
+        name = vob.name.upper()
+        if name == "VIDEO_TS.VOB" or MENU_VOB_RE.match(name):
+            menu_vobs.append(vob)
+            continue
+        content_match = CONTENT_VOB_RE.match(name)
+        if content_match:
+            groups.setdefault(int(content_match.group(1)), []).append(vob)
+        else:
+            unrecognized.append(vob)
+
+    # Spec-shaped titlesets win; otherwise fall back to one pseudo-titleset
+    # of unrecognized-but-not-menu VOBs (preserves old behavior for odd
+    # discs with real content under nonstandard names)
+    if not groups and unrecognized:
+        groups = {0: list(unrecognized)}
+        unrecognized = []
+
+    plans: List[TitlesetPlan] = []
+    for index, vts in enumerate(sorted(groups)):
+        vobs = sorted(groups[vts], key=lambda p: p.name.upper())
+        is_main = index == 0
+        if is_main:
+            output = output_dir / f"{iso_name}.mp4"
+        else:
+            output = output_dir / f"{iso_name}_title{vts:02d}.mp4"
+        plans.append(TitlesetPlan(
+            vts_number=vts,
+            content_vobs=vobs,
+            output_path=output,
+            total_size=sum(v.stat().st_size for v in vobs if v.exists()),
+            is_main=is_main,
+        ))
+    return plans, menu_vobs, unrecognized
+
 ### === FFMPEG OPERATIONS ===
 
 def check_ffmpeg() -> Tuple[bool, Optional[str]]:
@@ -337,22 +423,49 @@ def check_ffmpeg() -> Tuple[bool, Optional[str]]:
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False, None
 
-def get_video_duration(video_path: Path) -> Optional[float]:
-    """Get duration of a video file in seconds using ffprobe"""
+def get_video_duration(target) -> Optional[float]:
+    """Get duration in seconds via ffprobe; target may be a path or a concat: URL"""
     try:
         result = run_cmd([
             "ffprobe",
             "-v", "quiet",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
-            str(video_path)
+            str(target)
         ])
         return float(result.stdout.strip())
     except (subprocess.CalledProcessError, ValueError):
         return None
 
-def get_video_info(video_path: Path) -> Dict[str, Any]:
-    """Get detailed video information using ffprobe"""
+def probe_expected_duration(vobs: List[Path]) -> Optional[float]:
+    """Best-effort expected duration of a titleset.
+
+    ffprobe on a concat: VOB input is unreliable — it can report only the
+    first segment's duration, which would blind the truncation check. So we
+    take the LARGER of two estimates: the concat probe and the sum of
+    per-VOB durations. Returns None when neither can be obtained — callers
+    warn rather than fail."""
+    estimates = []
+    concat = "concat:" + "|".join(str(v) for v in vobs)
+    concat_duration = get_video_duration(concat)
+    if concat_duration:
+        estimates.append(concat_duration)
+    parts = [get_video_duration(v) for v in vobs]
+    if parts and all(p is not None for p in parts):
+        estimates.append(sum(parts))
+    return max(estimates) if estimates else None
+
+def probe_stream_counts(target) -> Dict[str, int]:
+    """Count video/audio/subtitle streams via ffprobe"""
+    counts = {"video": 0, "audio": 0, "subtitle": 0}
+    for stream in get_video_info(target).get("streams", []):
+        codec_type = stream.get("codec_type")
+        if codec_type in counts:
+            counts[codec_type] += 1
+    return counts
+
+def get_video_info(target) -> Dict[str, Any]:
+    """Get detailed video information using ffprobe; target may be a path or concat: URL"""
     try:
         result = run_cmd([
             "ffprobe",
@@ -360,7 +473,7 @@ def get_video_info(video_path: Path) -> Dict[str, Any]:
             "-print_format", "json",
             "-show_format",
             "-show_streams",
-            str(video_path)
+            str(target)
         ])
         return json.loads(result.stdout)
     except (subprocess.CalledProcessError, json.JSONDecodeError):
@@ -422,10 +535,10 @@ class ISOToMP4Converter:
                 if not analysis.has_video_ts or not analysis.vob_files:
                     skip_reason = self._get_skip_reason(analysis)
                     log(colorize("yellow", f"Skipping: {skip_reason}"))
-        
+
                     # Analysis errors should be counted as failures, not skips
                     is_error = analysis.disc_type == "error"
-        
+
                     result = ConversionResult(
                         success=not is_error,
                         iso_path=self.config.iso_path,
@@ -435,34 +548,56 @@ class ISOToMP4Converter:
                         skip_reason=skip_reason if not is_error else None,
                         error_message=skip_reason if is_error else None
                     )
-                
-                # Check for existing output (skip in dry-run mode - nothing will be written)
-                elif not self.config.dry_run and self.config.mp4_path.exists() and not self._confirm_overwrite():
-                    result = ConversionResult(
-                        success=False,
-                        iso_path=self.config.iso_path,
-                        source_size=iso_size,
-                        disc_analysis=analysis,
-                        error_message="Aborted to avoid overwrite"
-                    )
-                
-                # Perform conversion
-                elif self.config.dry_run:
-                    log(colorize("cyan", "Dry run:") + " " + 
-                        colorize("yellow", "Would convert VIDEO_TS to MP4"))
-                    result = ConversionResult(
-                        success=True,
-                        mp4_path=self.config.mp4_path,
-                        iso_path=self.config.iso_path,
-                        source_size=iso_size,
-                        disc_analysis=analysis,
-                        skipped=True,
-                        skip_reason="Dry run mode"
-                    )
                 else:
-                    # Create output directory (only for actual conversion)
-                    self.config.output_dir.mkdir(parents=True, exist_ok=True)
-                    result = self._perform_conversion(analysis, iso_size)
+                    # Plan titlesets (titleset-aware: grouped by VTS number;
+                    # a titleset may still contain multiple programs/PGCs)
+                    plans, menu_vobs, unrecognized = plan_titlesets(
+                        analysis.vob_files, self.config.output_dir, self.config.iso_name)
+                    self._log_titleset_plan(plans, menu_vobs, unrecognized)
+
+                    existing_outputs = [] if self.config.dry_run else \
+                        [p.output_path for p in plans if p.output_path.exists()]
+
+                    if not plans:
+                        # Menu-only structure: skip, never convert menus
+                        skip_reason = "Menu-only VIDEO_TS structure (no content VOBs)"
+                        log(colorize("yellow", f"Skipping: {skip_reason}"))
+                        result = ConversionResult(
+                            success=True,
+                            iso_path=self.config.iso_path,
+                            source_size=iso_size,
+                            disc_analysis=analysis,
+                            skipped=True,
+                            skip_reason=skip_reason
+                        )
+                    elif existing_outputs and not self._confirm_overwrite(existing_outputs):
+                        result = ConversionResult(
+                            success=False,
+                            iso_path=self.config.iso_path,
+                            source_size=iso_size,
+                            disc_analysis=analysis,
+                            error_message="Aborted to avoid overwrite"
+                        )
+                    elif self.config.dry_run:
+                        log(colorize("cyan", "Dry run:") + " " +
+                            colorize("yellow", f"Would convert {len(plans)} titleset(s) to MP4"))
+                        result = ConversionResult(
+                            success=True,
+                            mp4_path=self.config.mp4_path,
+                            iso_path=self.config.iso_path,
+                            source_size=iso_size,
+                            disc_analysis=analysis,
+                            skipped=True,
+                            skip_reason="Dry run mode",
+                            titles=[TitleOutput(vts_number=p.vts_number,
+                                                output_path=p.output_path,
+                                                status="planned")
+                                    for p in plans]
+                        )
+                    else:
+                        # Create output directory (only for actual conversion)
+                        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+                        result = self._perform_conversion(analysis, iso_size, plans, unrecognized)
         
         # Generate outputs (now guaranteed to run for all paths)
         if result.success and not result.skipped:
@@ -514,20 +649,103 @@ class ISOToMP4Converter:
         else:
             return "Unknown reason"
     
-    def _confirm_overwrite(self) -> bool:
-        """Confirm file overwrite"""
-        response = get_input(colorize("yellow", 
-            f"{self.config.mp4_path} exists. Overwrite? (y/n): "))
+    def _confirm_overwrite(self, existing_paths: List[Path]) -> bool:
+        """Confirm overwrite of pre-existing planned outputs"""
+        names = ", ".join(p.name for p in existing_paths)
+        response = get_input(colorize("yellow",
+            f"Output exists ({names}). Overwrite? (y/n): "))
         return response.lower() == 'y'
+
+    def _log_titleset_plan(self, plans: List[TitlesetPlan], menu_vobs: List[Path],
+                           unrecognized: List[Path]):
+        """Log the titleset conversion plan"""
+        log(colorize("cyan", f"Content titlesets detected: {len(plans)}"))
+        for plan in plans:
+            label = "main" if plan.is_main else f"title{plan.vts_number:02d}"
+            log(colorize("cyan", f"  VTS_{plan.vts_number:02d} ({label}) → {plan.output_path.name}: "
+                                 f"{len(plan.content_vobs)} VOB(s), {format_bytes(plan.total_size)}"))
+        if menu_vobs:
+            log(colorize("yellow", f"Skipping {len(menu_vobs)} menu VOB(s): "
+                                   + ", ".join(v.name for v in menu_vobs)))
+        if unrecognized:
+            log(colorize("yellow", "Unrecognized VOB name(s), not converted: "
+                                   + ", ".join(v.name for v in unrecognized)))
     
-    def _perform_conversion(self, analysis: DiscContentAnalysis, iso_size: int) -> ConversionResult:
-        """Perform the actual VIDEO_TS to MP4 conversion"""
+    def _perform_conversion(self, analysis: DiscContentAnalysis, iso_size: int,
+                            plans: List[TitlesetPlan],
+                            unrecognized_vobs: List[Path]) -> ConversionResult:
+        """Convert each planned titleset to its own MP4"""
         log_divider("Converting VIDEO_TS to MP4")
-        
+        log(colorize("cyan", "Encoding settings:"))
+        log(colorize("cyan", f"  Video codec: {self.config.video_codec}"))
+        log(colorize("cyan", f"  CRF: {self.config.crf} (lower = higher quality)"))
+        log(colorize("cyan", f"  Preset: {self.config.preset}"))
+        log(colorize("cyan", f"  Audio codec: {self.config.audio_codec}"))
+        log(colorize("cyan", f"  Audio bitrate: {self.config.audio_bitrate}"))
+        log(colorize("cyan", "  Stream mapping: -map 0:v:0 -map 0:a? -sn (all audio, no subtitles)"))
+
+        result = ConversionResult(
+            success=True,
+            mp4_path=self.config.mp4_path,
+            iso_path=self.config.iso_path,
+            source_size=iso_size,
+            disc_analysis=analysis,
+        )
+
+        if unrecognized_vobs:
+            names = ", ".join(v.name for v in unrecognized_vobs)
+            result.warnings.append(f"unrecognized VOB name(s) not converted: {names}")
+
+        for plan in plans:
+            title = TitleOutput(vts_number=plan.vts_number, output_path=plan.output_path)
+            result.titles.append(title)
+
+            label = "main title" if plan.is_main else f"title {plan.vts_number:02d}"
+            log_divider(f"Encoding {label} → {plan.output_path.name}")
+
+            # Source stream inventory (first content VOB is representative)
+            source_counts = probe_stream_counts(plan.content_vobs[0])
+            title.source_audio_streams = source_counts.get("audio")
+            title.source_subtitle_streams = source_counts.get("subtitle")
+
+            # Best-effort expected duration for the truncation check
+            title.expected_duration = probe_expected_duration(plan.content_vobs)
+
+            # A failed titleset marks the whole run failed, but remaining
+            # titlesets are still attempted so the record is complete.
+            self._encode_titleset(plan, title, result)
+            result.conversion_time += title.encode_time
+            if title.status != "completed":
+                result.success = False
+
+        # Mirror the main title into the legacy top-level fields so existing
+        # log/manifest consumers keep working
+        main = result.titles[0] if result.titles else None
+        if main and main.status == "completed":
+            result.output_size = main.output_size
+            result.video_duration = main.video_duration
+            result.md5_mp4 = main.md5
+        if not result.success:
+            failed = [t for t in result.titles if t.status == "failed"]
+            result.error_message = "; ".join(
+                f"{t.output_path.name}: {t.error}" for t in failed)
+
+        return result
+
+    def _encode_titleset(self, plan: TitlesetPlan, title: TitleOutput,
+                         result: ConversionResult):
+        """Encode one titleset's content VOBs to MP4 and verify the output"""
+        for vob in plan.content_vobs:
+            log(colorize("cyan", f"  + {vob.name} ({format_bytes(vob.stat().st_size)})"))
+
+        concat_input = "concat:" + "|".join(str(v) for v in plan.content_vobs)
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",  # Overwrite output
-            "-i", f"concat:{self._get_vob_concat_string(analysis.vob_files)}",
+            "-i", concat_input,
+            "-map", "0:v:0",   # first video stream
+            "-map", "0:a?",    # ALL audio streams ('?' tolerates audio-less input)
+            "-sn",             # subtitles deliberately excluded (recorded in manifest)
             "-c:v", self.config.video_codec,
             "-preset", self.config.preset,
             "-crf", str(self.config.crf),
@@ -535,20 +753,11 @@ class ISOToMP4Converter:
             "-b:a", self.config.audio_bitrate,
             "-movflags", "+faststart",  # Enable streaming
             "-pix_fmt", "yuv420p",  # Compatibility
-            str(self.config.mp4_path)
+            str(plan.output_path)
         ]
-        
-        log(colorize("cyan", "Running ffmpeg conversion..."))
         log(colorize("cyan", "Command:") + " " + colorize("yellow", " ".join(ffmpeg_cmd)))
-        log(colorize("cyan", "Encoding settings:"))
-        log(colorize("cyan", f"  Video codec: {self.config.video_codec}"))
-        log(colorize("cyan", f"  CRF: {self.config.crf} (lower = higher quality)"))
-        log(colorize("cyan", f"  Preset: {self.config.preset}"))
-        log(colorize("cyan", f"  Audio codec: {self.config.audio_codec}"))
-        log(colorize("cyan", f"  Audio bitrate: {self.config.audio_bitrate}"))
-        
-        conversion_start = time.time()
-        
+
+        encode_start = time.time()
         try:
             # Run ffmpeg with progress output
             process = subprocess.Popen(
@@ -557,131 +766,89 @@ class ISOToMP4Converter:
                 stderr=subprocess.PIPE,
                 universal_newlines=True
             )
-            
+
             # Parse ffmpeg stderr for progress (ffmpeg outputs progress to stderr)
             log("")  # Blank line before progress display
             stderr_output = []
-            last_timecode = "00:00:00.00"
-            
+
             while True:
                 line = process.stderr.readline()
                 if not line and process.poll() is not None:
                     break
-                
+
                 stderr_output.append(line)
-                
+
                 # Parse timecode from ffmpeg output (format: time=HH:MM:SS.ss)
                 match = re.search(r'time=(\d+:\d+:\d+\.\d+)', line)
                 if match:
-                    last_timecode = match.group(1)
-                    elapsed = time.time() - conversion_start
+                    elapsed = time.time() - encode_start
                     # Update progress display (overwrite same line)
-                    sys.stdout.write(f"\r{colorize('cyan', 'Encoding:')} {last_timecode}  |  {colorize('cyan', 'Elapsed:')} {format_duration(elapsed)}    ")
+                    sys.stdout.write(f"\r{colorize('cyan', 'Encoding:')} {match.group(1)}  |  {colorize('cyan', 'Elapsed:')} {format_duration(elapsed)}    ")
                     sys.stdout.flush()
-            
+
             # Clear progress line and move to new line
             sys.stdout.write("\r" + " " * 80 + "\r")
             sys.stdout.flush()
-            
-            stderr_text = "".join(stderr_output)
-            
+
+            title.encode_time = time.time() - encode_start
+
             if process.returncode != 0:
+                stderr_text = "".join(stderr_output)
                 log(colorize("red", f"ffmpeg error:\n{stderr_text}"))
-                return ConversionResult(
-                    success=False,
-                    iso_path=self.config.iso_path,
-                    source_size=iso_size,
-                    disc_analysis=analysis,
-                    error_message=f"ffmpeg failed with return code {process.returncode}"
-                )
-            
-            conversion_time = time.time() - conversion_start
-            
+                title.status = "failed"
+                title.error = f"ffmpeg failed with return code {process.returncode}"
+                return
+
         except KeyboardInterrupt:
             log(colorize("red", "\nConversion interrupted by user."))
             process.kill()
+            title.status = "failed"
+            title.error = "Interrupted by operator (Ctrl-C)"
             raise
         except Exception as e:
-            return ConversionResult(
-                success=False,
-                iso_path=self.config.iso_path,
-                source_size=iso_size,
-                disc_analysis=analysis,
-                error_message=str(e)
-            )
-        
+            title.encode_time = time.time() - encode_start
+            title.status = "failed"
+            title.error = str(e)
+            return
+
         # Verify output exists
-        if not self.config.mp4_path.exists():
-            return ConversionResult(
-                success=False,
-                iso_path=self.config.iso_path,
-                source_size=iso_size,
-                disc_analysis=analysis,
-                error_message="Output file was not created"
-            )
-        
-        output_size = self.config.mp4_path.stat().st_size
-        video_duration = get_video_duration(self.config.mp4_path)
-        
-        log(colorize("green", "Conversion complete!"))
-        log(colorize("cyan", f"Output size: {format_bytes(output_size)}"))
-        log(colorize("cyan", f"Conversion time: {format_duration(conversion_time)}"))
-        
-        if video_duration:
-            log(colorize("cyan", f"Video duration: {format_timecode(video_duration)}"))
-        
+        if not plan.output_path.exists():
+            title.status = "failed"
+            title.error = "Output file was not created"
+            return
+
+        title.output_size = plan.output_path.stat().st_size
+        title.video_duration = get_video_duration(plan.output_path)
+
+        # Record what was actually mapped (closes the loop on stream loss)
+        output_counts = probe_stream_counts(plan.output_path)
+        title.mapped_video_streams = output_counts.get("video", 0)
+        title.mapped_audio_streams = output_counts.get("audio", 0)
+        if title.source_audio_streams and title.mapped_audio_streams < title.source_audio_streams:
+            result.warnings.append(
+                f"{plan.output_path.name}: only {title.mapped_audio_streams} of "
+                f"{title.source_audio_streams} source audio stream(s) mapped")
+
+        # Duration sanity check (best-effort; warns, never fails the run)
+        if title.expected_duration and title.video_duration:
+            if title.video_duration < title.expected_duration * 0.95:
+                result.warnings.append(
+                    f"{plan.output_path.name}: output duration "
+                    f"{format_timecode(title.video_duration)} is >5% shorter than expected "
+                    f"{format_timecode(title.expected_duration)} — possible truncation")
+        elif title.expected_duration is None:
+            result.warnings.append(
+                f"{plan.output_path.name}: duration comparison unavailable (source unprobeable)")
+
         # Calculate MD5
-        log_divider("Calculating Checksum")
         log(colorize("cyan", "Calculating MD5 hash of output file..."))
-        md5_hash = calculate_md5(self.config.mp4_path)
-        log(colorize("cyan", f"MD5: {md5_hash}"))
-        
-        return ConversionResult(
-            success=True,
-            mp4_path=self.config.mp4_path,
-            iso_path=self.config.iso_path,
-            source_size=iso_size,
-            output_size=output_size,
-            video_duration=video_duration,
-            conversion_time=conversion_time,
-            md5_mp4=md5_hash,
-            disc_analysis=analysis
-        )
-    
-    def _get_vob_concat_string(self, vob_files: List[Path]) -> str:
-        """Build concat string for ffmpeg from VOB files"""
-        # Filter to only include main content VOBs (VTS_01_*.VOB typically)
-        # Skip menu VOBs (VIDEO_TS.VOB, VTS_*_0.VOB)
-        content_vobs = []
-        skipped_vobs = []
-        
-        for vob in vob_files:
-            name_upper = vob.name.upper()
-            # Skip VIDEO_TS.VOB (menu) and files ending in _0.VOB (title menus)
-            if name_upper == "VIDEO_TS.VOB":
-                skipped_vobs.append((vob, "menu VOB"))
-                continue
-            if re.match(r'VTS_\d+_0\.VOB', name_upper):
-                skipped_vobs.append((vob, "title menu VOB"))
-                continue
-            content_vobs.append(vob)
-        
-        # Log skipped VOBs so operators can verify
-        if skipped_vobs:
-            log(colorize("yellow", f"Skipping {len(skipped_vobs)} menu VOB(s):"))
-            for vob, reason in skipped_vobs:
-                log(colorize("yellow", f"  - {vob.name} ({reason}, {format_bytes(vob.stat().st_size)})"))
-        
-        log(colorize("cyan", f"Including {len(content_vobs)} content VOB(s):"))
-        for vob in content_vobs:
-            log(colorize("cyan", f"  + {vob.name} ({format_bytes(vob.stat().st_size)})"))
-        
-        if not content_vobs:
-            # Fall back to all VOBs if filtering removed everything
-            log(colorize("yellow", "Warning: No content VOBs found after filtering, using all VOBs"))
-            content_vobs = vob_files
-        
-        return "|".join(str(vob) for vob in content_vobs)
+        title.md5 = calculate_md5(plan.output_path)
+
+        title.status = "completed"
+        log(colorize("green", f"{plan.output_path.name} complete "
+                              f"({format_bytes(title.output_size)}, "
+                              f"{format_timecode(title.video_duration) if title.video_duration else 'duration n/a'}, "
+                              f"{title.mapped_audio_streams} audio track(s))"))
     
     def _generate_summary(self, result: ConversionResult):
         """Generate timing and summary information"""
@@ -689,6 +856,13 @@ class ISOToMP4Converter:
         
         log(colorize("cyan", f"Source ISO: {result.iso_path.name}"))
         log(colorize("cyan", f"Output MP4: {result.mp4_path.name if result.mp4_path else 'N/A'}"))
+        if len(result.titles) > 1:
+            log(colorize("cyan", f"Titleset outputs ({len(result.titles)}):"))
+            for t in result.titles:
+                duration_str = format_timecode(t.video_duration) if t.video_duration else "n/a"
+                log(colorize("cyan", f"  {t.output_path.name}: {t.status}, "
+                                     f"{format_bytes(t.output_size)}, {duration_str}, "
+                                     f"{t.mapped_audio_streams} audio track(s)"))
         log(colorize("cyan", f"Source size: {format_bytes(result.source_size)}"))
         log(colorize("cyan", f"Output size: {format_bytes(result.output_size) if result.output_size else 'N/A'}"))
         
@@ -704,6 +878,8 @@ class ISOToMP4Converter:
             log(colorize("cyan", f"Encoding speed: {result.speed_factor}x realtime"))
         
         log(colorize("cyan", f"MD5 checksum: {result.md5_mp4}"))
+        for warning in result.warnings:
+            log(colorize("yellow", f"Warning: {warning}"))
         log(colorize("green", "Conversion completed successfully!"))
     
     def _create_log_file(self, result: ConversionResult, dry_run: bool = False, is_error: bool = False):
@@ -734,7 +910,16 @@ class ISOToMP4Converter:
             f.write(f"Start Time:       {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"End Time:         {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Total Duration:   {format_duration(total_duration)}\n")
-            f.write(f"Status:           {'SUCCESS' if result.success else 'FAILED'}\n\n")
+            if result.success:
+                status = 'SUCCESS (WITH WARNINGS)' if result.warnings else 'SUCCESS'
+            else:
+                status = 'FAILED'
+            f.write(f"Status:           {status}\n")
+            if result.error_message:
+                f.write(f"Error:            {result.error_message}\n")
+            for warning in result.warnings:
+                f.write(f"Warning:          {warning}\n")
+            f.write("\n")
             
             f.write("SOURCE INFORMATION\n")
             f.write("-" * 20 + "\n")
@@ -759,8 +944,28 @@ class ISOToMP4Converter:
             
             if result.compression_ratio:
                 f.write(f"Compression:      {result.compression_ratio}:1\n")
-            
+
             f.write(f"MD5 Checksum:     {result.md5_mp4}\n\n")
+
+            if result.titles:
+                f.write("TITLESET OUTPUTS\n")
+                f.write("-" * 20 + "\n")
+                f.write("Note: titleset-aware (VTS grouping); a titleset may contain\n")
+                f.write("multiple programs. Subtitles recorded but not encoded.\n")
+                for t in result.titles:
+                    duration_str = format_timecode(t.video_duration) if t.video_duration else "n/a"
+                    f.write(f"{t.output_path.name}\n")
+                    f.write(f"  Status:   {t.status}\n")
+                    f.write(f"  Size:     {format_bytes(t.output_size)}\n")
+                    f.write(f"  Duration: {duration_str}")
+                    if t.expected_duration:
+                        f.write(f" (expected ~{format_timecode(t.expected_duration)})")
+                    f.write("\n")
+                    f.write(f"  Audio:    {t.mapped_audio_streams} of {t.source_audio_streams if t.source_audio_streams is not None else '?'} source track(s) mapped\n")
+                    f.write(f"  MD5:      {t.md5}\n")
+                    if t.error:
+                        f.write(f"  Error:    {t.error}\n")
+                f.write("\n")
             
             f.write("ENCODING SETTINGS\n")
             f.write("-" * 20 + "\n")
@@ -816,10 +1021,12 @@ class ISOToMP4Converter:
             },
             
             "conversion_status": {
-                "overall_status": "success" if result.success else "failed",
+                "overall_status": (("success_with_warnings" if result.warnings else "success")
+                                   if result.success else "failed"),
                 "mp4_created": result.mp4_path is not None and result.mp4_path.exists() if result.mp4_path else False,
                 "skipped": result.skipped,
                 "skip_reason": result.skip_reason,
+                "warnings": result.warnings,
                 "errors": result.error_message
             },
             
@@ -851,6 +1058,31 @@ class ISOToMP4Converter:
                 "md5_checksum": result.md5_mp4,
                 "compression_ratio": result.compression_ratio
             },
+
+            "titlesets": {
+                "count": len(result.titles),
+                "note": ("Titleset-aware (grouped by VTS number): a single titleset may still "
+                         "contain multiple programs/PGCs/angles — this is not DVD-player title "
+                         "parsing. Subtitle streams are recorded but deliberately not encoded "
+                         "(DVD bitmap subtitles are not MP4-compatible)."),
+                "outputs": [
+                    {
+                        "vts_number": t.vts_number,
+                        "filename": t.output_path.name,
+                        "is_main": i == 0,
+                        "status": t.status,
+                        "size_bytes": t.output_size,
+                        "duration_seconds": t.video_duration,
+                        "expected_duration_seconds": t.expected_duration,
+                        "encode_time_seconds": t.encode_time,
+                        "md5_checksum": t.md5,
+                        "source_audio_streams": t.source_audio_streams,
+                        "source_subtitle_streams": t.source_subtitle_streams,
+                        "mapped_audio_streams": t.mapped_audio_streams,
+                        "error": t.error
+                    } for i, t in enumerate(result.titles)
+                ]
+            },
             
             "encoding_settings": {
                 "video_codec": self.config.video_codec,
@@ -859,7 +1091,8 @@ class ISOToMP4Converter:
                 "audio_codec": self.config.audio_codec,
                 "audio_bitrate": self.config.audio_bitrate,
                 "pixel_format": "yuv420p",
-                "movflags": "+faststart"
+                "movflags": "+faststart",
+                "stream_mapping": "-map 0:v:0 -map 0:a? -sn (first video, all audio, no subtitles)"
             },
             
             "performance": {

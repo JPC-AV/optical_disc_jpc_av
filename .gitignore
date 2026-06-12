@@ -1,3 +1,6 @@
+# Generated test fixtures (rebuild with tests/make_fixtures.py)
+tests/fixtures/
+
 # macOS
 .DS_Store
 .AppleDouble

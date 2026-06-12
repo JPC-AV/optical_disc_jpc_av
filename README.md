@@ -647,13 +647,33 @@ The script automatically detects disc content and handles different types approp
 
 | Disc Type | Action | Notes |
 |-----------|--------|-------|
-| DVD-Video (VIDEO_TS) | ✅ Converted | Standard DVD movies/video content |
+| DVD-Video (VIDEO_TS) | ✅ Converted | One MP4 per titleset (see below) |
+| Menu-only VIDEO_TS | ⏭️ Skipped | No content VOBs — nothing to convert |
 | DVD-Audio (AUDIO_TS) | ⏭️ Skipped | Requires specialized audio extraction |
 | Data DVD | ⏭️ Skipped | Use file copy instead |
 | Photo/Image DVD | ⏭️ Skipped | Use file copy instead |
 | Empty/Unreadable | ⏭️ Skipped | Verify ISO integrity |
 
 Skipped discs generate a `*_skip_manifest.json` documenting why the disc was skipped.
+
+### Titlesets: One MP4 Per Titleset
+
+DVDs group content into **titlesets** (`VTS_01_*`, `VTS_02_*`, …) — separate programs such as a main feature plus extras, or multiple episodes. The script encodes **each titleset to its own MP4**:
+
+- The lowest-numbered content titleset is the *main* title and keeps the plain name: `JPC_AV_00001.mp4`
+- Additional titlesets get suffixes matching their VTS number: `JPC_AV_00001_title02.mp4`, etc.
+- Single-titleset discs (the vast majority of the collection) produce exactly one MP4 with the same name as before.
+- The manifest's `titlesets` section records every output with its own size, duration, and checksum.
+
+> **Scope note:** grouping is *titleset-aware*, not title-aware — a single titleset can still contain multiple programs/PGCs/angles internally. This is not DVD-player-equivalent title parsing. The preservation ISO always retains the complete original structure.
+
+### Stream Handling
+
+Each encode uses explicit stream mapping (`-map 0:v:0 -map 0:a? -sn`):
+
+- **All audio tracks** on the disc are carried into the MP4 as selectable tracks (e.g. narration and ambient audio both survive).
+- **Subtitles are not encoded** — DVD bitmap subtitles are not MP4-compatible; their presence is recorded in the manifest, and they remain intact in the preservation ISO.
+- The manifest records both the source stream counts and the streams actually mapped into each output, plus a best-effort duration comparison that warns if an output is >5% shorter than expected (possible truncation).
 
 ### Menu VOBs Are Intentionally Excluded
 
@@ -673,7 +693,7 @@ DVD-Video discs contain two categories of VOB files:
 
 - **Content VOBs** (`VTS_*_1.VOB`, `VTS_*_2.VOB`, etc.) — contain the actual linear video content: everything you would see by pressing Play All on the disc.
 
-The script automatically skips menu VOBs and concatenates only the content VOBs. **No video content is lost.** The full disc — including all menu structure, navigation data, logos, and interactive elements — remains intact in the preservation ISO, which can be mounted on any computer to experience the disc exactly as originally authored, menus and all.
+The script automatically skips menu VOBs and concatenates only the content VOBs, per titleset. A disc whose VIDEO_TS contains *only* menu VOBs is skipped (nothing to convert). **No video content is lost.** The full disc — including all menu structure, navigation data, logos, and interactive elements — remains intact in the preservation ISO, which can be mounted on any computer to experience the disc exactly as originally authored, menus and all.
 
 ### Encoding Defaults
 
@@ -686,7 +706,8 @@ The default encoding settings are optimized for archival access copies:
 | **Preset** | medium | Balanced speed/compression |
 | **Pixel Format** | yuv420p | Maximum compatibility |
 | **Audio Codec** | AAC | Standard audio codec |
-| **Audio Bitrate** | 192 kbps | High quality stereo audio |
+| **Audio Bitrate** | 192 kbps | High quality audio, per track |
+| **Stream Mapping** | `-map 0:v:0 -map 0:a? -sn` | First video, all audio tracks, no subtitles |
 | **Container** | MP4 | Universal playback support |
 | **Faststart** | enabled | Enables streaming/seeking |
 
