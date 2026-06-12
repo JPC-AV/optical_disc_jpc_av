@@ -418,8 +418,8 @@ The script executes the following steps:
 │  4. ISO CREATION + VERIFICATION (two-phase)                     │
 │     • Read from raw device (/dev/rdiskN)                        │
 │     • Write to ISO file                                         │
-│     • Calculate MD5 of source stream                            │
-│     • Flush to disk, re-read ISO, verify MD5                    │
+│     • Calculate MD5 + SHA-256 of source stream                  │
+│     • Flush to disk, re-read ISO, verify hashes                 │
 │     • Display real-time progress                                │
 └─────────────────────────────────────────────────────────────────┘
                               ▼
@@ -514,9 +514,10 @@ Checksum match: ISO on disk is a true bit-for-bit copy.
 | `1` | Failure — backup failed (see error message) |
 | `2` | Verification failed — written ISO does not match the source (run is marked failed) |
 
-> **Note:** Exit `0` covers two record states — the manifest's `overall_status` and the log header are the source of truth:
+> **Note:** Exit `0` covers three record states — the manifest's `overall_status` and the log header are the source of truth:
 > - `success` — verified master produced
 > - `success_with_warnings` — verified master, with a non-fatal problem recorded (e.g. a failed eject or an incomplete tree listing; this workflow is operator-attended, so these don't change the exit code)
+> - `dry_run` — `--dry-run` rehearsal; no ISO was created and nothing was verified (log header reads `DRY RUN`)
 
 ---
 

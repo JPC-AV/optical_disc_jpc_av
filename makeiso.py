@@ -80,7 +80,7 @@ class BackupResult:
     verification_time: float = 0.0
     error_message: Optional[str] = None
     unmount_ok: Optional[bool] = None  # None = unmount not attempted (dry run)
-    finalized: bool = False            # disc eject succeeded
+    finalized: Optional[bool] = None   # disc ejected; None = not attempted (dry run)
     warnings: List[str] = field(default_factory=list)  # non-fatal problems (run still valid)
     
     @property
@@ -289,7 +289,9 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"Start Time:       {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"End Time:         {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total Duration:   {format_duration(total_duration)}\n")
-        if result.success:
+        if config.dry_run:
+            status = 'DRY RUN'
+        elif result.success:
             status = 'SUCCESS (WITH WARNINGS)' if result.warnings else 'SUCCESS'
         else:
             status = 'VERIFICATION FAILED' if result.checksum_match is False else 'FAILED'
@@ -536,6 +538,17 @@ class OpticalDiscBackup:
                                 f"(file or symlink). Refusing to continue."))
             return BackupResult(False, self.config.output_path, disk_size,
                                 error_message=f"Output path {self.config.output_dir} is not a directory")
+
+        # Likewise refuse to write through a pre-existing symlink at any
+        # planned artifact path — running as root, following one could
+        # clobber an arbitrary file elsewhere on the system.
+        planned = [self.config.output_path, self.config.log_path, self.config.manifest_path,
+                   self.config.tree_path, self.config.isolyzer_path]
+        linked = [p.name for p in planned if p.is_symlink()]
+        if linked:
+            log(colorize("red", f"Refusing to continue: symlink(s) at planned output path(s): {', '.join(linked)}"))
+            return BackupResult(False, self.config.output_path, disk_size,
+                                error_message=f"Symlink at planned output path(s): {', '.join(linked)}")
         
         # Generate tree listing (this is the first divider after user inputs)
         self.run.mark("tree")
@@ -545,7 +558,7 @@ class OpticalDiscBackup:
         # The disc is left as-is (no eject) since it never unmounted.
         backup_error = None
         unmount_ok = None
-        finalized = False
+        finalized = None
         if not self.config.dry_run:
             self.run.mark("unmount")
             unmount_ok = self._unmount_disk()
@@ -859,8 +872,9 @@ class OpticalDiscBackup:
             log(colorize("red", f"Failed to unmount:\n{e.stderr}"))
             return False
     
-    def _finalize_disk(self) -> bool:
-        """Eject the disc; returns True if it ejected"""
+    def _finalize_disk(self) -> Optional[bool]:
+        """Eject the disc; True if ejected, False if the eject failed,
+        None when nothing was attempted (dry run)"""
         log_divider("Finalizing")
         if self.config.dry_run:
             # Inspect only — a dry run must not change system state
@@ -871,7 +885,7 @@ class OpticalDiscBackup:
                 log(colorize("cyan", "Dry run:") + " " + colorize("yellow", f"Disk is {state}; leaving as-is (no mount, no eject)."))
             except Exception as e:
                 log(colorize("yellow", f"Dry run: could not read mount state: {e}"))
-            return True
+            return None
         else:
             # Eject directly — diskutil eject works on an unmounted disk, and
             # the goal of finalization is physical release of the disc.
@@ -1089,8 +1103,9 @@ class OpticalDiscBackup:
             },
             
             "backup_status": {
-                "overall_status": (("success_with_warnings" if result.warnings else "success") if result.success
-                                   else ("verification_failed" if result.checksum_match is False else "failed")),
+                "overall_status": ("dry_run" if self.config.dry_run
+                                   else (("success_with_warnings" if result.warnings else "success") if result.success
+                                         else ("verification_failed" if result.checksum_match is False else "failed"))),
                 "iso_created": iso_file_size is not None,
                 "verification_performed": result.md5_iso is not None,
                 "verification_passed": result.checksum_match if result.checksum_match is not None else "skipped",
@@ -1150,9 +1165,7 @@ class OpticalDiscBackup:
                 },
                 "verification": {
                     "method": "md5 + sha-256 hash comparison (written ISO re-read from disk vs raw device stream)",
-                    "algorithm": "MD5",
                     "algorithms": ["MD5", "SHA-256"],
-                    "algorithm_bits": 128,
                     "performed": result.md5_iso is not None,
                     "shell_equivalent": (f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] '
                                          f'&& echo "MATCH" || echo "MISMATCH"  # MD5 shown; the script also compares SHA-256')
@@ -1185,8 +1198,6 @@ class OpticalDiscBackup:
             },
             
             "integrity_verification": {
-                "hash_algorithm": "MD5",
-                "hash_length_bits": 128,
                 "hash_algorithms": ["MD5", "SHA-256"],
                 "iso_hash": result.md5_iso,
                 "source_hash": result.md5_raw,
@@ -1644,7 +1655,10 @@ def main():
     
     # Exit with appropriate code
     if result.success:
-        log(colorize("green", "Backup completed successfully!"))
+        if config.dry_run:
+            log(colorize("green", "Dry run completed — no ISO was created."))
+        else:
+            log(colorize("green", "Backup completed successfully!"))
         sys.exit(0)
     elif result.checksum_match is False:
         log(colorize("red", "Backup failed verification: checksum mismatch!"))
