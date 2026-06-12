@@ -73,6 +73,8 @@ class BackupResult:
     disk_size: int
     md5_iso: Optional[str] = None
     md5_raw: Optional[str] = None
+    sha256_iso: Optional[str] = None
+    sha256_raw: Optional[str] = None
     creation_time: float = 0.0
     verification_time: float = 0.0
     error_message: Optional[str] = None
@@ -82,9 +84,15 @@ class BackupResult:
     
     @property
     def checksum_match(self) -> Optional[bool]:
-        """Whether checksums match (None if verification skipped)"""
+        """Whether checksums match (None if verification never produced ISO hashes).
+
+        Requires every recorded algorithm pair to match — MD5 always, and
+        SHA-256 too when present."""
         if self.md5_iso and self.md5_raw:
-            return self.md5_iso == self.md5_raw
+            match = self.md5_iso == self.md5_raw
+            if self.sha256_iso and self.sha256_raw:
+                match = match and self.sha256_iso == self.sha256_raw
+            return match
         return None
     
     @property
@@ -112,6 +120,16 @@ class RunContext:
     def mark(self, step: str):
         """Record the moment a step actually happened"""
         self.step_times[step] = datetime.datetime.now()
+
+@dataclass
+class IsoCreationResult:
+    """Hashes and timing produced by the copy and verification passes"""
+    creation_time: float
+    verification_time: float
+    md5_raw: str
+    md5_iso: Optional[str]
+    sha256_raw: str
+    sha256_iso: Optional[str]
 
 ### === COLOR UTILITIES ===
 
@@ -347,11 +365,15 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         if result.md5_iso and result.md5_raw:
             f.write("VERIFICATION RESULTS\n")
             f.write("-" * 20 + "\n")
-            f.write(f"Method:         Written ISO re-read from disk, compared to streamed raw disk hash\n")
-            f.write(f"MD5 (ISO):      {result.md5_iso}\n")
-            f.write(f"MD5 (Raw Disk): {result.md5_raw}\n")
+            f.write(f"Method:         Written ISO re-read from disk, compared to streamed raw disk hashes\n")
+            f.write(f"MD5 (ISO):          {result.md5_iso}\n")
+            f.write(f"MD5 (Raw Disk):     {result.md5_raw}\n")
+            if result.sha256_iso and result.sha256_raw:
+                f.write(f"SHA-256 (ISO):      {result.sha256_iso}\n")
+                f.write(f"SHA-256 (Raw Disk): {result.sha256_raw}\n")
+            algorithms = "MD5 (128-bit), SHA-256 (256-bit)" if result.sha256_iso else "MD5 (128-bit)"
             f.write(f"Match:          {'YES' if result.checksum_match else 'NO'}\n")
-            f.write(f"Algorithm:      MD5 (128-bit)\n")
+            f.write(f"Algorithms:     {algorithms}\n")
             f.write(f"Duration:       {format_duration(result.verification_time)}\n\n")
         
         # ISO Structure Analysis
@@ -516,7 +538,7 @@ class OpticalDiscBackup:
         # Create ISO (with in-stream source hashing), then verify by re-reading it.
         # Wrapped so the disc is always remounted/ejected and the run is always
         # documented, even when the copy or verification fails partway.
-        creation_time, verification_time, md5_iso, md5_raw = 0.0, 0.0, None, None
+        iso_result = None
         iso_analysis = {"skipped": True, "reason": backup_error or "not started"}
         if backup_error is None:
             try:
@@ -524,7 +546,7 @@ class OpticalDiscBackup:
                     iso_analysis = {"skipped": True, "reason": "dry run"}
                     log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Skipping .iso creation and verification."))
                 else:
-                    creation_time, verification_time, md5_iso, md5_raw = self._create_and_verify_iso(disk_size)
+                    iso_result = self._create_and_verify_iso(disk_size)
                     # Analyze ISO structure
                     iso_analysis = self._analyze_iso_structure(self.config.output_path)
             except (Exception, KeyboardInterrupt) as e:
@@ -541,10 +563,12 @@ class OpticalDiscBackup:
             success=backup_error is None,
             iso_path=self.config.output_path,
             disk_size=disk_size,
-            md5_iso=md5_iso,
-            md5_raw=md5_raw,
-            creation_time=creation_time,
-            verification_time=verification_time,
+            md5_iso=iso_result.md5_iso if iso_result else None,
+            md5_raw=iso_result.md5_raw if iso_result else None,
+            sha256_iso=iso_result.sha256_iso if iso_result else None,
+            sha256_raw=iso_result.sha256_raw if iso_result else None,
+            creation_time=iso_result.creation_time if iso_result else 0.0,
+            verification_time=iso_result.verification_time if iso_result else 0.0,
             error_message=backup_error,
             unmount_ok=unmount_ok,
             finalized=finalized
@@ -644,7 +668,7 @@ class OpticalDiscBackup:
             log(colorize("red", f"Tree generation failed: {e}"))
             return False
     
-    def _create_and_verify_iso(self, disk_size: int) -> Tuple[float, float, str, str]:
+    def _create_and_verify_iso(self, disk_size: int) -> IsoCreationResult:
         """Create ISO with in-stream source hashing, then verify by re-reading the written file"""
         log_divider("Creating ISO")
         log(colorize("cyan", "Creating ISO from:") + " " + colorize("yellow", self.config.disk_id))
@@ -654,6 +678,7 @@ class OpticalDiscBackup:
         log(colorize("cyan", "Running command:") + " " + colorize("yellow", dd_command))
 
         raw_hasher = hashlib.md5()
+        raw_sha_hasher = hashlib.sha256()
         bytes_written = 0
         start_time = time.time()
         if self.run:
@@ -672,9 +697,10 @@ class OpticalDiscBackup:
                     if not chunk:
                         break
 
-                    # Write to file and update the streamed source hash
+                    # Write to file and update the streamed source hashes
                     iso_file.write(chunk)
                     raw_hasher.update(chunk)
+                    raw_sha_hasher.update(chunk)
                     bytes_written += len(chunk)
 
                     # Update progress (with "ISO Creation:" label to match expected output)
@@ -701,11 +727,13 @@ class OpticalDiscBackup:
 
         creation_time = time.time() - start_time
         raw_hash = raw_hasher.hexdigest()
+        raw_sha = raw_sha_hasher.hexdigest()
         if self.run:
             self.run.mark("copy_end")
 
         log(colorize("green", "ISO creation complete."))
         log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
+        log(colorize("cyan", "SHA-256 (Raw Disk):") + " " + colorize("yellow", raw_sha))
 
         # Independent verification: re-read the written ISO from disk and hash it,
         # so the comparison reflects the bytes that actually landed on disk.
@@ -717,6 +745,7 @@ class OpticalDiscBackup:
         log(colorize("cyan", "Shell equivalent:") + " " + colorize("yellow", shell_equiv))
 
         iso_hasher = hashlib.md5()
+        iso_sha_hasher = hashlib.sha256()
         verify_start = time.time()
         bytes_read = 0
         if self.run:
@@ -737,23 +766,34 @@ class OpticalDiscBackup:
                 if not chunk:
                     break
                 iso_hasher.update(chunk)
+                iso_sha_hasher.update(chunk)
                 bytes_read += len(chunk)
                 self._display_progress("Verification", bytes_read, bytes_written, verify_start)
 
         verification_time = time.time() - verify_start
         iso_hash = iso_hasher.hexdigest()
+        iso_sha = iso_sha_hasher.hexdigest()
         if self.run:
             self.run.mark("verify_end")
 
         log(colorize("cyan", "MD5 (ISO):") + " " + colorize("yellow", iso_hash))
         log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
+        log(colorize("cyan", "SHA-256 (ISO):") + " " + colorize("yellow", iso_sha))
+        log(colorize("cyan", "SHA-256 (Raw Disk):") + " " + colorize("yellow", raw_sha))
 
-        if iso_hash == raw_hash:
+        if iso_hash == raw_hash and iso_sha == raw_sha:
             log(colorize("green", "Checksum match: ISO on disk is a true bit-for-bit copy."))
         else:
             log(colorize("red", "Checksum mismatch! ISO on disk does not match the source stream."))
 
-        return creation_time, verification_time, iso_hash, raw_hash
+        return IsoCreationResult(
+            creation_time=creation_time,
+            verification_time=verification_time,
+            md5_raw=raw_hash,
+            md5_iso=iso_hash,
+            sha256_raw=raw_sha,
+            sha256_iso=iso_sha,
+        )
     
     def _display_progress(self, title: str, current: int, total: int, start_time: float):
         """Display progress information"""
@@ -1085,8 +1125,9 @@ class OpticalDiscBackup:
                     "performed": result.unmount_ok is True
                 },
                 "verification": {
-                    "method": "md5 hash comparison (written ISO re-read from disk vs raw device stream)",
+                    "method": "md5 + sha-256 hash comparison (written ISO re-read from disk vs raw device stream)",
                     "algorithm": "MD5",
+                    "algorithms": ["MD5", "SHA-256"],
                     "algorithm_bits": 128,
                     "performed": result.md5_iso is not None,
                     "shell_equivalent": f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
@@ -1124,6 +1165,8 @@ class OpticalDiscBackup:
                 "hash_length_bits": 128,
                 "iso_hash": result.md5_iso,
                 "source_hash": result.md5_raw,
+                "sha256_iso_hash": result.sha256_iso,
+                "sha256_source_hash": result.sha256_raw,
                 "hashes_match": result.checksum_match,
                 "verification_method": "Source hashed in-stream during creation; written ISO re-read from disk (cache bypassed) and hashed",
                 "integrity_status": "verified" if result.checksum_match else ("failed" if result.checksum_match is False else "not_performed"),
@@ -1225,7 +1268,7 @@ class OpticalDiscBackup:
                 "verification_levels": [
                     {
                         "type": "bit_perfect_copy",
-                        "method": "MD5 hash comparison",
+                        "method": "MD5 + SHA-256 hash comparison",
                         "status": "verified" if result.checksum_match else ("failed" if result.checksum_match is False else "not_performed"),
                         "confidence": "100%" if result.checksum_match else ("0%" if result.checksum_match is False else "n/a")
                     },

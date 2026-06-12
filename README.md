@@ -315,7 +315,7 @@ If all commands return version information, you're ready to go!
 
 Creates archival-quality ISO images from optical discs while simultaneously verifying data integrity. Designed for digital preservation workflows where verification and documentation are critical.
 
-The script reads directly from the raw device (bypassing filesystem caching) and calculates the source MD5 checksum during the copy. After the copy completes, it verifies the backup by re-reading the written ISO from disk and comparing its hash against the source — so verification reflects the bytes that actually landed on disk, not the in-memory stream.
+The script reads directly from the raw device (bypassing filesystem caching) and calculates the source MD5 and SHA-256 checksums during the copy. After the copy completes, it verifies the backup by re-reading the written ISO from disk and comparing both hashes against the source — so verification reflects the bytes that actually landed on disk, not the in-memory stream.
 
 ### Quick Start
 
@@ -500,8 +500,10 @@ Avg Speed: 24.67MB/s
 #### Verification Output
 
 ```
-MD5 (ISO):      a1b2c3d4e5f6...
-MD5 (Raw Disk): a1b2c3d4e5f6...
+MD5 (ISO):          a1b2c3d4e5f6...
+MD5 (Raw Disk):     a1b2c3d4e5f6...
+SHA-256 (ISO):      9f8e7d6c5b4a...
+SHA-256 (Raw Disk): 9f8e7d6c5b4a...
 Checksum match: ISO on disk is a true bit-for-bit copy.
 ```
 
@@ -848,7 +850,7 @@ Phase 2 — Verification (after forcing the file to physical disk)
 └──────────────┘
 ```
 
-During creation, each 4MB chunk is read from the raw device, written to the ISO file, and fed to the source (raw) MD5 hasher. After the copy completes, the script forces the file to physical media (`F_FULLFSYNC`), then re-reads the written ISO from disk with the page cache bypassed (`F_NOCACHE`) and hashes it independently.
+During creation, each 4MB chunk is read from the raw device, written to the ISO file, and fed to the source (raw) hashers — both MD5 and SHA-256. After the copy completes, the script forces the file to physical media (`F_FULLFSYNC`), then re-reads the written ISO from disk with the page cache bypassed (`F_NOCACHE`) and hashes it independently with both algorithms. A match requires both digest pairs to agree; MD5 is retained for continuity with existing collection manifests, SHA-256 for current archival fixity practice.
 
 Because the second hash comes from the bytes that actually landed on disk — not from the in-memory stream — a mismatch catches write errors, truncated writes, and destination-disk corruption. Verification always runs; there is no option to skip it.
 
