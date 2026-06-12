@@ -510,11 +510,14 @@ Checksum match: ISO on disk is a true bit-for-bit copy.
 
 | Code | Meaning |
 |------|---------|
-| `0` | Success — backup completed and verified |
+| `0` | Success — backup completed (see note below) |
 | `1` | Failure — backup failed (see error message) |
 | `2` | Verification failed — written ISO does not match the source (run is marked failed) |
 
-> **Note:** A failed disc remount/eject after a verified backup still exits `0` — this workflow is operator-attended, so a stuck disc is immediately visible at the drive. Such runs are recorded as `success_with_warnings` in the manifest and `SUCCESS (WITH WARNINGS)` in the log header, so they remain findable later.
+> **Note:** Exit `0` covers three record states — the manifest's `overall_status` and the log header are the source of truth:
+> - `success` — verified master produced
+> - `success_with_warnings` — verified master, with a non-fatal problem recorded (e.g. a failed remount/eject or an incomplete tree listing; this workflow is operator-attended, so these don't change the exit code)
+> - `--no-verification` runs — master produced but verification was deliberately skipped (`verification_performed: false`, integrity status `not_performed`)
 
 ---
 

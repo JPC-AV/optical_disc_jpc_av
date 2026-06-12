@@ -462,7 +462,9 @@ class OpticalDiscBackup:
         if self.config.output_path.exists() and not self._confirm_overwrite():
             return BackupResult(False, self.config.output_path, disk_size, error_message="Aborted to avoid overwrite")
         
-        # Create output directory
+        # Create output directory, remembering whether this run created it so
+        # we never chown a pre-existing directory we don't own (e.g. /tmp)
+        created_output_dir = not self.config.output_dir.exists()
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Generate tree listing (this is the first divider after user inputs)
@@ -563,8 +565,10 @@ class OpticalDiscBackup:
         # Deliberately non-recursive and limited to this run's known artifacts.
         sudo_user = os.environ.get("SUDO_USER")
         if sudo_user:
-            artifacts = [self.config.output_dir, result.iso_path, self.config.log_path,
+            artifacts = [result.iso_path, self.config.log_path,
                          self.config.manifest_path, self.config.tree_path, self.config.isolyzer_path]
+            if created_output_dir:
+                artifacts.insert(0, self.config.output_dir)
             existing = [str(p) for p in artifacts if p.exists()]
             try:
                 subprocess.run(["chown", sudo_user] + existing, check=True)
