@@ -37,6 +37,7 @@ class BackupConfig:
     no_verification: bool = False
     force: bool = False
     media_type: str = "Unknown"
+    mount_point: Optional[str] = None
     # Set when a run fails; sidecar paths then resolve to failure-marked names
     # so a retry can never overwrite the failed attempt's records.
     failure_token: Optional[str] = None
@@ -286,7 +287,8 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         
         # Tree generation
         f.write(f"[{start_time.strftime('%H:%M:%S')}] Tree Listing Generation\n")
-        f.write(f"  Command: tree -RapugD --si --du /Volumes/{config.volume_name}\n")
+        tree_target = config.mount_point or f"/Volumes/{config.volume_name}"
+        f.write(f"  Command: tree -RapugD --si --du {tree_target}\n")
         f.write(f"  Output:  {config.tree_path.name}\n\n")
         
         # Disk unmount
@@ -361,7 +363,12 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
                     f.write(f"  Size check: ISO is {size_diff} bytes ({iso_analysis.get('size_difference_sectors', 0)} sectors) larger than the filesystem declares.\n")
                     f.write(f"  This is normal for optical media — extra sectors are lead-out/padding and do not indicate data loss.\n")
             
-            f.write("  Status:  Complete\n\n")
+            if iso_analysis and 'error' in iso_analysis:
+                f.write(f"  Status:  FAILED ({iso_analysis['error']})\n\n")
+            elif iso_analysis and iso_analysis.get('skipped'):
+                f.write(f"  Status:  Skipped ({iso_analysis.get('reason', 'unknown')})\n\n")
+            else:
+                f.write("  Status:  Complete\n\n")
         
         # Finalization
         final_time = create_end + datetime.timedelta(seconds=1)
@@ -439,6 +446,7 @@ class OpticalDiscBackup:
         
         disk_size = disk_info.get("TotalSize", 0)
         self.config.media_type = disk_info.get("OpticalMediaType", "Unknown")
+        self.config.mount_point = disk_info.get("MountPoint") or f"/Volumes/{self.config.volume_name}"
 
         # Safety guard: refuse to image anything diskutil does not identify as
         # optical media, so a mistyped disk ID can't unmount and read an
@@ -457,17 +465,8 @@ class OpticalDiscBackup:
         # Create output directory
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Fix ownership — since we're running under sudo, the dir would be owned
-        # by root. Chown it back to the real user so other scripts can write into it.
-        sudo_user = os.environ.get("SUDO_USER")
-        if sudo_user:
-            try:
-                subprocess.run(["chown", "-R", sudo_user, str(self.config.output_dir)], check=True)
-            except subprocess.CalledProcessError as e:
-                log(colorize("yellow", f"Warning: Could not set ownership of output directory: {e}"))
-        
         # Generate tree listing (this is the first divider after user inputs)
-        self._generate_tree_listing()
+        tree_ok = self._generate_tree_listing()
         
         # Unmount disk; record the failure rather than dd a mounted device.
         # The disc is left as-is (no remount/eject) since it never unmounted.
@@ -493,10 +492,10 @@ class OpticalDiscBackup:
                     creation_time, verification_time, md5_iso, md5_raw = self._create_and_verify_iso(disk_size)
                     # Analyze ISO structure
                     iso_analysis = self._analyze_iso_structure(self.config.output_path)
-            except Exception as e:
-                backup_error = str(e)
-                iso_analysis = {"skipped": True, "reason": f"backup failed: {e}"}
-                log(colorize("red", f"Backup failed: {e}"))
+            except (Exception, KeyboardInterrupt) as e:
+                backup_error = "Interrupted by operator (Ctrl-C)" if isinstance(e, KeyboardInterrupt) else str(e)
+                iso_analysis = {"skipped": True, "reason": f"backup failed: {backup_error}"}
+                log(colorize("red", f"Backup failed: {backup_error}"))
             finally:
                 # Remount and eject the disc even if the backup failed
                 finalized = self._finalize_disk()
@@ -524,12 +523,16 @@ class OpticalDiscBackup:
         # the record should make these findable (success_with_warnings).
         if result.success and not self.config.dry_run and not result.finalized:
             result.warnings.append("disc finalization (remount/eject) failed")
+        if result.success and not tree_ok:
+            result.warnings.append("tree listing failed or incomplete")
 
         # Failed or aborted runs keep all their records under failure-marked
         # names, so they are obvious in the output directory and a retry can
         # never overwrite the evidence of a previous attempt.
         if not result.success:
-            fail_token = datetime.datetime.now().strftime('failed-%Y%m%dT%H%M%S')
+            # Timestamp for readability/sorting plus a random suffix so rapid
+            # retries in the same second can never overwrite prior evidence
+            fail_token = f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
             if self.config.output_path.exists():
                 marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
                 marked_path = self.config.output_dir / f"{self.config.filename}_{fail_token}{marker}"
@@ -554,7 +557,20 @@ class OpticalDiscBackup:
         create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info, iso_analysis)
 
         self._create_manifest(result, disk_info, iso_analysis)
-        
+
+        # Fix ownership last — everything above ran as root, so the directory
+        # and the files this run created would otherwise stay root-owned.
+        # Deliberately non-recursive and limited to this run's known artifacts.
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            artifacts = [self.config.output_dir, result.iso_path, self.config.log_path,
+                         self.config.manifest_path, self.config.tree_path, self.config.isolyzer_path]
+            existing = [str(p) for p in artifacts if p.exists()]
+            try:
+                subprocess.run(["chown", sudo_user] + existing, check=True)
+            except subprocess.CalledProcessError as e:
+                log(colorize("yellow", f"Warning: Could not set ownership of output files: {e}"))
+
         return result
     
     def _get_disk_info(self) -> Dict[str, Any]:
@@ -570,19 +586,25 @@ class OpticalDiscBackup:
         response = get_input(colorize("yellow", f"{self.config.output_path} exists. Overwrite? (y/n): "))
         return response.lower() == 'y'
     
-    def _generate_tree_listing(self):
-        """Generate tree listing of volume contents"""
+    def _generate_tree_listing(self) -> bool:
+        """Generate tree listing of volume contents; returns True on success"""
         log_divider("Generating Tree Listing")
-        tree_cmd = ["tree", "-RapugD", "--si", "--du", f"/Volumes/{self.config.volume_name}"]
+        target = self.config.mount_point or f"/Volumes/{self.config.volume_name}"
+        tree_cmd = ["tree", "-RapugD", "--si", "--du", target]
         try:
             log(colorize("cyan", "Generating tree listing..."))
             log(colorize("cyan", "Running command:") + " " + colorize("yellow", " ".join(tree_cmd)))
             with open(self.config.tree_path, "w", encoding="utf-8") as f:
-                subprocess.run(tree_cmd, stdout=f, stderr=subprocess.STDOUT,
+                proc = subprocess.run(tree_cmd, stdout=f, stderr=subprocess.STDOUT,
                              env={**os.environ, "LANG": "en_US.UTF-8"})
+            if proc.returncode != 0:
+                log(colorize("yellow", f"Warning: tree exited with status {proc.returncode}; listing may be missing or incomplete."))
+                return False
             log(colorize("cyan", "Tree saved to:") + " " + colorize("yellow", str(self.config.tree_path)))
+            return True
         except Exception as e:
             log(colorize("red", f"Tree generation failed: {e}"))
+            return False
     
     def _create_and_verify_iso(self, disk_size: int) -> Tuple[float, float, Optional[str], str]:
         """Create ISO with in-stream source hashing, then verify by re-reading the written file"""
@@ -600,45 +622,42 @@ class OpticalDiscBackup:
         # Initialize progress display
         print("\n" * 4, end="")
 
-        try:
-            with open(self.config.output_path, 'wb') as iso_file:
-                with subprocess.Popen(["dd", f"if=/dev/{raw_disk}", "bs=4m"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
-                    while True:
-                        chunk = proc.stdout.read(4 * 1024 * 1024)  # 4MB chunks
-                        if not chunk:
-                            break
+        # A KeyboardInterrupt here propagates to create_backup(), which records
+        # the interruption as a failed run and renames the partial ISO.
+        with open(self.config.output_path, 'wb') as iso_file:
+            with subprocess.Popen(["dd", f"if=/dev/{raw_disk}", "bs=4m"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                while True:
+                    chunk = proc.stdout.read(4 * 1024 * 1024)  # 4MB chunks
+                    if not chunk:
+                        break
 
-                        # Write to file and update the streamed source hash
-                        iso_file.write(chunk)
-                        raw_hasher.update(chunk)
-                        bytes_written += len(chunk)
+                    # Write to file and update the streamed source hash
+                    iso_file.write(chunk)
+                    raw_hasher.update(chunk)
+                    bytes_written += len(chunk)
 
-                        # Update progress (with "ISO Creation:" label to match expected output)
-                        self._display_progress("ISO Creation", bytes_written, disk_size, start_time)
+                    # Update progress (with "ISO Creation:" label to match expected output)
+                    self._display_progress("ISO Creation", bytes_written, disk_size, start_time)
 
-                    # Wait for dd to complete and get stderr (which contains the transfer stats)
-                    _, stderr = proc.communicate()
-                    if proc.returncode != 0:
-                        raise RuntimeError(f"dd failed: {stderr.decode()}")
+                # Wait for dd to complete and get stderr (which contains the transfer stats)
+                _, stderr = proc.communicate()
+                if proc.returncode != 0:
+                    raise RuntimeError(f"dd failed: {stderr.decode()}")
 
-                    # Print dd output (records in/out, transfer stats) - decode and strip
-                    if stderr:
-                        # Decode bytes to string and clean up the output
-                        dd_output = stderr.strip() if isinstance(stderr, str) else stderr.decode().strip()
-                        log(dd_output)
+                # Print dd output (records in/out, transfer stats) - decode and strip
+                if stderr:
+                    # Decode bytes to string and clean up the output
+                    dd_output = stderr.strip() if isinstance(stderr, str) else stderr.decode().strip()
+                    log(dd_output)
 
-                # Force data to physical media before the verification pass below;
-                # plain fsync on macOS stops at the drive cache, F_FULLFSYNC does not.
-                iso_file.flush()
-                try:
-                    fcntl.fcntl(iso_file.fileno(), fcntl.F_FULLFSYNC)
-                except (OSError, AttributeError):
-                    os.fsync(iso_file.fileno())
-
-        except KeyboardInterrupt:
-            log(colorize("red", "Operation interrupted by user."))
-            sys.exit(1)
+            # Force data to physical media before the verification pass below;
+            # plain fsync on macOS stops at the drive cache, F_FULLFSYNC does not.
+            iso_file.flush()
+            try:
+                fcntl.fcntl(iso_file.fileno(), fcntl.F_FULLFSYNC)
+            except (OSError, AttributeError):
+                os.fsync(iso_file.fileno())
 
         creation_time = time.time() - start_time
         raw_hash = raw_hasher.hexdigest()
@@ -666,25 +685,20 @@ class OpticalDiscBackup:
         # Initialize progress display
         print("\n" * 4, end="")
 
-        try:
-            with open(self.config.output_path, 'rb') as iso_file:
-                # Bypass the page cache so we hash what is on disk, not the
-                # copy of the data still sitting in memory from the write.
-                try:
-                    fcntl.fcntl(iso_file.fileno(), fcntl.F_NOCACHE, 1)
-                except (OSError, AttributeError):
-                    pass
-                while True:
-                    chunk = iso_file.read(4 * 1024 * 1024)  # 4MB chunks
-                    if not chunk:
-                        break
-                    iso_hasher.update(chunk)
-                    bytes_read += len(chunk)
-                    self._display_progress("Verification", bytes_read, bytes_written, verify_start)
-
-        except KeyboardInterrupt:
-            log(colorize("red", "Operation interrupted by user."))
-            sys.exit(1)
+        with open(self.config.output_path, 'rb') as iso_file:
+            # Bypass the page cache so we hash what is on disk, not the
+            # copy of the data still sitting in memory from the write.
+            try:
+                fcntl.fcntl(iso_file.fileno(), fcntl.F_NOCACHE, 1)
+            except (OSError, AttributeError):
+                pass
+            while True:
+                chunk = iso_file.read(4 * 1024 * 1024)  # 4MB chunks
+                if not chunk:
+                    break
+                iso_hasher.update(chunk)
+                bytes_read += len(chunk)
+                self._display_progress("Verification", bytes_read, bytes_written, verify_start)
 
         verification_time = time.time() - verify_start
         iso_hash = iso_hasher.hexdigest()
@@ -1014,7 +1028,7 @@ class OpticalDiscBackup:
             
             "operations_performed": {
                 "tree_listing": {
-                    "command": f"tree -RapugD --si --du /Volumes/{self.config.volume_name}",
+                    "command": f"tree -RapugD --si --du {self.config.mount_point or '/Volumes/' + self.config.volume_name}",
                     "output_file": self.config.tree_path.name,
                     "summary": tree_summary
                 },
@@ -1487,6 +1501,14 @@ def gather_user_inputs(args: argparse.Namespace) -> BackupConfig:
     
     # Get other inputs
     filename = args.filename or get_input(colorize("cyan", "Enter output ISO filename (no extension): "))
+    # The filename becomes a directory component and its files are chowned as
+    # root later; require a simple basename so it cannot point outside the
+    # output directory (rejects '..', absolute paths, and anything with '/').
+    if (not filename or filename != Path(filename).name or filename in (".", "..")
+            or filename.startswith(("-", "~"))):
+        log(colorize("red", f"Invalid filename: {filename!r}. Use a simple name with no path separators "
+                            f"that does not start with '-' or '~'."))
+        sys.exit(1)
     base_dir = Path(args.dir or get_input(colorize("cyan", "Enter output directory: "))).expanduser()
     operator = args.operator or get_input(colorize("cyan", "Enter operator name or initials: "))
     

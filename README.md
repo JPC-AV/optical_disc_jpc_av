@@ -464,15 +464,15 @@ For a backup with filename `JPC_AV_00001`, the script creates a directory contai
 
 #### Failed Run Naming
 
-Failed or aborted runs are renamed so they can never be mistaken for finished masters. All artifacts from a failed attempt share a `failed-<timestamp>` token, and retries never overwrite them:
+Failed or aborted runs are renamed so they can never be mistaken for finished masters. All artifacts from a failed attempt share a `failed-<timestamp>-<random>` token, and retries never overwrite them:
 
 ```
-JPC_AV_00001_failed-20260612T140322.iso.partial    # copy aborted partway
-JPC_AV_00001_failed-20260612T140322.iso.mismatch   # completed but failed verification
-JPC_AV_00001_failed-20260612T140322.iso.log.txt    # log for that attempt
-JPC_AV_00001_failed-20260612T140322_manifest.json  # manifest for that attempt
-JPC_AV_00001_failed-20260612T140322_tree.txt       # tree listing for that attempt
-JPC_AV_00001_failed-20260612T140322_isolyzer.xml   # structural analysis, if it ran
+JPC_AV_00001_failed-20260612T140322-3f9a2c.iso.partial    # copy aborted partway
+JPC_AV_00001_failed-20260612T140322-3f9a2c.iso.mismatch   # completed but failed verification
+JPC_AV_00001_failed-20260612T140322-3f9a2c.iso.log.txt    # log for that attempt
+JPC_AV_00001_failed-20260612T140322-3f9a2c_manifest.json  # manifest for that attempt
+JPC_AV_00001_failed-20260612T140322-3f9a2c_tree.txt       # tree listing for that attempt
+JPC_AV_00001_failed-20260612T140322-3f9a2c_isolyzer.xml   # structural analysis, if it ran
 ```
 
 Successful runs use the standard names above.
