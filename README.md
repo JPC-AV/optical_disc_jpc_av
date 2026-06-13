@@ -8,6 +8,7 @@ This repository contains two Python scripts for a complete optical disc digitiza
 |--------|---------|
 | **`makeiso.py`** | Creates bit-perfect ISO preservation masters from physical discs |
 | **`makeiso-video.py`** | Converts DVD-Video ISOs to MP4 access copies |
+| **`verifyiso.py`** | Re-verifies existing ISO masters against their manifest hashes — no discs needed |
 
 Part of the Johnson Publishing Company Archive (JPCA) digitization initiative—a collaboration between the [Getty Research Institute](https://www.getty.edu/projects/johnson-publishing-company-archive/) and the [Smithsonian National Museum of African American History and Culture](https://www.searchablemuseum.com/johnson-publishing-company-image-power/).
 
@@ -38,6 +39,7 @@ Part of the Johnson Publishing Company Archive (JPCA) digitization initiative—
   - [Disc Type Handling](#disc-type-handling)
   - [Encoding Defaults](#encoding-defaults)
   - [Output Files](#output-files-1)
+- [verifyiso.py — Collection Fixity Verification](#verifyisopy--collection-fixity-verification)
 - [Troubleshooting](#troubleshooting)
 - [Technical Details](#technical-details)
   - [How Verification Works](#how-verification-works)
@@ -769,6 +771,32 @@ For skipped ISOs (non-VIDEO_TS content):
 ```
 
 ---
+
+## verifyiso.py — Collection Fixity Verification
+
+Audits existing ISO preservation masters **without reloading any discs**: it re-hashes each ISO and compares against the source hash recorded in its manifest at imaging time. The `source_hash` was always computed by streaming the physical disc, so it is a valid fixity baseline for ISOs made by *any* version of `makeiso.py`; newer manifests' SHA-256 hashes are compared too when present.
+
+Read-only and sudo-free — it never modifies the collection.
+
+```bash
+# Verify everything under a collection directory (searched recursively)
+python3 verifyiso.py /Volumes/Archive/JPC_AV
+
+# Multiple locations, with a CSV report for record-keeping
+python3 verifyiso.py /Volumes/Archive /Volumes/Backup --csv fixity_report.csv
+```
+
+Each manifest is reported as one of:
+
+| Status | Meaning |
+|--------|---------|
+| `PASS` | ISO hash matches the manifest (MD5, plus SHA-256 when recorded) |
+| `FAIL` | Hash mismatch — the ISO has changed since imaging (bit rot, bad copy, truncation) |
+| `MISSING_ISO` | Manifest exists but its ISO is gone |
+| `SKIPPED` | Nothing to check (dry-run/failed-run records, non-preservation manifests) |
+| `ERROR` | Manifest or ISO unreadable |
+
+Exit code `0` means every checked ISO verified; `1` means at least one item needs attention (listed at the end of the run). Suitable for a scheduled fixity-audit job.
 
 ## Troubleshooting
 
