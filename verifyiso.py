@@ -138,15 +138,21 @@ def check_manifest(manifest_path: Path) -> CheckResult:
         result.detail = "manifest records no ISO filename"
         return result
     result.iso = manifest_path.parent / iso_name
-    if not result.iso.exists():
-        result.status = "MISSING_ISO"
-        result.detail = f"ISO not found next to manifest: {iso_name}"
-        return result
-
-    result.size_bytes = result.iso.stat().st_size
+    # exists/stat/hash handled as one unit: a file vanishing mid-check maps
+    # to MISSING_ISO, any other filesystem trouble (stale network handle,
+    # permissions) to ERROR — one bad item must never stop the batch
     started = time.time()
     try:
+        if not result.iso.exists():
+            result.status = "MISSING_ISO"
+            result.detail = f"ISO not found next to manifest: {iso_name}"
+            return result
+        result.size_bytes = result.iso.stat().st_size
         result.md5_actual, result.sha256_actual = hash_file(result.iso, result.iso.name)
+    except FileNotFoundError:
+        result.status = "MISSING_ISO"
+        result.detail = f"ISO disappeared during check: {iso_name}"
+        return result
     except OSError as e:
         result.detail = f"could not read ISO: {e}"
         return result
@@ -238,8 +244,13 @@ def main():
             print(colorize("red", f"  {r.iso or r.manifest}: {r.status} — {r.detail}"))
 
     if args.csv:
-        write_csv(results, args.csv)
-        print(colorize("cyan", f"\nCSV report written to: {args.csv}"))
+        try:
+            write_csv(results, args.csv)
+            print(colorize("cyan", f"\nCSV report written to: {args.csv}"))
+        except OSError as e:
+            # The report is part of the deliverable for a scheduled audit
+            print(colorize("red", f"\nCould not write CSV report: {e}"))
+            sys.exit(1)
 
     sys.exit(1 if bad else 0)
 
