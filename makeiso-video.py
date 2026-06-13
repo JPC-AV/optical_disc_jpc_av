@@ -585,19 +585,29 @@ class ISOToMP4Converter:
         result = self._convert_inner()
 
         # Generate records — every processed ISO gets a log and a manifest of
-        # some kind, unless the record paths themselves failed the symlink guard
+        # some kind, unless the record paths themselves failed the symlink guard.
+        # Record writing is best-effort: a filesystem failure here must not
+        # crash the run — but records are part of the deliverable, so a
+        # nominally-successful conversion whose records can't be written is
+        # reported as failed.
         if not result.records_unsafe:
-            if result.success and not result.skipped:
-                self._generate_summary(result)
-                self._create_log_file(result)
-                self._create_manifest(result)
-            elif result.skipped and not result.error_message:
-                self._create_skip_manifest(result)
-                self._create_log_file(result, dry_run=self.config.dry_run)
-            elif result.error_message:
-                token = self._get_failure_token("aborted" if result.aborted else "failed")
-                self._create_error_manifest(result, token)
-                self._create_log_file(result, is_error=True, failure_token=token)
+            try:
+                if result.success and not result.skipped:
+                    self._generate_summary(result)
+                    self._create_log_file(result)
+                    self._create_manifest(result)
+                elif result.skipped and not result.error_message:
+                    self._create_skip_manifest(result)
+                    self._create_log_file(result, dry_run=self.config.dry_run)
+                elif result.error_message:
+                    token = self._get_failure_token("aborted" if result.aborted else "failed")
+                    self._create_error_manifest(result, token)
+                    self._create_log_file(result, is_error=True, failure_token=token)
+            except Exception as record_error:
+                log(colorize("red", f"Could not write run records: {record_error}"))
+                if result.success:
+                    result.success = False
+                    result.error_message = f"Run records could not be written: {record_error}"
 
         return result
 
@@ -908,7 +918,13 @@ class ISOToMP4Converter:
         base = display_base or path
         token = self._get_failure_token()
         marked = path.with_name(f"{base.stem}_{token}.mp4.partial")
-        path.rename(marked)
+        try:
+            path.rename(marked)
+        except OSError as e:
+            # Same filesystem condition that failed the run can block the
+            # rename too; leave the temp where it is and point records at it
+            log(colorize("yellow", f"Warning: could not quarantine partial {path.name}: {e}"))
+            return path
         log(colorize("yellow", f"Partial output renamed to: {marked.name}"))
         return marked
 
@@ -1013,47 +1029,66 @@ class ISOToMP4Converter:
             title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
             return
 
-        # Verify output exists (still at the temp path — promotion comes last)
-        if not temp_path.exists():
-            title.status = "failed"
-            title.error = "Output file was not created"
-            return
+        # Post-encode verification and promotion share the encode's failure
+        # handling: any error here fails the title, quarantines the temp,
+        # and flows into the normal failure records (it must never escape
+        # the record machinery).
+        stage = "verification"
+        try:
+            if not temp_path.exists():
+                title.status = "failed"
+                title.error = "Output file was not created"
+                return
 
-        title.output_size = temp_path.stat().st_size
-        title.video_duration = get_video_duration(temp_path)
+            title.output_size = temp_path.stat().st_size
+            title.video_duration = get_video_duration(temp_path)
 
-        # Record what was actually mapped (closes the loop on stream loss)
-        output_counts = probe_stream_counts(temp_path)
-        title.mapped_video_streams = output_counts.get("video", 0)
-        title.mapped_audio_streams = output_counts.get("audio", 0)
-        if title.source_audio_streams and title.mapped_audio_streams < title.source_audio_streams:
-            result.warnings.append(
-                f"{plan.output_path.name}: only {title.mapped_audio_streams} of "
-                f"{title.source_audio_streams} source audio stream(s) mapped")
-
-        # Duration sanity check (best-effort; warns, never fails the run)
-        if title.expected_duration and title.video_duration:
-            if title.video_duration < title.expected_duration * 0.95:
+            # Record what was actually mapped (closes the loop on stream loss)
+            output_counts = probe_stream_counts(temp_path)
+            title.mapped_video_streams = output_counts.get("video", 0)
+            title.mapped_audio_streams = output_counts.get("audio", 0)
+            if title.source_audio_streams and title.mapped_audio_streams < title.source_audio_streams:
                 result.warnings.append(
-                    f"{plan.output_path.name}: output duration "
-                    f"{format_timecode(title.video_duration)} is >5% shorter than expected "
-                    f"{format_timecode(title.expected_duration)} — possible truncation")
-        elif title.expected_duration is None:
-            result.warnings.append(
-                f"{plan.output_path.name}: duration comparison unavailable (source unprobeable)")
+                    f"{plan.output_path.name}: only {title.mapped_audio_streams} of "
+                    f"{title.source_audio_streams} source audio stream(s) mapped")
 
-        # Calculate checksums (MD5 + SHA-256 in one read)
-        if self.run:
-            self.run.mark(f"checksum_vts_{plan.vts_number:02d}")
-        log(colorize("cyan", "Calculating MD5 and SHA-256 of output file..."))
-        title.md5, title.sha256 = calculate_checksums(temp_path)
-        if title.md5 is None:
-            result.warnings.append(
-                f"{plan.output_path.name}: checksum calculation failed — no fixity recorded")
+            # Duration sanity check (best-effort; warns, never fails the run)
+            if title.expected_duration and title.video_duration:
+                if title.video_duration < title.expected_duration * 0.95:
+                    result.warnings.append(
+                        f"{plan.output_path.name}: output duration "
+                        f"{format_timecode(title.video_duration)} is >5% shorter than expected "
+                        f"{format_timecode(title.expected_duration)} — possible truncation")
+            elif title.expected_duration is None:
+                result.warnings.append(
+                    f"{plan.output_path.name}: duration comparison unavailable (source unprobeable)")
 
-        # Everything verified — atomically promote the temp onto the final
-        # name (replaces an operator-approved overwrite target in one step)
-        temp_path.replace(plan.output_path)
+            # Calculate checksums (MD5 + SHA-256 in one read)
+            stage = "checksum"
+            if self.run:
+                self.run.mark(f"checksum_vts_{plan.vts_number:02d}")
+            log(colorize("cyan", "Calculating MD5 and SHA-256 of output file..."))
+            title.md5, title.sha256 = calculate_checksums(temp_path)
+            if title.md5 is None:
+                result.warnings.append(
+                    f"{plan.output_path.name}: checksum calculation failed — no fixity recorded")
+
+            # Everything verified — atomically promote the temp onto the final
+            # name (replaces an operator-approved overwrite target in one step)
+            stage = "promotion"
+            temp_path.replace(plan.output_path)
+
+        except KeyboardInterrupt:
+            title.status = "failed"
+            title.error = f"Interrupted by operator (Ctrl-C) during post-encode {stage}"
+            title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+            raise
+        except Exception as e:
+            title.status = "failed"
+            title.error = f"post-encode {stage} failed: {e}"
+            log(colorize("red", f"{plan.output_path.name}: {title.error}"))
+            title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+            return
 
         title.status = "completed"
         log(colorize("green", f"{plan.output_path.name} complete "
