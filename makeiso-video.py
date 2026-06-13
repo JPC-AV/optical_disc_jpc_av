@@ -607,6 +607,9 @@ class ISOToMP4Converter:
                 log(colorize("red", f"Could not write run records: {record_error}"))
                 if result.success:
                     result.success = False
+                    # A skip without its record is not a valid skip — clear the
+                    # flag so batch accounting counts this as a failure too
+                    result.skipped = False
                     result.error_message = f"Run records could not be written: {record_error}"
 
         return result
@@ -1657,16 +1660,18 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
         
         results["processed"] += 1
         
-        if result.skipped:
+        # Failure outranks skipped: a run can end up failed-while-skip-shaped
+        # (e.g. its skip record could not be written) and must count as failed
+        if not result.success:
+            results["failed"] += 1
+        elif result.skipped:
             # Differentiate dry-run skips (VIDEO_TS that would convert) from actual skips
             if result.skip_reason == "Dry run mode":
                 results["would_convert"] += 1
             else:
                 results["skipped"] += 1
-        elif result.success:
-            results["success"] += 1
         else:
-            results["failed"] += 1
+            results["success"] += 1
         
         results["details"].append({
             "iso": iso_path.name,
