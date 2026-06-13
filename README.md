@@ -95,7 +95,7 @@ This toolkit provides a two-stage workflow for optical disc digitization:
 - **Intelligent skipping** — Gracefully handles non-video discs (data DVDs, photo discs, DVD-Audio)
 - **High-quality output** — Default CRF 18 produces visually lossless MP4 files
 - **Batch processing** — Process entire directories of ISOs with a single command
-- **Checksum verification** — MD5 hash of output for integrity verification
+- **Checksum recording** — MD5 and SHA-256 hashes of every output for fixity
 - **Comprehensive logging** — Detailed logs and JSON manifests matching preservation conventions
 
 ---

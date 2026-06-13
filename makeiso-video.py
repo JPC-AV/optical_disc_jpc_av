@@ -9,6 +9,7 @@ A collaboration between the Getty Research Institute and the
 Smithsonian National Museum of African American History and Culture.
 """
 
+import os
 import subprocess
 import sys
 import datetime
@@ -102,6 +103,7 @@ class TitleOutput:
     expected_duration: Optional[float] = None
     encode_time: float = 0.0
     md5: Optional[str] = None
+    sha256: Optional[str] = None
     source_audio_streams: Optional[int] = None
     source_subtitle_streams: Optional[int] = None
     mapped_video_streams: int = 0
@@ -121,6 +123,7 @@ class ConversionResult:
     video_duration: Optional[float] = None  # Duration of the video content
     conversion_time: float = 0.0
     md5_mp4: Optional[str] = None
+    sha256_mp4: Optional[str] = None
     error_message: Optional[str] = None
     disc_analysis: Optional[DiscContentAnalysis] = None
     skipped: bool = False
@@ -173,8 +176,14 @@ COLOR = {
     "off": "\033[0m"
 }
 
+# ANSI output (color + progress carriage returns) only when stdout is a
+# terminal and NO_COLOR is unset (https://no-color.org). Decided at import.
+ANSI_ENABLED = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
 def colorize(color: str, text: str) -> str:
-    """Apply ANSI color to text"""
+    """Apply ANSI color to text (no-op when output is not a terminal)"""
+    if not ANSI_ENABLED:
+        return text
     return f"{COLOR[color]}{text}{COLOR['off']}"
 
 ### === LOGGING SETUP ===
@@ -254,72 +263,102 @@ def format_timecode(seconds: float) -> str:
     secs = seconds % 60
     return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
 
-def calculate_md5(filepath: Path) -> Optional[str]:
-    """Calculate MD5 hash of a file. Returns None on error."""
+def calculate_checksums(filepath: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Calculate MD5 and SHA-256 of a file in one read.
+
+    MD5 is kept for continuity with existing collection records; SHA-256 for
+    current archival fixity practice. Returns (None, None) on error — callers
+    surface that as a run warning."""
     try:
-        hasher = hashlib.md5()
+        md5 = hashlib.md5()
+        sha256 = hashlib.sha256()
         with open(filepath, 'rb') as f:
             for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):  # 4MB chunks
-                hasher.update(chunk)
-        return hasher.hexdigest()
+                md5.update(chunk)
+                sha256.update(chunk)
+        return md5.hexdigest(), sha256.hexdigest()
     except Exception as e:
-        log(colorize("yellow", f"Warning: MD5 calculation failed: {e}"))
-        return None
+        log(colorize("yellow", f"Warning: checksum calculation failed: {e}"))
+        return None, None
 
 ### === ISO MOUNTING ===
 
 class ISOMount:
-    """Context manager for mounting ISO files"""
-    
+    """Context manager for mounting ISO files.
+
+    Multi-session/multi-partition ISOs can mount several volumes; the
+    returned mount point is the one containing VIDEO_TS when present,
+    falling back to the first volume."""
+
     def __init__(self, iso_path: Path):
         self.iso_path = iso_path
         self.mount_point: Optional[Path] = None
-        self.device: Optional[str] = None
-    
+        self.mount_points: List[Path] = []
+        self.devices: List[str] = []
+
     def __enter__(self) -> Optional[Path]:
-        """Mount the ISO and return mount point"""
+        """Mount the ISO and return the most relevant mount point"""
         try:
             # Use hdiutil to mount the ISO
             result = run_cmd([
                 "hdiutil", "attach", str(self.iso_path),
                 "-readonly", "-nobrowse", "-plist"
             ])
-            
-            # Parse plist output to get mount point
+
+            # Parse plist output: collect ALL mounted volumes and devices
             plist_data = plistlib.loads(result.stdout.encode())
-            
             for entity in plist_data.get("system-entities", []):
                 mount_point = entity.get("mount-point")
                 if mount_point:
-                    self.mount_point = Path(mount_point)
-                    self.device = entity.get("dev-entry")
-                    log(colorize("green", f"Mounted ISO at: {self.mount_point}"))
-                    return self.mount_point
-            
-            log(colorize("red", "Failed to find mount point in hdiutil output"))
-            return None
-            
+                    self.mount_points.append(Path(mount_point))
+                if entity.get("dev-entry"):
+                    self.devices.append(entity["dev-entry"])
+
+            if not self.mount_points:
+                log(colorize("red", "Failed to find mount point in hdiutil output"))
+                return None
+
+            # Prefer the volume that actually contains VIDEO_TS
+            self.mount_point = self.mount_points[0]
+            if len(self.mount_points) > 1:
+                log(colorize("yellow", f"ISO mounted {len(self.mount_points)} volumes: "
+                                       + ", ".join(str(p) for p in self.mount_points)))
+                for candidate in self.mount_points:
+                    try:
+                        if any(item.is_dir() and item.name.upper() == "VIDEO_TS"
+                               for item in candidate.iterdir()):
+                            self.mount_point = candidate
+                            log(colorize("cyan", f"Using volume containing VIDEO_TS: {candidate}"))
+                            break
+                    except OSError:
+                        continue
+
+            log(colorize("green", f"Mounted ISO at: {self.mount_point}"))
+            return self.mount_point
+
         except subprocess.CalledProcessError as e:
             log(colorize("red", f"Failed to mount ISO: {e}"))
             return None
         except Exception as e:
             log(colorize("red", f"Unexpected error mounting ISO: {e}"))
             return None
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Unmount the ISO"""
-        if self.mount_point:
+        """Unmount the ISO (all volumes for multi-session images)"""
+        for mount_point in self.mount_points:
+            if not mount_point.exists():
+                continue  # an earlier detach already released this volume
             try:
-                run_cmd(["hdiutil", "detach", str(self.mount_point), "-force"])
-                log(colorize("green", f"Unmounted: {self.mount_point}"))
+                run_cmd(["hdiutil", "detach", str(mount_point), "-force"])
+                log(colorize("green", f"Unmounted: {mount_point}"))
             except subprocess.CalledProcessError as e:
                 log(colorize("yellow", f"Warning: Failed to unmount cleanly: {e}"))
-                # Try with device path
-                if self.device:
+                # Try with device paths
+                for device in self.devices:
                     try:
-                        run_cmd(["hdiutil", "detach", self.device, "-force"])
-                    except:
-                        pass
+                        run_cmd(["hdiutil", "detach", device, "-force"])
+                    except Exception as fallback_error:
+                        log(colorize("yellow", f"Warning: fallback detach of {device} failed: {fallback_error}"))
 
 ### === CONTENT ANALYSIS ===
 
@@ -851,6 +890,7 @@ class ISOToMP4Converter:
             result.output_size = main.output_size
             result.video_duration = main.video_duration
             result.md5_mp4 = main.md5
+            result.sha256_mp4 = main.sha256
         if not result.success:
             failed = [t for t in result.titles if t.status == "failed"]
             result.error_message = "; ".join(
@@ -920,6 +960,7 @@ class ISOToMP4Converter:
             # Parse ffmpeg stderr for progress (ffmpeg outputs progress to stderr)
             log("")  # Blank line before progress display
             stderr_output = []
+            last_plain_progress = time.time()
 
             while True:
                 line = process.stderr.readline()
@@ -932,13 +973,19 @@ class ISOToMP4Converter:
                 match = re.search(r'time=(\d+:\d+:\d+\.\d+)', line)
                 if match:
                     elapsed = time.time() - encode_start
-                    # Update progress display (overwrite same line)
-                    sys.stdout.write(f"\r{colorize('cyan', 'Encoding:')} {match.group(1)}  |  {colorize('cyan', 'Elapsed:')} {format_duration(elapsed)}    ")
-                    sys.stdout.flush()
+                    if ANSI_ENABLED:
+                        # Update progress display (overwrite same line)
+                        sys.stdout.write(f"\r{colorize('cyan', 'Encoding:')} {match.group(1)}  |  {colorize('cyan', 'Elapsed:')} {format_duration(elapsed)}    ")
+                        sys.stdout.flush()
+                    elif time.time() - last_plain_progress >= 15:
+                        # Redirected output: a plain line every ~15s instead
+                        last_plain_progress = time.time()
+                        log(f"Encoding {plan.output_path.name}: {match.group(1)}  |  Elapsed: {format_duration(elapsed)}")
 
-            # Clear progress line and move to new line
-            sys.stdout.write("\r" + " " * 80 + "\r")
-            sys.stdout.flush()
+            if ANSI_ENABLED:
+                # Clear progress line and move to new line
+                sys.stdout.write("\r" + " " * 80 + "\r")
+                sys.stdout.flush()
 
             title.encode_time = time.time() - encode_start
 
@@ -995,11 +1042,14 @@ class ISOToMP4Converter:
             result.warnings.append(
                 f"{plan.output_path.name}: duration comparison unavailable (source unprobeable)")
 
-        # Calculate MD5
+        # Calculate checksums (MD5 + SHA-256 in one read)
         if self.run:
             self.run.mark(f"checksum_vts_{plan.vts_number:02d}")
-        log(colorize("cyan", "Calculating MD5 hash of output file..."))
-        title.md5 = calculate_md5(temp_path)
+        log(colorize("cyan", "Calculating MD5 and SHA-256 of output file..."))
+        title.md5, title.sha256 = calculate_checksums(temp_path)
+        if title.md5 is None:
+            result.warnings.append(
+                f"{plan.output_path.name}: checksum calculation failed — no fixity recorded")
 
         # Everything verified — atomically promote the temp onto the final
         # name (replaces an operator-approved overwrite target in one step)
@@ -1039,6 +1089,7 @@ class ISOToMP4Converter:
             log(colorize("cyan", f"Encoding speed: {result.speed_factor}x realtime"))
         
         log(colorize("cyan", f"MD5 checksum: {result.md5_mp4}"))
+        log(colorize("cyan", f"SHA-256 checksum: {result.sha256_mp4}"))
         for warning in result.warnings:
             log(colorize("yellow", f"Warning: {warning}"))
         log(colorize("green", "Conversion completed successfully!"))
@@ -1132,7 +1183,8 @@ class ISOToMP4Converter:
             if result.compression_ratio:
                 f.write(f"Compression:      {result.compression_ratio}:1\n")
 
-            f.write(f"MD5 Checksum:     {result.md5_mp4}\n\n")
+            f.write(f"MD5 Checksum:     {result.md5_mp4}\n")
+            f.write(f"SHA-256 Checksum: {result.sha256_mp4}\n\n")
 
             if result.titles:
                 f.write("TITLESET OUTPUTS\n")
@@ -1150,6 +1202,7 @@ class ISOToMP4Converter:
                     f.write("\n")
                     f.write(f"  Audio:    {t.mapped_audio_streams} of {t.source_audio_streams if t.source_audio_streams is not None else '?'} source track(s) mapped\n")
                     f.write(f"  MD5:      {t.md5}\n")
+                    f.write(f"  SHA-256:  {t.sha256}\n")
                     if t.error:
                         f.write(f"  Error:    {t.error}\n")
                 f.write("\n")
@@ -1213,6 +1266,7 @@ class ISOToMP4Converter:
                     "expected_duration_seconds": t.expected_duration,
                     "encode_time_seconds": t.encode_time,
                     "md5_checksum": t.md5,
+                    "sha256_checksum": t.sha256,
                     "source_audio_streams": t.source_audio_streams,
                     "source_subtitle_streams": t.source_subtitle_streams,
                     "mapped_audio_streams": t.mapped_audio_streams,
@@ -1279,6 +1333,7 @@ class ISOToMP4Converter:
                 "duration_seconds": result.video_duration,
                 "duration_formatted": format_timecode(result.video_duration) if result.video_duration else None,
                 "md5_checksum": result.md5_mp4,
+                "sha256_checksum": result.sha256_mp4,
                 "compression_ratio": result.compression_ratio
             },
 
