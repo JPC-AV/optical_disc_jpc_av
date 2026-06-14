@@ -300,6 +300,18 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
 
     end_time = datetime.datetime.now()
     total_duration = (end_time - start_time).total_seconds()
+    staged_success = bool(
+        result.success and config.attempt_token
+        and result.creation_path
+        and result.creation_path != config.canonical_output_path
+    )
+    record_iso_path = config.canonical_output_path if staged_success else result.iso_path
+    record_log_path = config.canonical_log_path if staged_success else log_path
+    record_manifest_path = config.canonical_manifest_path if staged_success else config.manifest_path
+    record_tree_path = config.canonical_tree_path if staged_success else config.tree_path
+    record_isolyzer_path = config.canonical_isolyzer_path if staged_success else config.isolyzer_path
+    iso_stat_path = (result.creation_path if result.creation_path and result.creation_path.exists()
+                     else result.iso_path)
 
     def step_time(step: str, fallback: datetime.datetime) -> str:
         """Real captured timestamp for a step, or the fallback if it never ran"""
@@ -349,14 +361,14 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         # === OUTPUT FILES ===
         f.write("OUTPUT FILES\n")
         f.write("-" * 20 + "\n")
-        f.write(f"ISO File:         {result.iso_path.name}\n")
+        f.write(f"ISO File:         {record_iso_path.name}\n")
         f.write(f"Output Directory: {config.output_dir}\n")
-        f.write(f"Log File:         {log_path.name}\n")
-        f.write(f"Tree File:        {config.tree_path.name}\n")
-        f.write(f"Isolyzer File:    {config.isolyzer_path.name}\n")
-        f.write(f"Manifest File:    {config.manifest_path.name}\n")
-        if result.iso_path.exists():
-            iso_size = result.iso_path.stat().st_size
+        f.write(f"Log File:         {record_log_path.name}\n")
+        f.write(f"Tree File:        {record_tree_path.name}\n")
+        f.write(f"Isolyzer File:    {record_isolyzer_path.name}\n")
+        f.write(f"Manifest File:    {record_manifest_path.name}\n")
+        if iso_stat_path.exists():
+            iso_size = iso_stat_path.stat().st_size
             f.write(f"ISO File Size:    {iso_size / (1024 * 1024):.0f} MB\n")
         f.write("\n")
         
@@ -369,7 +381,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"[{step_time('tree', start_time)}] Tree Listing Generation\n")
         tree_target = config.mount_point or f"/Volumes/{config.volume_name}"
         f.write(f"  Command: tree -RapugD --si --du {tree_target}\n")
-        f.write(f"  Output:  {config.tree_path.name}\n\n")
+        f.write(f"  Output:  {record_tree_path.name}\n\n")
         
         # Disk unmount
         if result.unmount_ok is None:
@@ -424,7 +436,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         if config.isolyzer_path.exists():
             f.write(f"[{step_time('isolyzer', create_end)}] ISO Structure Analysis\n")
             f.write(f"  Tool:    isolyzer\n")
-            f.write(f"  Output:  {config.isolyzer_path.name}\n")
+            f.write(f"  Output:  {record_isolyzer_path.name}\n")
             
             if iso_analysis and 'error' not in iso_analysis:
                 f.write("  Results:\n")
@@ -493,7 +505,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
             fmt_field("File System",        disk_info.get('FilesystemName', disk_info.get('FilesystemType')))
             fmt_field("Connection",         disk_info.get('BusProtocol'))
             # Physical Size = actual ISO/disc size; TotalSize in plist returns volume size on optical media
-            physical_size = result.iso_path.stat().st_size if result.iso_path.exists() else disk_info.get('TotalSize')
+            physical_size = iso_stat_path.stat().st_size if iso_stat_path.exists() else disk_info.get('TotalSize')
             volume_size = disk_info.get('TotalSize')
             fmt_field("Physical Size",      fmt_diskutil_size(physical_size))
             fmt_field("Volume Capacity",    fmt_diskutil_size(volume_size))
@@ -582,7 +594,8 @@ class OpticalDiscBackup:
 
     def _promote_successful_attempt(self, result: BackupResult,
                                     attempt_iso: Path, attempt_tree: Path,
-                                    attempt_isolyzer: Path):
+                                    attempt_isolyzer: Path, attempt_log: Path,
+                                    attempt_manifest: Path):
         """Publish verified attempt artifacts at the canonical names.
 
         The old canonical artifacts are archived only after the new copy has
@@ -594,6 +607,8 @@ class OpticalDiscBackup:
             (attempt_iso, self.config.canonical_output_path),
             (attempt_tree, self.config.canonical_tree_path),
             (attempt_isolyzer, self.config.canonical_isolyzer_path),
+            (attempt_log, self.config.canonical_log_path),
+            (attempt_manifest, self.config.canonical_manifest_path),
         )
         try:
             self._check_publish_symlinks(self._standard_artifacts())
@@ -612,6 +627,45 @@ class OpticalDiscBackup:
             raise
         self.config.attempt_token = None
         result.iso_path = self.config.canonical_output_path
+
+    def _mark_failed_attempt(self, result: BackupResult, attempt_iso: Path,
+                             attempt_tree: Path, attempt_isolyzer: Path,
+                             attempt_log: Path, attempt_manifest: Path):
+        """Move this run's attempt artifacts to failure-marked names.
+
+        Only attempt paths are touched here; canonical artifacts from a prior
+        successful run are never relabelled as failed evidence for this run."""
+        fail_token = f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
+        self.config.failure_token = fail_token
+        self.config.attempt_token = None
+        if attempt_iso.exists():
+            marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
+            marked_path = self.config.output_dir / f"{self.config.filename}_{fail_token}{marker}"
+            try:
+                attempt_iso.rename(marked_path)
+                result.iso_path = marked_path
+                log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
+            except OSError as e:
+                log(colorize("yellow", f"Could not rename partial ISO to {marked_path.name}: {e} "
+                                      f"(leaving it in place; run still recorded as failed)"))
+        for src, dst in (
+            (attempt_tree, self.config.tree_path),
+            (attempt_isolyzer, self.config.isolyzer_path),
+            (attempt_log, self.config.log_path),
+            (attempt_manifest, self.config.manifest_path),
+        ):
+            if src.exists():
+                try:
+                    src.rename(dst)
+                    log(colorize("yellow", f"{src.name} renamed to: {dst.name}"))
+                except OSError as e:
+                    log(colorize("yellow", f"Could not rename {src.name} to {dst.name}: {e}"))
+
+    def _write_run_records(self, result: BackupResult, start_time: datetime.datetime,
+                           disk_info: Dict[str, Any], iso_analysis: Dict[str, Any]):
+        create_formatted_log(self.config.log_path, self.config, result,
+                             start_time, disk_info, iso_analysis, self.run)
+        self._create_manifest(result, disk_info, iso_analysis)
         
     def create_backup(self) -> BackupResult:
         """Main entry point for creating backup"""
@@ -697,6 +751,8 @@ class OpticalDiscBackup:
         attempt_iso_path = self.config.output_path
         attempt_tree_path = self.config.tree_path
         attempt_isolyzer_path = self.config.isolyzer_path
+        attempt_log_path = self.config.log_path
+        attempt_manifest_path = self.config.manifest_path
 
         # Generate tree listing (this is the first divider after user inputs)
         self.run.mark("tree")
@@ -783,56 +839,55 @@ class OpticalDiscBackup:
         if iso_result and iso_result.warnings:
             result.warnings.extend(iso_result.warnings)
 
+        # Failed or aborted runs keep all their records under failure-marked
+        # names, so they are obvious in the output directory and a retry can
+        # never overwrite the evidence of a previous attempt.
+        if not result.success and not self.config.dry_run:
+            self._mark_failed_attempt(result, attempt_iso_path, attempt_tree_path,
+                                      attempt_isolyzer_path, attempt_log_path,
+                                      attempt_manifest_path)
+
+        # Write the log and manifest before publishing a successful ISO. This
+        # makes the record bundle part of the same promotion step as the master,
+        # so a sidecar write failure cannot leave a canonical ISO with missing
+        # evidence.
+        try:
+            self._write_run_records(result, start_time, disk_info, iso_analysis)
+        except Exception as e:
+            if result.success:
+                result.success = False
+                result.error_message = f"Could not write run records before publish: {e}"
+                log(colorize("red", f"Backup failed: {result.error_message}"))
+                if not self.config.dry_run:
+                    self._mark_failed_attempt(result, attempt_iso_path, attempt_tree_path,
+                                              attempt_isolyzer_path, attempt_log_path,
+                                              attempt_manifest_path)
+                    try:
+                        self._write_run_records(result, start_time, disk_info, iso_analysis)
+                    except Exception as record_error:
+                        log(colorize("red", f"Could not write failure records: {record_error}"))
+            else:
+                log(colorize("red", f"Could not write failure records: {e}"))
+
         if result.success and not self.config.dry_run:
             try:
                 self._promote_successful_attempt(result, attempt_iso_path,
-                                                 attempt_tree_path, attempt_isolyzer_path)
+                                                 attempt_tree_path, attempt_isolyzer_path,
+                                                 attempt_log_path, attempt_manifest_path)
             except OSError as e:
                 result.success = False
                 result.error_message = f"Could not publish verified attempt artifacts: {e}"
                 log(colorize("red", f"Backup failed: {result.error_message}"))
-
-        # Failed or aborted runs keep all their records under failure-marked
-        # names, so they are obvious in the output directory and a retry can
-        # never overwrite the evidence of a previous attempt.
-        if not result.success:
-            # Timestamp for readability/sorting plus a random suffix so rapid
-            # retries in the same second can never overwrite prior evidence
-            fail_token = f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
-            # Set the token first and unconditionally: it points the log and
-            # manifest writes below at failure-marked names. A rename that raises
-            # (cross-filesystem move, a symlink pre-placed at the destination)
-            # must NOT abort the run before those records are written, or a failed
-            # run would be left undocumented — so each rename is best-effort.
-            self.config.failure_token = fail_token
-            self.config.attempt_token = None
-            if attempt_iso_path.exists():
-                marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
-                marked_path = self.config.output_dir / f"{self.config.filename}_{fail_token}{marker}"
+                self._mark_failed_attempt(result, attempt_iso_path, attempt_tree_path,
+                                          attempt_isolyzer_path, attempt_log_path,
+                                          attempt_manifest_path)
                 try:
-                    attempt_iso_path.rename(marked_path)
-                    result.iso_path = marked_path
-                    log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
-                except OSError as e:
-                    log(colorize("yellow", f"Could not rename partial ISO to {marked_path.name}: {e} "
-                                          f"(leaving it in place; run still recorded as failed)"))
-            # Move already-written sidecars (tree, isolyzer) to failure-marked names.
-            for src, dst in ((attempt_tree_path, self.config.tree_path),
-                             (attempt_isolyzer_path, self.config.isolyzer_path)):
-                if src.exists():
-                    try:
-                        src.rename(dst)
-                        log(colorize("yellow", f"{src.name} renamed to: {dst.name}"))
-                    except OSError as e:
-                        log(colorize("yellow", f"Could not rename {src.name} to {dst.name}: {e}"))
-        
-        # Generate outputs
-        self._generate_summary(result)
-        
-        # Save formatted log with all the details
-        create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info, iso_analysis, self.run)
+                    self._write_run_records(result, start_time, disk_info, iso_analysis)
+                except Exception as record_error:
+                    log(colorize("red", f"Could not write failure records: {record_error}"))
 
-        self._create_manifest(result, disk_info, iso_analysis)
+        # Generate console summary after the final success/failure state is known.
+        self._generate_summary(result)
 
         # Fix ownership last — everything above ran as root, so the directory
         # and the files this run created would otherwise stay root-owned.
@@ -1295,13 +1350,25 @@ class OpticalDiscBackup:
         """Create comprehensive manifest file with improved organization"""
         # Get current timestamp
         now = datetime.datetime.now()
+        staged_success = bool(
+            result.success and self.config.attempt_token
+            and result.creation_path
+            and result.creation_path != self.config.canonical_output_path
+        )
+        record_iso_path = self.config.canonical_output_path if staged_success else result.iso_path
+        record_log_path = self.config.canonical_log_path if staged_success else self.config.log_path
+        record_manifest_path = self.config.canonical_manifest_path if staged_success else self.config.manifest_path
+        record_tree_path = self.config.canonical_tree_path if staged_success else self.config.tree_path
+        record_isolyzer_path = self.config.canonical_isolyzer_path if staged_success else self.config.isolyzer_path
         
         # Extract tree listing summary
         tree_summary = self._extract_tree_summary()
         
         # Calculate additional metrics
         # Get ISO file size
-        iso_file_size = result.iso_path.stat().st_size if result.iso_path.exists() else None
+        iso_stat_path = (result.creation_path if result.creation_path and result.creation_path.exists()
+                         else result.iso_path)
+        iso_file_size = iso_stat_path.stat().st_size if iso_stat_path.exists() else None
         
         # Build comprehensive manifest
         manifest = {
@@ -1350,20 +1417,20 @@ class OpticalDiscBackup:
             },
             
             "output_files": {
-                "iso_filename": result.iso_path.name,
+                "iso_filename": record_iso_path.name,
                 "iso_file_size_bytes": iso_file_size,
                 "iso_file_size_formatted": format_bytes(iso_file_size) if iso_file_size else None,
                 "output_directory": str(self.config.output_dir),
-                "log_filename": self.config.log_path.name,
-                "tree_filename": self.config.tree_path.name,
-                "isolyzer_filename": self.config.isolyzer_path.name,
-                "manifest_filename": self.config.manifest_path.name
+                "log_filename": record_log_path.name,
+                "tree_filename": record_tree_path.name,
+                "isolyzer_filename": record_isolyzer_path.name,
+                "manifest_filename": record_manifest_path.name
             },
             
             "operations_performed": {
                 "tree_listing": {
                     "command": f"tree -RapugD --si --du {self.config.mount_point or '/Volumes/' + self.config.volume_name}",
-                    "output_file": self.config.tree_path.name,
+                    "output_file": record_tree_path.name,
                     "summary": tree_summary
                 },
                 "disk_unmount": {
@@ -1386,7 +1453,7 @@ class OpticalDiscBackup:
                     "algorithms": ["MD5", "SHA-256"],
                     "performed": result.md5_iso is not None,
                     "note": "The script does not perform a second raw-device read during verification; it compares the source hash captured during the copy stream to a re-read of the written ISO.",
-                    "optional_manual_spot_check": (f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] '
+                    "optional_manual_spot_check": (f'[ "$(md5 -q {record_iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] '
                                                    f'&& echo "MATCH" || echo "MISMATCH"')
                 },
                 "finalization": {
@@ -1513,7 +1580,7 @@ class OpticalDiscBackup:
                     "dd_block_size": "4MB",
                     "read_device": f"/dev/r{self.config.disk_id}",
                     "write_destination": str(result.creation_path or self.config.output_path),
-                    "final_destination": str(result.iso_path),
+                    "final_destination": str(record_iso_path),
                     "parallel_processing": True,
                     "verification_during_creation": False,
                     "error_handling": "standard dd error handling"
