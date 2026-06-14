@@ -132,6 +132,7 @@ class IsoCreationResult:
     md5_iso: Optional[str]
     sha256_raw: str
     sha256_iso: Optional[str]
+    warnings: List[str] = field(default_factory=list)  # degraded-but-not-fatal conditions
 
 ### === COLOR UTILITIES ===
 
@@ -588,6 +589,17 @@ class OpticalDiscBackup:
                 self.run.mark("finalize")
                 finalized = self._finalize_disk()
 
+        # A structurally short ISO is a failed master, not a warning: isolyzer
+        # found fewer bytes than the filesystem itself declares, which means a
+        # truncated read. (Larger-than-expected is normal optical lead-out
+        # padding and stays a benign note.)
+        if (backup_error is None and not self.config.dry_run
+                and iso_analysis.get('smaller_than_expected')):
+            backup_error = (f"ISO is structurally smaller than the filesystem declares by "
+                            f"{iso_analysis.get('size_difference_bytes', 0)} bytes — "
+                            f"truncated read, master not certified")
+            log(colorize("red", f"Backup failed: {backup_error}"))
+
         # Create result
         result = BackupResult(
             success=backup_error is None,
@@ -617,6 +629,10 @@ class OpticalDiscBackup:
             result.warnings.append("tree listing failed or incomplete")
         if result.success and not self.config.dry_run and iso_analysis.get('error'):
             result.warnings.append(f"isolyzer structural analysis not performed ({iso_analysis['error']})")
+        # Degraded-independence notes from the copy/verify pass (fsync or page-cache
+        # fallbacks) are recorded regardless of overall success.
+        if iso_result and iso_result.warnings:
+            result.warnings.extend(iso_result.warnings)
 
         # Failed or aborted runs keep all their records under failure-marked
         # names, so they are obvious in the output directory and a retry can
@@ -625,22 +641,32 @@ class OpticalDiscBackup:
             # Timestamp for readability/sorting plus a random suffix so rapid
             # retries in the same second can never overwrite prior evidence
             fail_token = f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
+            # Set the token first and unconditionally: it points the log and
+            # manifest writes below at failure-marked names. A rename that raises
+            # (cross-filesystem move, a symlink pre-placed at the destination)
+            # must NOT abort the run before those records are written, or a failed
+            # run would be left undocumented — so each rename is best-effort.
+            tree_std, isolyzer_std = self.config.tree_path, self.config.isolyzer_path
+            self.config.failure_token = fail_token
             if self.config.output_path.exists():
                 marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
                 marked_path = self.config.output_dir / f"{self.config.filename}_{fail_token}{marker}"
-                self.config.output_path.rename(marked_path)
-                result.iso_path = marked_path
-                log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
-            # Move already-written sidecars (tree, isolyzer) to failure-marked
-            # names; setting failure_token also points the log and manifest
-            # writes below at failure-marked names.
-            tree_std, isolyzer_std = self.config.tree_path, self.config.isolyzer_path
-            self.config.failure_token = fail_token
+                try:
+                    self.config.output_path.rename(marked_path)
+                    result.iso_path = marked_path
+                    log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
+                except OSError as e:
+                    log(colorize("yellow", f"Could not rename partial ISO to {marked_path.name}: {e} "
+                                          f"(leaving it in place; run still recorded as failed)"))
+            # Move already-written sidecars (tree, isolyzer) to failure-marked names.
             for src, dst in ((tree_std, self.config.tree_path),
                              (isolyzer_std, self.config.isolyzer_path)):
                 if src.exists():
-                    src.rename(dst)
-                    log(colorize("yellow", f"{src.name} renamed to: {dst.name}"))
+                    try:
+                        src.rename(dst)
+                        log(colorize("yellow", f"{src.name} renamed to: {dst.name}"))
+                    except OSError as e:
+                        log(colorize("yellow", f"Could not rename {src.name} to {dst.name}: {e}"))
         
         # Generate outputs
         self._generate_summary(result)
@@ -712,6 +738,7 @@ class OpticalDiscBackup:
         raw_hasher = hashlib.md5()
         raw_sha_hasher = hashlib.sha256()
         bytes_written = 0
+        warnings: List[str] = []
         start_time = time.time()
         if self.run:
             self.run.mark("copy_start")
@@ -757,6 +784,21 @@ class OpticalDiscBackup:
                 fcntl.fcntl(iso_file.fileno(), fcntl.F_FULLFSYNC)
             except (OSError, AttributeError):
                 os.fsync(iso_file.fileno())
+                warnings.append("F_FULLFSYNC unavailable; fell back to fsync, which on "
+                                "macOS may not flush the drive's own write cache before "
+                                "verification")
+
+        # Completeness check: a bit-perfect *equal* copy is not enough — it must
+        # also be *complete*. dd exits 0 on a short read (bad sector, flaky USB
+        # optical drive), and the streamed and re-read hashes would then match
+        # over the same truncated bytes. Compare what we wrote against the disc's
+        # reported size and fail hard on any shortfall. (disk_size == 0 means the
+        # size was unknown up front, so there is nothing to compare against.)
+        if disk_size and bytes_written < disk_size:
+            raise RuntimeError(
+                f"Short read: copied {bytes_written} of {disk_size} bytes "
+                f"({disk_size - bytes_written} bytes missing). The disc may have a "
+                f"read error; the ISO is incomplete and will not be certified.")
 
         creation_time = time.time() - start_time
         raw_hash = raw_hasher.hexdigest()
@@ -795,7 +837,9 @@ class OpticalDiscBackup:
             try:
                 fcntl.fcntl(iso_file.fileno(), fcntl.F_NOCACHE, 1)
             except (OSError, AttributeError):
-                pass
+                warnings.append("F_NOCACHE unavailable; the verification read may have "
+                                "been served from the page cache rather than re-read from "
+                                "disk, weakening the independence of the verification pass")
             while True:
                 chunk = iso_file.read(4 * 1024 * 1024)  # 4MB chunks
                 if not chunk:
@@ -828,6 +872,7 @@ class OpticalDiscBackup:
             md5_iso=iso_hash,
             sha256_raw=raw_sha,
             sha256_iso=iso_sha,
+            warnings=warnings,
         )
     
     def _display_progress(self, title: str, current: int, total: int, start_time: float):
@@ -1588,6 +1633,13 @@ def gather_user_inputs(args: argparse.Namespace) -> BackupConfig:
     """Gather all necessary inputs from user and command line"""
     # Get disk ID
     disk_id = get_input(colorize("cyan", "Enter disk ID (e.g. disk2): "))
+    # Whole-disk identifiers only: this tool images/unmounts/ejects an entire
+    # optical disc, so reject partition slices (diskNsM) and anything that could
+    # turn into a traversing device path like /dev/rdisk2/../... reaching dd.
+    if not re.fullmatch(r"disk\d+", disk_id):
+        log(colorize("red", f"Invalid disk ID: {disk_id!r}. Expected a whole-disk "
+                            f"identifier like 'disk2' (no partition slice, no path)."))
+        sys.exit(1)
 
     # One plist fetch covers volume name, size, and media type (the same
     # structured source create_backup() uses, rather than scraping text output)

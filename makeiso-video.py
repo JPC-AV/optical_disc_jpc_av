@@ -101,6 +101,9 @@ class TitleOutput:
     output_size: int = 0
     video_duration: Optional[float] = None
     expected_duration: Optional[float] = None
+    # True only when EVERY content VOB's duration was measurable, so the expected
+    # duration is trustworthy. False means completeness cannot be proven.
+    expected_duration_complete: bool = True
     encode_time: float = 0.0
     md5: Optional[str] = None
     sha256: Optional[str] = None
@@ -295,6 +298,9 @@ class ISOMount:
         self.mount_point: Optional[Path] = None
         self.mount_points: List[Path] = []
         self.devices: List[str] = []
+        # Detach failures recorded here so the caller can surface them into the
+        # conversion record (the context manager has no access to it directly).
+        self.detach_errors: List[str] = []
 
     def __enter__(self) -> Optional[Path]:
         """Mount the ISO and return the most relevant mount point"""
@@ -344,21 +350,44 @@ class ISOMount:
             return None
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Unmount the ISO (all volumes for multi-session images)"""
+        """Unmount the ISO (all volumes for multi-session images).
+
+        Detach failures are recorded in self.detach_errors so the caller can
+        surface them: a leaked attach holds a /dev/diskN that can block later
+        mounts across a batch."""
+        detached_any = False
         for mount_point in self.mount_points:
             if not mount_point.exists():
-                continue  # an earlier detach already released this volume
+                detached_any = True  # an earlier detach already released this volume
+                continue
             try:
                 run_cmd(["hdiutil", "detach", str(mount_point), "-force"])
                 log(colorize("green", f"Unmounted: {mount_point}"))
+                detached_any = True
             except subprocess.CalledProcessError as e:
                 log(colorize("yellow", f"Warning: Failed to unmount cleanly: {e}"))
-                # Try with device paths
+                # Fall back to detaching the backing device(s) directly
                 for device in self.devices:
                     try:
                         run_cmd(["hdiutil", "detach", device, "-force"])
+                        detached_any = True
                     except Exception as fallback_error:
-                        log(colorize("yellow", f"Warning: fallback detach of {device} failed: {fallback_error}"))
+                        msg = f"failed to detach {device}: {fallback_error}"
+                        log(colorize("yellow", f"Warning: fallback {msg}"))
+                        self.detach_errors.append(f"unmount of {self.iso_path.name}: {msg}")
+
+        # Leak sweep: if the image attached devices but exposed NO mount points
+        # (e.g. a raw session macOS would not auto-mount), the loop above never
+        # released them. Detach by device so they do not accumulate across a batch.
+        if not detached_any and self.devices:
+            for device in self.devices:
+                try:
+                    run_cmd(["hdiutil", "detach", device, "-force"])
+                    log(colorize("green", f"Detached leaked device: {device}"))
+                except Exception as e:
+                    msg = f"failed to detach leaked device {device}: {e}"
+                    log(colorize("yellow", f"Warning: {msg}"))
+                    self.detach_errors.append(f"unmount of {self.iso_path.name}: {msg}")
 
 ### === CONTENT ANALYSIS ===
 
@@ -511,23 +540,24 @@ def get_video_duration(target) -> Optional[float]:
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         return None
 
-def probe_expected_duration(vobs: List[Path]) -> Optional[float]:
-    """Best-effort expected duration of a titleset.
+def probe_expected_duration(vobs: List[Path]) -> tuple:
+    """Expected duration of a titleset and whether it is provably complete.
 
-    ffprobe on a concat: VOB input is unreliable — it can report only the
-    first segment's duration, which would blind the truncation check. So we
-    take the LARGER of two estimates: the concat probe and the sum of
-    per-VOB durations. Returns None when neither can be obtained — callers
-    warn rather than fail."""
-    estimates = []
-    concat = "concat:" + "|".join(str(v) for v in vobs)
-    concat_duration = get_video_duration(concat)
-    if concat_duration:
-        estimates.append(concat_duration)
+    Returns (expected_seconds, complete). ffprobe on a concat: VOB input is
+    unreliable — it can report only the first segment's duration — so the
+    trustworthy estimate is the sum of per-VOB durations. The completeness flag
+    matters because a *partial* sum can hide a dropped segment: if some VOB on a
+    multi-VOB title is unprobeable, the encode could silently omit exactly that
+    segment and a partial-sum comparison would never notice.
+
+      - every VOB probes        -> (sum, True)    trustworthy
+      - some VOBs unprobeable    -> (partial_sum_or_None, False)  not provable
+    """
     parts = [get_video_duration(v) for v in vobs]
     if parts and all(p is not None for p in parts):
-        estimates.append(sum(parts))
-    return max(estimates) if estimates else None
+        return sum(parts), True
+    known = [p for p in parts if p is not None]
+    return (sum(known) if known else None), False
 
 def probe_stream_counts(target) -> Dict[str, int]:
     """Count video/audio/subtitle streams via ffprobe"""
@@ -681,7 +711,8 @@ class ISOToMP4Converter:
         result = None
         self.run.mark("mount")
 
-        with ISOMount(self.config.iso_path) as mount_point:
+        mount = ISOMount(self.config.iso_path)
+        with mount as mount_point:
             if not mount_point:
                 result = ConversionResult(
                     success=False,
@@ -777,7 +808,13 @@ class ISOToMP4Converter:
                         # Create output directory (only for actual conversion)
                         self.config.output_dir.mkdir(parents=True, exist_ok=True)
                         result = self._perform_conversion(analysis, iso_size, plans, unrecognized)
-        
+
+        # Surface any unmount failures into the record. A volume that fails to
+        # detach (e.g. a handle still open) leaks an attached /dev/diskN that can
+        # block later mounts in a batch, so it must be visible, not just logged.
+        if mount.detach_errors:
+            result.warnings.extend(mount.detach_errors)
+
         self.run.mark("detach")
         return result
     
@@ -875,8 +912,10 @@ class ISOToMP4Converter:
             title.source_audio_streams = source_counts.get("audio")
             title.source_subtitle_streams = source_counts.get("subtitle")
 
-            # Best-effort expected duration for the truncation check
-            title.expected_duration = probe_expected_duration(plan.content_vobs)
+            # Expected duration + whether it is provably complete (drives the
+            # truncation / completeness guard after the encode).
+            title.expected_duration, title.expected_duration_complete = \
+                probe_expected_duration(plan.content_vobs)
 
             # A failed titleset marks the whole run failed, but remaining
             # titlesets are still attempted so the record is complete.
@@ -968,10 +1007,13 @@ class ISOToMP4Converter:
 
         encode_start = time.time()
         try:
-            # Run ffmpeg with progress output
+            # Run ffmpeg with progress output. stdout is discarded rather than
+            # piped: we only read stderr below, and an unread stdout pipe could
+            # fill its OS buffer and deadlock the encode if ffmpeg ever writes to
+            # it (no reader would drain it).
             process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 universal_newlines=True
             )
@@ -1055,16 +1097,35 @@ class ISOToMP4Converter:
                     f"{plan.output_path.name}: only {title.mapped_audio_streams} of "
                     f"{title.source_audio_streams} source audio stream(s) mapped")
 
-            # Duration sanity check (best-effort; warns, never fails the run)
-            if title.expected_duration and title.video_duration:
-                if title.video_duration < title.expected_duration * 0.95:
-                    result.warnings.append(
-                        f"{plan.output_path.name}: output duration "
-                        f"{format_timecode(title.video_duration)} is >5% shorter than expected "
-                        f"{format_timecode(title.expected_duration)} — possible truncation")
+            # Completeness guard. A truncated or unprovable encode must FAIL the
+            # title before promotion — never pass as a warning. Quarantine the
+            # temp and return so the normal failure records pick it up.
+            name = plan.output_path.name
+            if title.video_duration is None:
+                # We couldn't measure the output at all — can't confirm length.
+                result.warnings.append(
+                    f"{name}: output duration unprobeable — encode length not confirmed")
+            elif title.expected_duration and title.video_duration < title.expected_duration * 0.95:
+                title.status = "failed"
+                title.error = (f"output duration {format_timecode(title.video_duration)} is >5% "
+                               f"shorter than expected {format_timecode(title.expected_duration)} "
+                               f"— truncated encode")
+                log(colorize("red", f"{name}: {title.error}"))
+                title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+                return
+            elif not title.expected_duration_complete and len(plan.content_vobs) > 1:
+                # Some VOB durations were unprobeable on a multi-VOB titleset, so a
+                # dropped segment would be invisible. We cannot prove the encode is
+                # complete — treat that as a failure, not a warning.
+                title.status = "failed"
+                title.error = ("duration comparison incomplete; cannot prove complete encode "
+                               "(one or more source VOBs were unprobeable on a multi-VOB title)")
+                log(colorize("red", f"{name}: {title.error}"))
+                title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+                return
             elif title.expected_duration is None:
                 result.warnings.append(
-                    f"{plan.output_path.name}: duration comparison unavailable (source unprobeable)")
+                    f"{name}: duration comparison unavailable (source unprobeable)")
 
             # Calculate checksums (MD5 + SHA-256 in one read)
             stage = "checksum"

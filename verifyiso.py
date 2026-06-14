@@ -21,7 +21,12 @@ Usage:
 
 Exit codes:
   0  every checked ISO matched its recorded hashes
-  1  at least one mismatch, missing ISO, or read error
+  1  at least one mismatch, missing ISO, unverifiable manifest, or read error
+
+A manifest is UNVERIFIABLE (and fails the audit) when it claims to be a
+preservation master but cannot be trusted to verify: missing status block,
+blank/invalid recorded hash, no source hash, or an ISO filename that tries to
+escape the manifest's own directory. These never silently pass.
 """
 
 import argparse
@@ -51,7 +56,7 @@ def colorize(color: str, text: str) -> str:
 @dataclass
 class CheckResult:
     manifest: Path
-    status: str                      # PASS | FAIL | MISSING_ISO | SKIPPED | ERROR
+    status: str                      # PASS | FAIL | MISSING_ISO | UNVERIFIABLE | SKIPPED | ERROR
     iso: Optional[Path] = None
     size_bytes: int = 0
     run_id: Optional[str] = None
@@ -78,6 +83,16 @@ def find_preservation_manifests(roots: List[Path]) -> List[Path]:
     return [m for m in manifests
             if not m.name.endswith(("_access_manifest.json", "_skip_manifest.json",
                                     "_aborted_manifest.json", "_error_manifest.json"))]
+
+
+def _normalize_hash(value) -> Optional[str]:
+    """Normalize a manifest hash for comparison: hashlib emits lowercase hex,
+    so strip surrounding whitespace and lowercase the recorded value too. A
+    non-string or blank value normalizes to None (treated as 'no usable hash')."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    return cleaned or None
 
 
 def hash_file(path: Path, progress_label: str = "") -> tuple:
@@ -119,23 +134,48 @@ def check_manifest(manifest_path: Path) -> CheckResult:
         return result
 
     result.run_id = manifest.get("backup_metadata", {}).get("run_id")
-    overall = manifest.get("backup_status", {}).get("overall_status", "success")
+    # Fail closed: a preservation manifest that has lost its status block is
+    # corrupt/truncated, not implicitly a good run. Only an explicitly recorded
+    # non-success run is a legitimate skip.
+    backup_status = manifest.get("backup_status")
+    if not isinstance(backup_status, dict) or "overall_status" not in backup_status:
+        result.status = "UNVERIFIABLE"
+        result.detail = "manifest missing backup_status/overall_status — cannot trust this master"
+        return result
+    overall = backup_status["overall_status"]
     if overall not in ("success", "success_with_warnings"):
         result.status = "SKIPPED"
         result.detail = f"run status was '{overall}' — no verified master to check"
         return result
 
     integrity = manifest.get("integrity_verification", {})
-    result.md5_expected = integrity.get("source_hash")
-    result.sha256_expected = integrity.get("sha256_source_hash")
+    # Distinguish "key absent" (legitimately hash-free) from "key present but
+    # blank/invalid" (corrupt or tampered manifest — must not pass silently).
+    md5_present = "source_hash" in integrity
+    sha_present = "sha256_source_hash" in integrity
+    result.md5_expected = _normalize_hash(integrity.get("source_hash"))
+    result.sha256_expected = _normalize_hash(integrity.get("sha256_source_hash"))
+    if (md5_present and not result.md5_expected) or (sha_present and not result.sha256_expected):
+        result.status = "UNVERIFIABLE"
+        result.detail = "manifest records a blank/invalid hash"
+        return result
     if not result.md5_expected and not result.sha256_expected:
-        result.status = "SKIPPED"
+        # A preservation manifest with no usable hash cannot be verified; this
+        # is a finding, not a benign skip — it must affect the exit code.
+        result.status = "UNVERIFIABLE"
         result.detail = "manifest records no source hash"
         return result
 
     iso_name = manifest.get("output_files", {}).get("iso_filename")
     if not iso_name:
+        result.status = "UNVERIFIABLE"
         result.detail = "manifest records no ISO filename"
+        return result
+    # iso_filename is attacker-controllable manifest data; it must name a sibling
+    # file, never traverse out of the manifest's own directory.
+    if iso_name != Path(iso_name).name or os.path.isabs(iso_name):
+        result.status = "UNVERIFIABLE"
+        result.detail = f"manifest ISO filename is not a plain sibling name: {iso_name!r}"
         return result
     result.iso = manifest_path.parent / iso_name
     # exists/stat/hash handled as one unit: a file vanishing mid-check maps
@@ -190,7 +230,7 @@ def write_csv(results: List[CheckResult], csv_path: Path):
 
 
 STATUS_COLOR = {"PASS": "green", "FAIL": "red", "MISSING_ISO": "red",
-                "ERROR": "red", "SKIPPED": "yellow"}
+                "UNVERIFIABLE": "red", "ERROR": "red", "SKIPPED": "yellow"}
 
 
 def main():
@@ -233,10 +273,12 @@ def main():
     print()
     print(colorize("cyan", "=" * 60))
     print(colorize("cyan", f"Checked {len(results)} manifest(s) in {elapsed:.0f}s"))
-    for status in ("PASS", "FAIL", "MISSING_ISO", "ERROR", "SKIPPED"):
+    for status in ("PASS", "FAIL", "MISSING_ISO", "UNVERIFIABLE", "ERROR", "SKIPPED"):
         if counts.get(status):
             print(colorize(STATUS_COLOR[status], f"  {status}: {counts[status]}"))
-    bad = [r for r in results if r.status in ("FAIL", "MISSING_ISO", "ERROR")]
+    # UNVERIFIABLE is a finding, not a benign skip: a master that should carry a
+    # checkable hash but doesn't must not let the audit exit 0.
+    bad = [r for r in results if r.status in ("FAIL", "MISSING_ISO", "UNVERIFIABLE", "ERROR")]
     if bad:
         print()
         print(colorize("red", "Items needing attention:"))
