@@ -19,7 +19,7 @@ import json
 import logging
 import fcntl
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 from uuid import uuid4
 from xml.sax.saxutils import escape as xml_escape
@@ -528,21 +528,57 @@ class OpticalDiscBackup:
             self.config.canonical_isolyzer_path,
         ]
 
-    def _archive_existing_artifacts(self) -> List[Path]:
+    def _restore_archived_artifacts(self, archived: List[Tuple[Path, Path]]):
+        """Put archived canonical artifacts back after a failed promotion."""
+        for original, archive in reversed(archived):
+            if not archive.exists():
+                continue
+            try:
+                archive.replace(original)
+                log(colorize("yellow", f"Restored prior artifact: {original.name}"))
+            except OSError as e:
+                log(colorize("yellow", f"Warning: could not restore {original.name} from "
+                                      f"{archive.name}: {e}"))
+
+    def _archive_existing_artifacts(self) -> List[Tuple[Path, Path]]:
         """Move any existing canonical artifacts aside before publishing a
         verified replacement. Called only after the new ISO has verified, so a
         failed retry leaves the existing master untouched."""
         token = f"overwritten-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
         archived = []
-        for path in self._standard_artifacts():
-            if not path.exists():
-                continue
-            archive_name = path.name.replace(self.config.filename, f"{self.config.filename}_{token}", 1)
-            archive_path = path.with_name(archive_name)
-            path.rename(archive_path)
-            archived.append(archive_path)
-            log(colorize("yellow", f"Existing artifact archived to: {archive_path.name}"))
+        try:
+            for path in self._standard_artifacts():
+                if not path.exists():
+                    continue
+                if path.is_symlink():
+                    raise OSError(f"Symlink appeared at canonical artifact path during publish: {path}")
+                archive_name = path.name.replace(self.config.filename, f"{self.config.filename}_{token}", 1)
+                archive_path = path.with_name(archive_name)
+                path.rename(archive_path)
+                archived.append((path, archive_path))
+                log(colorize("yellow", f"Existing artifact archived to: {archive_path.name}"))
+        except OSError:
+            self._restore_archived_artifacts(archived)
+            raise
         return archived
+
+    def _move_published_attempts_back(self, published: List[Tuple[Path, Path]]):
+        """Move any already-published attempt artifacts back out of canonical
+        slots so prior canonical artifacts can be restored."""
+        for attempt, canonical in reversed(published):
+            if not canonical.exists() or attempt.exists():
+                continue
+            try:
+                canonical.rename(attempt)
+                log(colorize("yellow", f"Moved failed publish back to attempt path: {attempt.name}"))
+            except OSError as e:
+                log(colorize("yellow", f"Warning: could not move {canonical.name} back to "
+                                      f"{attempt.name}: {e}"))
+
+    def _check_publish_symlinks(self, paths: List[Path]):
+        linked = [p.name for p in paths if p.is_symlink()]
+        if linked:
+            raise OSError(f"Symlink appeared at publish path(s): {', '.join(linked)}")
 
     def _promote_successful_attempt(self, result: BackupResult,
                                     attempt_iso: Path, attempt_tree: Path,
@@ -552,15 +588,28 @@ class OpticalDiscBackup:
         The old canonical artifacts are archived only after the new copy has
         passed completeness and checksum verification; if this promotion fails,
         the attempt falls through the normal failed-run record path."""
-        self._archive_existing_artifacts()
-        for src, dst in (
+        archived: List[Tuple[Path, Path]] = []
+        published: List[Tuple[Path, Path]] = []
+        publish_order = (
+            (attempt_iso, self.config.canonical_output_path),
             (attempt_tree, self.config.canonical_tree_path),
             (attempt_isolyzer, self.config.canonical_isolyzer_path),
-            (attempt_iso, self.config.canonical_output_path),
-        ):
-            if src.exists():
+        )
+        try:
+            self._check_publish_symlinks(self._standard_artifacts())
+            self._check_publish_symlinks([src for src, _ in publish_order if src.exists()])
+            archived = self._archive_existing_artifacts()
+            for src, dst in publish_order:
+                if not src.exists():
+                    continue
+                self._check_publish_symlinks([src, dst])
                 src.replace(dst)
+                published.append((src, dst))
                 log(colorize("green", f"Published verified artifact: {dst.name}"))
+        except OSError:
+            self._move_published_attempts_back(published)
+            self._restore_archived_artifacts(archived)
+            raise
         self.config.attempt_token = None
         result.iso_path = self.config.canonical_output_path
         
