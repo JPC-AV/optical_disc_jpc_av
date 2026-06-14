@@ -41,30 +41,58 @@ class BackupConfig:
     # Set when a run fails; sidecar paths then resolve to failure-marked names
     # so a retry can never overwrite the failed attempt's records.
     failure_token: Optional[str] = None
+    # Set while a run is in progress; ISO/tree/isolyzer writes go to private
+    # attempt paths and only replace the canonical artifacts after verification.
+    attempt_token: Optional[str] = None
+
+    def _sidecar_token(self) -> str:
+        token = self.failure_token or self.attempt_token
+        return f"_{token}" if token else ""
 
     def _named(self, suffix: str) -> Path:
-        token = f"_{self.failure_token}" if self.failure_token else ""
+        token = self._sidecar_token()
         return self.output_dir / f"{self.filename}{token}{suffix}"
 
     @property
     def output_path(self) -> Path:
+        token = f"_{self.attempt_token}" if self.attempt_token else ""
+        return self.output_dir / f"{self.filename}{token}.iso"
+
+    @property
+    def canonical_output_path(self) -> Path:
         return self.output_dir / f"{self.filename}.iso"
     
     @property
     def log_path(self) -> Path:
         return self._named(".iso.log.txt")
+
+    @property
+    def canonical_log_path(self) -> Path:
+        return self.output_dir / f"{self.filename}.iso.log.txt"
     
     @property
     def manifest_path(self) -> Path:
         return self._named("_manifest.json")
+
+    @property
+    def canonical_manifest_path(self) -> Path:
+        return self.output_dir / f"{self.filename}_manifest.json"
     
     @property
     def tree_path(self) -> Path:
         return self._named("_tree.txt")
+
+    @property
+    def canonical_tree_path(self) -> Path:
+        return self.output_dir / f"{self.filename}_tree.txt"
     
     @property
     def isolyzer_path(self) -> Path:
         return self._named("_isolyzer.xml")
+
+    @property
+    def canonical_isolyzer_path(self) -> Path:
+        return self.output_dir / f"{self.filename}_isolyzer.xml"
 
 @dataclass
 class BackupResult:
@@ -72,6 +100,7 @@ class BackupResult:
     success: bool
     iso_path: Path
     disk_size: int
+    creation_path: Optional[Path] = None
     md5_iso: Optional[str] = None
     md5_raw: Optional[str] = None
     sha256_iso: Optional[str] = None
@@ -132,6 +161,7 @@ class IsoCreationResult:
     md5_iso: Optional[str]
     sha256_raw: str
     sha256_iso: Optional[str]
+    output_path: Path
     warnings: List[str] = field(default_factory=list)  # degraded-but-not-fatal conditions
 
 ### === COLOR UTILITIES ===
@@ -361,8 +391,11 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         elif result.unmount_ok is False:
             f.write(f"  Status:  Not started ({result.error_message or 'aborted before copy'})\n\n")
         else:
-            f.write(f"  Command: dd if=/dev/r{config.disk_id} of={config.output_path} bs=4m\n")
+            creation_path = result.creation_path or config.output_path
+            f.write(f"  Command: dd if=/dev/r{config.disk_id} of={creation_path} bs=4m\n")
             f.write(f"  Method:  Streamed copy with in-stream source (raw disk) hashing\n")
+            if creation_path != config.canonical_output_path:
+                f.write(f"  Attempt: Run-private path; promoted to {config.canonical_output_path.name} only after successful verification\n")
             if result.md5_raw is None and result.error_message:
                 f.write(f"  Status:  FAILED ({result.error_message})\n\n")
             else:
@@ -484,6 +517,52 @@ class OpticalDiscBackup:
         self.config = config
         self.run: Optional[RunContext] = None
         self._progress_marks = set()  # deciles already reported in non-TTY mode
+
+    def _standard_artifacts(self) -> List[Path]:
+        """Canonical artifacts that a successful run publishes."""
+        return [
+            self.config.canonical_output_path,
+            self.config.canonical_log_path,
+            self.config.canonical_manifest_path,
+            self.config.canonical_tree_path,
+            self.config.canonical_isolyzer_path,
+        ]
+
+    def _archive_existing_artifacts(self) -> List[Path]:
+        """Move any existing canonical artifacts aside before publishing a
+        verified replacement. Called only after the new ISO has verified, so a
+        failed retry leaves the existing master untouched."""
+        token = f"overwritten-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
+        archived = []
+        for path in self._standard_artifacts():
+            if not path.exists():
+                continue
+            archive_name = path.name.replace(self.config.filename, f"{self.config.filename}_{token}", 1)
+            archive_path = path.with_name(archive_name)
+            path.rename(archive_path)
+            archived.append(archive_path)
+            log(colorize("yellow", f"Existing artifact archived to: {archive_path.name}"))
+        return archived
+
+    def _promote_successful_attempt(self, result: BackupResult,
+                                    attempt_iso: Path, attempt_tree: Path,
+                                    attempt_isolyzer: Path):
+        """Publish verified attempt artifacts at the canonical names.
+
+        The old canonical artifacts are archived only after the new copy has
+        passed completeness and checksum verification; if this promotion fails,
+        the attempt falls through the normal failed-run record path."""
+        self._archive_existing_artifacts()
+        for src, dst in (
+            (attempt_tree, self.config.canonical_tree_path),
+            (attempt_isolyzer, self.config.canonical_isolyzer_path),
+            (attempt_iso, self.config.canonical_output_path),
+        ):
+            if src.exists():
+                src.replace(dst)
+                log(colorize("green", f"Published verified artifact: {dst.name}"))
+        self.config.attempt_token = None
+        result.iso_path = self.config.canonical_output_path
         
     def create_backup(self) -> BackupResult:
         """Main entry point for creating backup"""
@@ -521,9 +600,6 @@ class OpticalDiscBackup:
             return BackupResult(False, self.config.output_path, disk_size,
                                 error_message=f"/dev/{self.config.disk_id} is not optical media")
 
-        if self.config.output_path.exists() and not self._confirm_overwrite():
-            return BackupResult(False, self.config.output_path, disk_size, error_message="Aborted to avoid overwrite")
-        
         # Create output directory, remembering whether this run created it so
         # we never chown a pre-existing directory we don't own (e.g. /tmp).
         # mkdir without exist_ok is atomic: no check-then-create race.
@@ -543,14 +619,36 @@ class OpticalDiscBackup:
         # Likewise refuse to write through a pre-existing symlink at any
         # planned artifact path — running as root, following one could
         # clobber an arbitrary file elsewhere on the system.
-        planned = [self.config.output_path, self.config.log_path, self.config.manifest_path,
-                   self.config.tree_path, self.config.isolyzer_path]
+        planned = self._standard_artifacts()
         linked = [p.name for p in planned if p.is_symlink()]
         if linked:
             log(colorize("red", f"Refusing to continue: symlink(s) at planned output path(s): {', '.join(linked)}"))
             return BackupResult(False, self.config.output_path, disk_size,
                                 error_message=f"Symlink at planned output path(s): {', '.join(linked)}")
-        
+
+        if self.config.dry_run:
+            replace_candidates = [
+                self.config.canonical_log_path,
+                self.config.canonical_manifest_path,
+                self.config.canonical_tree_path,
+            ]
+        else:
+            replace_candidates = planned
+        existing_artifacts = [p for p in replace_candidates if p.exists()]
+        if existing_artifacts and not self._confirm_overwrite(existing_artifacts):
+            names = ", ".join(p.name for p in existing_artifacts)
+            return BackupResult(False, self.config.output_path, disk_size,
+                                error_message=f"Aborted to avoid replacing existing artifact(s): {names}")
+
+        # All new artifacts write to run-private attempt paths first. Existing
+        # masters/sidecars are not touched unless this attempt verifies and is
+        # promoted below.
+        if not self.config.dry_run:
+            self.config.attempt_token = f"attempt-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
+        attempt_iso_path = self.config.output_path
+        attempt_tree_path = self.config.tree_path
+        attempt_isolyzer_path = self.config.isolyzer_path
+
         # Generate tree listing (this is the first divider after user inputs)
         self.run.mark("tree")
         tree_ok = self._generate_tree_listing()
@@ -605,6 +703,8 @@ class OpticalDiscBackup:
             success=backup_error is None,
             iso_path=self.config.output_path,
             disk_size=disk_size,
+            creation_path=(iso_result.output_path if iso_result else
+                           (attempt_iso_path if attempt_iso_path.exists() else None)),
             md5_iso=iso_result.md5_iso if iso_result else None,
             md5_raw=iso_result.md5_raw if iso_result else None,
             sha256_iso=iso_result.sha256_iso if iso_result else None,
@@ -634,6 +734,15 @@ class OpticalDiscBackup:
         if iso_result and iso_result.warnings:
             result.warnings.extend(iso_result.warnings)
 
+        if result.success and not self.config.dry_run:
+            try:
+                self._promote_successful_attempt(result, attempt_iso_path,
+                                                 attempt_tree_path, attempt_isolyzer_path)
+            except OSError as e:
+                result.success = False
+                result.error_message = f"Could not publish verified attempt artifacts: {e}"
+                log(colorize("red", f"Backup failed: {result.error_message}"))
+
         # Failed or aborted runs keep all their records under failure-marked
         # names, so they are obvious in the output directory and a retry can
         # never overwrite the evidence of a previous attempt.
@@ -646,21 +755,21 @@ class OpticalDiscBackup:
             # (cross-filesystem move, a symlink pre-placed at the destination)
             # must NOT abort the run before those records are written, or a failed
             # run would be left undocumented — so each rename is best-effort.
-            tree_std, isolyzer_std = self.config.tree_path, self.config.isolyzer_path
             self.config.failure_token = fail_token
-            if self.config.output_path.exists():
+            self.config.attempt_token = None
+            if attempt_iso_path.exists():
                 marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
                 marked_path = self.config.output_dir / f"{self.config.filename}_{fail_token}{marker}"
                 try:
-                    self.config.output_path.rename(marked_path)
+                    attempt_iso_path.rename(marked_path)
                     result.iso_path = marked_path
                     log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
                 except OSError as e:
                     log(colorize("yellow", f"Could not rename partial ISO to {marked_path.name}: {e} "
                                           f"(leaving it in place; run still recorded as failed)"))
             # Move already-written sidecars (tree, isolyzer) to failure-marked names.
-            for src, dst in ((tree_std, self.config.tree_path),
-                             (isolyzer_std, self.config.isolyzer_path)):
+            for src, dst in ((attempt_tree_path, self.config.tree_path),
+                             (attempt_isolyzer_path, self.config.isolyzer_path)):
                 if src.exists():
                     try:
                         src.rename(dst)
@@ -701,9 +810,16 @@ class OpticalDiscBackup:
             log(colorize("red", f"Failed to get disk info: {e}"))
             return {}
     
-    def _confirm_overwrite(self) -> bool:
-        """Confirm file overwrite"""
-        response = get_input(colorize("yellow", f"{self.config.output_path} exists. Overwrite? (y/n): "))
+    def _confirm_overwrite(self, existing_paths: List[Path]) -> bool:
+        """Confirm replacement of existing canonical artifacts.
+
+        A confirmed replacement does not truncate anything up front. Existing
+        artifacts remain in place until the new attempt verifies, then they are
+        archived under an overwritten-* token before the new artifacts publish.
+        """
+        names = ", ".join(p.name for p in existing_paths)
+        response = get_input(colorize("yellow",
+            f"Existing artifact(s) may be replaced or archived by this run ({names}). Continue? (y/n): "))
         return response.lower() == 'y'
     
     def _generate_tree_listing(self) -> bool:
@@ -815,10 +931,12 @@ class OpticalDiscBackup:
         log_divider("Verifying ISO")
         log(colorize("cyan", "Verifying using:") + " " + colorize("yellow", f"md5 {self.config.output_path.name} (re-read from disk) vs streamed raw disk hash"))
 
-        # Show shell equivalent
-        shell_equiv = (f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] '
-                       f'&& echo "MATCH" || echo "MISMATCH"  # MD5 shown; the script also compares SHA-256')
-        log(colorize("cyan", "Shell equivalent:") + " " + colorize("yellow", shell_equiv))
+        # Optional operator check: this performs a fresh raw-device read, unlike
+        # the script's automated verification, which uses the streamed source hash.
+        manual_check = (f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] '
+                        f'&& echo "MATCH" || echo "MISMATCH"')
+        log(colorize("cyan", "Optional manual spot-check (fresh raw-device read; not run automatically):")
+            + " " + colorize("yellow", manual_check))
 
         iso_hasher = hashlib.md5()
         iso_sha_hasher = hashlib.sha256()
@@ -872,6 +990,7 @@ class OpticalDiscBackup:
             md5_iso=iso_hash,
             sha256_raw=raw_sha,
             sha256_iso=iso_sha,
+            output_path=self.config.output_path,
             warnings=warnings,
         )
     
@@ -1203,8 +1322,13 @@ class OpticalDiscBackup:
                     "status": "skipped" if result.unmount_ok is None else ("success" if result.unmount_ok else "failed")
                 },
                 "iso_creation": {
-                    "command": f"dd if=/dev/r{self.config.disk_id} of={self.config.output_path} bs=4m",
+                    "command": f"dd if=/dev/r{self.config.disk_id} of={result.creation_path or self.config.output_path} bs=4m",
                     "method": "streamed copy with in-stream source hash calculation",
+                    "publish_method": (("run-private attempt ISO promoted to canonical filename after verification"
+                                        if result.success else
+                                        "run-private attempt ISO was not promoted because the run failed")
+                                       if result.creation_path and result.creation_path != self.config.canonical_output_path
+                                       else "written directly to canonical filename"),
                     "block_size": "4MB",
                     "performed": result.unmount_ok is True
                 },
@@ -1212,8 +1336,9 @@ class OpticalDiscBackup:
                     "method": "md5 + sha-256 hash comparison (written ISO re-read from disk vs raw device stream)",
                     "algorithms": ["MD5", "SHA-256"],
                     "performed": result.md5_iso is not None,
-                    "shell_equivalent": (f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] '
-                                         f'&& echo "MATCH" || echo "MISMATCH"  # MD5 shown; the script also compares SHA-256')
+                    "note": "The script does not perform a second raw-device read during verification; it compares the source hash captured during the copy stream to a re-read of the written ISO.",
+                    "optional_manual_spot_check": (f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] '
+                                                   f'&& echo "MATCH" || echo "MISMATCH"')
                 },
                 "finalization": {
                     "eject_command": f"diskutil eject /dev/{self.config.disk_id}",
@@ -1338,7 +1463,8 @@ class OpticalDiscBackup:
                 "backup_parameters": {
                     "dd_block_size": "4MB",
                     "read_device": f"/dev/r{self.config.disk_id}",
-                    "write_destination": str(self.config.output_path),
+                    "write_destination": str(result.creation_path or self.config.output_path),
+                    "final_destination": str(result.iso_path),
                     "parallel_processing": True,
                     "verification_during_creation": False,
                     "error_handling": "standard dd error handling"
