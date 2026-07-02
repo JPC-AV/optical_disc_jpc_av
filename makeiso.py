@@ -780,8 +780,11 @@ class OpticalDiscBackup:
             return None, BackupResult(False, self.config.output_path, disk_size,
                                       error_message=f"Symlink at planned output path(s): {', '.join(linked)}")
 
-        replace_candidates = (self.config.canonical_artifacts.sidecars if self.config.dry_run
-                              else planned)
+        replace_candidates = (
+            [self.config.canonical_log_path, self.config.canonical_manifest_path,
+             self.config.canonical_tree_path]
+            if self.config.dry_run else planned
+        )
         existing_artifacts = [p for p in replace_candidates if p.exists()]
         if existing_artifacts and not self._confirm_overwrite(existing_artifacts):
             names = ", ".join(p.name for p in existing_artifacts)
