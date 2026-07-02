@@ -308,7 +308,7 @@ class ISOMount:
             # Use hdiutil to mount the ISO
             result = run_cmd([
                 "hdiutil", "attach", str(self.iso_path),
-                "-readonly", "-nobrowse", "-plist"
+                "-readonly", "-nobrowse", "-plist", "-owners", "off"
             ])
 
             # Parse plist output: collect ALL mounted volumes and devices
