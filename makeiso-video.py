@@ -331,13 +331,16 @@ class ISOMount:
                                        + ", ".join(str(p) for p in self.mount_points)))
                 for candidate in self.mount_points:
                     try:
-                        if any(item.is_dir() and item.name.upper() == "VIDEO_TS"
-                               for item in candidate.iterdir()):
-                            self.mount_point = candidate
-                            log(colorize("cyan", f"Using volume containing VIDEO_TS: {candidate}"))
-                            break
+                        has_video_ts = any(item.is_dir() and item.name.upper() == "VIDEO_TS"
+                                           for item in candidate.iterdir())
                     except OSError:
-                        continue
+                        # Unlistable root (e.g. mode --x on recorder-authored
+                        # UDF): probe the standard path by name instead
+                        has_video_ts = (candidate / "VIDEO_TS").is_dir()
+                    if has_video_ts:
+                        self.mount_point = candidate
+                        log(colorize("cyan", f"Using volume containing VIDEO_TS: {candidate}"))
+                        break
 
             log(colorize("green", f"Mounted ISO at: {self.mount_point}"))
             return self.mount_point
@@ -400,8 +403,27 @@ def analyze_iso_content(mount_point: Path) -> DiscContentAnalysis:
         # Check for VIDEO_TS folder (case-insensitive search)
         video_ts_path = None
         audio_ts_path = None
-        
-        for item in mount_point.iterdir():
+
+        root_listable = True
+        try:
+            entries = list(mount_point.iterdir())
+        except PermissionError:
+            # Some recorder-authored UDF discs give the volume root search
+            # permission but no read permission (mode --x), so it cannot be
+            # listed — but its well-known children can still be reached by
+            # name, which only requires search permission.
+            root_listable = False
+            log(colorize("yellow", "Volume root is not listable (no read permission); "
+                                   "probing standard VIDEO_TS/AUDIO_TS paths directly"))
+            entries = [p for p in (mount_point / "VIDEO_TS", mount_point / "AUDIO_TS")
+                       if p.is_dir()]
+            if not entries:
+                analysis.error = ("Volume root is unreadable and no VIDEO_TS or AUDIO_TS "
+                                  "directory was found at the standard paths")
+                analysis.disc_type = "error"
+                return analysis
+
+        for item in entries:
             if item.is_dir():
                 if item.name.upper() == "VIDEO_TS":
                     video_ts_path = item
@@ -431,6 +453,9 @@ def analyze_iso_content(mount_point: Path) -> DiscContentAnalysis:
                 analysis.disc_type = "dvd_video"
         elif analysis.has_audio_ts:
             analysis.disc_type = "dvd_audio"
+        elif not root_listable:
+            # Root can't be enumerated, so we can't tell data from empty
+            analysis.disc_type = "data"
         else:
             # Check if there's any recognizable content
             file_count = sum(1 for _ in mount_point.rglob("*") if _.is_file())
