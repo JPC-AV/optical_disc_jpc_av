@@ -37,6 +37,7 @@ Part of the Johnson Publishing Company Archive (JPCA) digitization initiative—
   - [Quick Start](#quick-start-1)
   - [Usage](#usage-1)
   - [Disc Type Handling](#disc-type-handling)
+  - [Duration Check and Outcomes](#duration-check-and-outcomes)
   - [Encoding Defaults](#encoding-defaults)
   - [Output Files](#output-files-1)
 - [verifyiso.py — Collection Fixity Verification](#verifyisopy--collection-fixity-verification)
@@ -98,6 +99,7 @@ This toolkit provides a two-stage workflow for optical disc digitization:
 - **High-quality output** — Default CRF 18 produces visually lossless MP4 files
 - **Batch processing** — Process entire directories of ISOs with a single command
 - **Checksum recording** — MD5 and SHA-256 hashes of every output for fixity
+- **Duration check** — Each MP4 is checked against the disc's expected duration; nothing gets its final name unless every titleset passes
 - **Comprehensive logging** — Detailed logs and JSON manifests matching preservation conventions
 
 ---
@@ -707,19 +709,57 @@ Each encode uses explicit stream mapping (`-map 0:v:0 -map 0:a? -sn`):
 
 - **All audio tracks** on the disc are carried into the MP4 as selectable tracks (e.g. narration and ambient audio both survive).
 - **Subtitles are not encoded** — DVD bitmap subtitles are not MP4-compatible; their presence is recorded in the manifest, and they remain intact in the preservation ISO.
-- The manifest records both the source stream counts and the streams actually mapped into each output, plus a best-effort duration comparison that warns if an output is >5% shorter than expected (possible truncation).
+- The manifest records both the source stream counts and the streams actually mapped into each output (null, and "unknown" in the log, when that probe failed or never ran; 0 only when a probe found none), plus each output's duration check (see [Duration Check and Outcomes](#duration-check-and-outcomes)).
+
+### Duration Check and Outcomes
+
+Each titleset is encoded to a temporary file and checked before anything gets a final name:
+
+1. ffmpeg must succeed and leave a non-empty file with a video stream.
+2. The MP4's duration must be measurable.
+3. It is compared with the titleset's **expected duration**, taken from:
+   - the titleset's IFO playback time, but only for one simple, straight-through layout: a single, structurally valid program chain, played in order, whose cells each play once and exactly cover the encoded VOBs — no angles, interleaving, still frames or cell commands — and whose time matches the sum of its cells' (to within a frame per cell). Any other IFO layout is recorded as *advisory* and never decides the outcome;
+   - otherwise, the sum of the VOBs' probed durations, but only if every VOB could be measured.
+
+   An expected duration implying more than 12 Mbps over the VOBs is impossible for DVD-Video and is rejected.
+4. The tolerance is 5% of the expected duration, but at least 1 second.
+
+| Outcome | When | What is kept |
+|---------|------|--------------|
+| **passed** | within the tolerance (or exactly on it) | the MP4 — promoted only if every titleset of the ISO passed |
+| **unverified** | the check could not be completed: the output's stream or duration probe failed, there is no usable expected duration, or the MP4 is longer than expected by more than the tolerance | a review copy, `*_unverified-<token>.mp4.unverified` |
+| **failed** | ffmpeg failed or was interrupted; the output is missing, empty, or confirmed by a successful probe to have no video; or it is shorter than expected by more than the tolerance | the attempt, `*_failed-<token>.mp4.partial` |
+
+Without a usable expected duration the MP4 is never compared, so it is never reported as truncated on that basis; it is unverified.
+
+**Nothing is promoted unless every titleset passes.** Then all of the ISO's MP4s get their final names and the normal log and manifest are written. Otherwise no final MP4, log or manifest is created or changed: failed titlesets are kept as `.partial`, unverified ones as review copies, and titlesets that passed but were held back because another did not are kept as review copies too, with the reason recorded. That run's log and manifest go under its token (see [Failed Conversion Naming](#failed-conversion-naming)); failure outranks unverified.
+
+**Review copies are not deliverables.** Do not rename them into place. How a review copy could be accepted will be decided after a separately authorized review of real discs; until then, rerun the ISO once the cause is understood. Reruns never overwrite review copies, and review copies do not trigger the overwrite prompt.
+
+**A passed check is not proof of a complete copy.** It means only that the MP4's length matches the expected duration within the tolerance — not that picture and sound are intact, nor that the disc was captured the way a DVD player would play it (see [Menu VOBs Are Intentionally Excluded](#menu-vobs-are-intentionally-excluded)).
+
+**Promotion is not one transaction.** The final renames happen one titleset after another. If one fails or is interrupted after earlier ones succeeded, promotion stops, the run fails, and its records list exactly which final MP4s this run replaced or created. An existing log and manifest then describe an earlier run and no longer match those files, and the run's warning says so. Records are written only after promotion, so a run can also fail after a partial or complete promotion because its records cannot be written. The MP4s it promoted then stay; the canonical log and manifest may be missing, incomplete or from an earlier run; the run may have no records of its own, and the error is shown on screen (a batch counts the ISO as failed). Nothing is rolled back.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Every ISO converted (all titlesets passed and promoted), skipped, or a successful dry run |
+| `1` | Any failure or unverified result, an operator abort, or another error (see the log) |
+| `2` | An option or value the argument parser rejected (an unknown option, or a missing or invalid value). Other arguments given without `-i`/`--iso` or `--batch` currently exit `1` |
 
 ### Failed Conversion Naming
 
-Encodes write to a temporary `*.encoding-<random>.mp4` file that atomically replaces the final name only after the output verifies — a failed retry can never damage a pre-existing good MP4. All artifacts of one failed attempt share a `failed-<timestamp>-<random>` token (`aborted-…` for operator aborts) so retries never overwrite earlier evidence:
+Encodes write to a temporary `*.encoding-<random>.mp4` file that atomically replaces the final name only after every titleset of the ISO passes its check — until promotion begins, failed or unverified attempts leave existing final MP4s unchanged. All artifacts of one attempt share a `<timestamp>-<random>` token, prefixed `failed-`, `unverified-` or (for operator aborts) `aborted-`, so retries never overwrite earlier evidence:
 
 ```
-JPC_AV_00001_failed-20260612T150000-3f9a2c.mp4.partial   # quarantined partial encode
-JPC_AV_00001_failed-20260612T150000-3f9a2c.log.txt       # log for that attempt
-JPC_AV_00001_failed-20260612T150000-3f9a2c_manifest.json # manifest for that attempt
+JPC_AV_00001_failed-20260612T150000-3f9a2c.mp4.partial                  # failed encode
+JPC_AV_00001_title02_unverified-20260612T150000-3f9a2c.mp4.unverified   # review copy, not a deliverable
+JPC_AV_00001_failed-20260612T150000-3f9a2c.log.txt                      # log for that attempt
+JPC_AV_00001_failed-20260612T150000-3f9a2c_manifest.json                # manifest for that attempt
 ```
 
-A hard kill (power loss, `kill -9`) may leave a `*.encoding-*.mp4` temp file behind, as can a filesystem failure that prevents quarantine (in that case the failure records name the leftover file). Temp files are incomplete by definition and safe to delete.
+A run that ends unverified names its log and manifest `…_unverified-<token>.log.txt` and `…_unverified-<token>_manifest.json`. Kept files never replace an existing file: each name is reserved first, and if it is taken another random suffix is added (`…-3f9a2c-7b01de.mp4.partial`).
+
+A hard kill (power loss, `kill -9`) may leave a `*.encoding-*.mp4` temp file behind, as can a filesystem failure that prevents moving it to its kept name (in that case the run's records name the leftover file and say what it holds). Temp files left by a hard kill are incomplete by definition.
 
 ### Menu VOBs Are Intentionally Excluded
 
@@ -737,9 +777,9 @@ DVD-Video discs contain two categories of VOB files:
 
 - **Menu VOBs** (`VIDEO_TS.VOB`, `VTS_*_0.VOB`) — contain interactive navigation data: button layouts, highlight graphics, menu audio loops, and DVD player commands. This data is designed to be driven by a DVD player's menu system and cannot be included in a linear MP4 stream. Attempting to include it causes ffmpeg errors or corrupted output.
 
-- **Content VOBs** (`VTS_*_1.VOB`, `VTS_*_2.VOB`, etc.) — contain the actual linear video content: everything you would see by pressing Play All on the disc.
+- **Content VOBs** (`VTS_*_1.VOB`, `VTS_*_2.VOB`, etc.) — contain the actual video content, which a DVD player plays in the order the disc's navigation chooses.
 
-The script automatically skips menu VOBs and concatenates only the content VOBs, per titleset. A disc whose VIDEO_TS contains *only* menu VOBs is skipped (nothing to convert). **No video content is lost.** The full disc — including all menu structure, navigation data, logos, and interactive elements — remains intact in the preservation ISO, which can be mounted on any computer to experience the disc exactly as originally authored, menus and all.
+The script automatically skips menu VOBs and concatenates only the content VOBs, per titleset, in file order. A disc whose VIDEO_TS contains *only* menu VOBs is skipped (nothing to convert). **The MP4 is not a player-equivalent copy.** File order is not necessarily how a DVD player plays the disc: program order, branching, angles and still frames are not followed, so an MP4 can differ from what a player shows, and a passed duration check does not prove that all intended content was captured. **Nothing is lost from the preservation ISO:** the full disc — including all menu structure, navigation data, logos, and interactive elements — remains intact there, and it can be mounted on any computer to experience the disc exactly as originally authored, menus and all.
 
 ### Encoding Defaults
 
@@ -801,6 +841,8 @@ For skipped ISOs (non-VIDEO_TS content):
 └── access_JPC_AV_data_disc/
     └── data_disc_skip_manifest.json        # Documents why disc was skipped
 ```
+
+For a run that fails or ends unverified before promotion begins, the final MP4s, log and manifest above are left as they were. A run that fails once promotion has begun — a rename stops partway, or its records cannot be written afterwards — can leave MP4s it already promoted beside a missing, incomplete or outdated log and manifest (see [Duration Check and Outcomes](#duration-check-and-outcomes)). The run's own files are named as in [Failed Conversion Naming](#failed-conversion-naming).
 
 ---
 
@@ -908,6 +950,10 @@ brew install ffmpeg
 3. Try with `-n` (dry run) first to analyze content
 4. Check the log file for detailed error messages
 
+#### Run ends UNVERIFIED
+
+Nothing was promoted, and existing final MP4s and records were left as they were. The run's `*_unverified-<token>.log.txt` gives each titleset's reason. Review copies (`*.mp4.unverified`) are not deliverables — see [Duration Check and Outcomes](#duration-check-and-outcomes).
+
 #### Poor video quality
 
 Adjust encoding settings:
@@ -974,6 +1020,7 @@ The access manifest (`*_access_manifest.json`) includes similar metadata plus:
 
 - `encoding_settings` — Video/audio codec, CRF, preset
 - `disc_analysis` — VIDEO_TS detection results, VOB file inventory
+- `titlesets` — Every planned titleset: its outcome; its duration check (expected and measured durations, their source, the tolerance, and the IFO and VOB-probe evidence); its intended final path; whether this run promoted it (and replaced an earlier file); and where any review copy or `.partial` actually is
 - `video_technical_info` — Resolution, frame rate, duration
 - `archival_notes` — Purpose, preservation relationship
 

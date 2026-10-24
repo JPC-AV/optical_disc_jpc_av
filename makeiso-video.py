@@ -20,7 +20,9 @@ import platform
 import argparse
 import json
 import logging
+import math
 import plistlib
+import stat
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass, field
@@ -93,26 +95,61 @@ class TitlesetPlan:
     is_main: bool = False    # lowest-numbered content titleset; keeps unsuffixed name
 
 @dataclass
+class IfoDuration:
+    """What a titleset's VTS IFO says about its playback time"""
+    status: str                      # supported | used | advisory | invalid | missing
+    seconds: Optional[float] = None  # program chain playback time, when it parsed
+    reason: Optional[str] = None     # why it is advisory, invalid or missing
+
+@dataclass
+class DurationExpectation:
+    """Expected duration of a titleset's encode, and where it came from"""
+    seconds: Optional[float] = None  # usable expectation only; None = nothing to compare
+    source: Optional[str] = None     # ifo | vob_probe
+    reason: Optional[str] = None     # why there is no usable expectation
+    ifo: Optional[IfoDuration] = None
+    vob_probe_seconds: Optional[float] = None  # sum of the VOB durations that measured
+    vob_probe_complete: Optional[bool] = None  # None = VOBs not probed (IFO used)
+
+@dataclass
 class TitleOutput:
-    """Outcome of one titleset's encode"""
+    """Outcome of one titleset's encode.
+
+    status: planned (dry run) | not_attempted | encoded (checked, awaiting
+    the promotion decision) | completed (passed and promoted this run) |
+    held (passed, but not promoted because the ISO's run did not pass) |
+    unverified (check could not be completed) | failed"""
     vts_number: int
-    output_path: Path
-    status: str = "not_attempted"   # planned | completed | failed | not_attempted
+    output_path: Path                # final (canonical) name this titleset is meant for
+    status: str = "not_attempted"
     output_size: int = 0
     video_duration: Optional[float] = None
-    expected_duration: Optional[float] = None
-    # True only when EVERY content VOB's duration was measurable, so the expected
-    # duration is trustworthy. False means completeness cannot be proven.
-    expected_duration_complete: bool = True
+    expected_duration: Optional[float] = None       # usable expectation only
+    expected_duration_source: Optional[str] = None  # ifo | vob_probe
+    expectation: Optional[DurationExpectation] = None
+    duration_check: Optional[str] = None             # passed | unverified | failed
+    duration_check_reason: Optional[str] = None
+    duration_tolerance: Optional[float] = None
     encode_time: float = 0.0
     md5: Optional[str] = None
     sha256: Optional[str] = None
     source_audio_streams: Optional[int] = None
     source_subtitle_streams: Optional[int] = None
-    mapped_video_streams: int = 0
-    mapped_audio_streams: int = 0
+    # None = not measured (output not probed, or the probe failed);
+    # 0 only when a successful probe found none
+    mapped_video_streams: Optional[int] = None
+    mapped_audio_streams: Optional[int] = None
     error: Optional[str] = None
-    partial_path: Optional[Path] = None  # where a failed/interrupted output was quarantined
+    temp_path: Optional[Path] = None   # checked output awaiting promotion or retention
+    promoted_this_run: bool = False
+    replaced_existing_canonical: bool = False
+    hold_reason: Optional[str] = None
+    # Where this run's non-canonical output actually is: kept as a .partial
+    # ("partial"), a review copy ("review_copy"), or left at its temp name
+    # ("encoding_temp") when it could not be moved
+    retained_path: Optional[Path] = None
+    retained_as: Optional[str] = None
+    retention_error: Optional[str] = None
 
 @dataclass
 class ConversionResult:
@@ -136,6 +173,16 @@ class ConversionResult:
     aborted: bool = False        # operator declined to proceed (recorded as aborted, not error)
     interrupted: bool = False    # Ctrl-C mid-run (batch processing stops)
     records_unsafe: bool = False # record paths themselves are suspect (symlink guard); write nothing
+    # Nothing failed, but at least one titleset could not be verified, so
+    # nothing was promoted (success is False; failure outranks this)
+    unverified: bool = False
+    unverified_reason: Optional[str] = None
+    promotion_error: Optional[str] = None  # promotion stopped partway (run failed)
+
+    @property
+    def canonical_files_changed(self) -> List[Path]:
+        """Final-name MP4s this run actually created or replaced"""
+        return [t.output_path for t in self.titles if t.promoted_this_run]
 
     @property
     def compression_ratio(self) -> Optional[float]:
@@ -258,6 +305,10 @@ def format_duration(seconds: float) -> str:
     parts.append(f"{remaining_seconds:.1f}s")
     
     return " ".join(parts)
+
+def format_count(count: Optional[int]) -> str:
+    """A stream count for people: "unknown" when it was not measured"""
+    return "unknown" if count is None else str(count)
 
 def format_timecode(seconds: float) -> str:
     """Format seconds as HH:MM:SS.mmm timecode"""
@@ -552,7 +603,9 @@ def check_ffprobe() -> Tuple[bool, Optional[str]]:
         return False, None
 
 def get_video_duration(target) -> Optional[float]:
-    """Get duration in seconds via ffprobe; target may be a path or a concat: URL"""
+    """Get duration in seconds via ffprobe; target may be a path or a concat: URL.
+
+    None when it cannot be measured, including a non-finite reading."""
     try:
         result = run_cmd([
             "ffprobe",
@@ -561,34 +614,310 @@ def get_video_duration(target) -> Optional[float]:
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(target)
         ])
-        return float(result.stdout.strip())
+        seconds = float(result.stdout.strip())
+        return seconds if math.isfinite(seconds) else None
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
         return None
 
-def probe_expected_duration(vobs: List[Path]) -> tuple:
-    """Expected duration of a titleset and whether it is provably complete.
+def _usable_seconds(value) -> bool:
+    """A duration that can take part in a comparison: finite and above zero"""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
 
-    Returns (expected_seconds, complete). ffprobe on a concat: VOB input is
-    unreliable — it can report only the first segment's duration — so the
-    trustworthy estimate is the sum of per-VOB durations. The completeness flag
-    matters because a *partial* sum can hide a dropped segment: if some VOB on a
-    multi-VOB title is unprobeable, the encode could silently omit exactly that
-    segment and a partial-sum comparison would never notice.
+SECTOR_SIZE = 2048
 
-      - every VOB probes        -> (sum, True)    trustworthy
-      - some VOBs unprobeable    -> (partial_sum_or_None, False)  not provable
-    """
+def _bcd_time_frames(raw: bytes) -> Optional[Tuple[int, int]]:
+    """Decode a DVD playback time (BCD hh:mm:ss:ff, frame rate in the top
+    two bits of ff: 01 = 25 fps, 11 = 30 fps) to (frames, fps).
+    None unless every field is valid BCD within range."""
+    if len(raw) != 4:
+        return None
+    fps = {0b01: 25, 0b11: 30}.get(raw[3] >> 6)
+    if fps is None:
+        return None
+
+    def bcd(byte: int) -> Optional[int]:
+        high, low = byte >> 4, byte & 0x0F
+        return high * 10 + low if high <= 9 and low <= 9 else None
+
+    hours, minutes, seconds, frames = bcd(raw[0]), bcd(raw[1]), bcd(raw[2]), bcd(raw[3] & 0x3F)
+    if None in (hours, minutes, seconds, frames) or minutes >= 60 or seconds >= 60 or frames >= fps:
+        return None
+    return (hours * 3600 + minutes * 60 + seconds) * fps + frames, fps
+
+def parse_ifo_playback(ifo_path: Optional[Path], content_vobs: List[Path]) -> IfoDuration:
+    """Playback time from a titleset's VTS_nn_0.IFO, and whether it applies.
+
+    The IFO's program chain (PGC) records the authored playback time, which
+    stays meaningful on recorder-authored discs whose VOB timestamps reset.
+    It describes what this script encodes (the content VOBs in file order)
+    only for a straight-through titleset: exactly one PGC, played in order,
+    whose cells each play once, in sector order, covering the content VOBs
+    exactly — no angle or interleaved blocks, still frames or cell commands —
+    and whose time matches the sum of its cells' (within a frame per cell).
+    Every offset is bounds-checked and every time BCD-validated, and the
+    PGC's required tables (libdvdread's ifoRead_PGC structures) must be
+    present and consistent with its declared program and cell counts.
+
+    status "supported" for that layout; "advisory" when the time parsed but
+    the layout is anything else (recorded, never decides an outcome);
+    "invalid" or "missing" when there is no trustworthy time at all."""
+    if ifo_path is None:
+        return IfoDuration("missing", reason="no VTS IFO for this titleset")
+    try:
+        data = ifo_path.read_bytes()
+    except OSError as e:
+        return IfoDuration("missing", reason=f"IFO could not be read: {e}")
+
+    def u16(offset: int) -> int:
+        return int.from_bytes(data[offset:offset + 2], "big")
+
+    def u32(offset: int) -> int:
+        return int.from_bytes(data[offset:offset + 4], "big")
+
+    def invalid(reason: str) -> IfoDuration:
+        return IfoDuration("invalid", reason=f"IFO {reason}")
+
+    if len(data) < 0x100 or not data.startswith(b"DVDVIDEO-VTS"):
+        return invalid("is not a VTS information file")
+    table = u32(0xCC) * SECTOR_SIZE  # VTS_PGCI: the titleset's program chains
+    if table < SECTOR_SIZE or table + 8 > len(data):
+        return invalid("program chain table pointer is out of bounds")
+    srp_count = u16(table)
+    table_end = table + u32(table + 4) + 1  # the end address is the table's last byte
+    if srp_count == 0:
+        return invalid("lists no program chains")
+    if table_end > len(data) or table + 8 + 8 * srp_count > table_end:
+        return invalid("program chain table runs past its end or the file")
+    if srp_count != 1:
+        return IfoDuration("advisory", reason=f"IFO lists {srp_count} program chains; "
+                                              "only a single straight-through chain is supported")
+
+    pgc = table + u32(table + 8 + 4)
+    if pgc < table + 16 or pgc + 0xEC > table_end:
+        return invalid("program chain is out of bounds")
+    pgc_time = _bcd_time_frames(data[pgc + 4:pgc + 8])
+    if pgc_time is None:
+        return invalid("program chain playback time is not a valid BCD time")
+    pgc_frames, fps = pgc_time
+    if pgc_frames == 0:
+        return invalid("program chain playback time is zero")
+    seconds = pgc_frames / fps
+    # Required PGC tables, as libdvdread reads them: the program map (one
+    # byte per program: its entry cell), the cell playback table (24 bytes
+    # per cell) and the cell position table (4 bytes per cell: VOB ID, a
+    # zero byte, cell ID). Each must lie after the 0xEC-byte PGC header and
+    # inside the program chain table, without overlapping another, and
+    # there can be no more programs than cells. The optional command table,
+    # when its pointer is set, must be just as readable.
+    program_count, cell_count = data[pgc + 2], data[pgc + 3]
+    if cell_count == 0 or program_count == 0:
+        return invalid("program chain has no cells or no programs")
+    if program_count > cell_count:
+        return invalid(f"program chain lists {program_count} programs "
+                       f"but only {cell_count} cells")
+    spans: Dict[str, Tuple[int, int]] = {}
+    for label, field, size in (("program map", 0xE6, program_count),
+                               ("cell table", 0xE8, 24 * cell_count),
+                               ("cell position table", 0xEA, 4 * cell_count)):
+        offset = u16(pgc + field)
+        if offset < 0xEC or pgc + offset + size > table_end:
+            return invalid(f"{label} is missing or out of bounds")
+        spans[label] = (pgc + offset, pgc + offset + size)
+    commands_offset = u16(pgc + 0xE4)
+    if commands_offset:
+        # 8-byte header: pre, post and cell command counts, last byte;
+        # then 8 bytes per command
+        commands = pgc + commands_offset
+        if commands_offset < 0xEC or commands + 8 > table_end:
+            return invalid("command table is out of bounds")
+        command_count = u16(commands) + u16(commands + 2) + u16(commands + 4)
+        length = u16(commands + 6) + 1
+        if command_count > 255 or length < 8 + 8 * command_count or commands + length > table_end:
+            return invalid("command table is inconsistent or out of bounds")
+        spans["command table"] = (commands, commands + length)
+    ordered = sorted(spans.values())
+    if any(end > next_start for (_, end), (next_start, _) in zip(ordered, ordered[1:])):
+        return invalid("program chain tables overlap")
+    entry_cells = data[spans["program map"][0]:spans["program map"][1]]
+    if (entry_cells[0] != 1 or entry_cells[-1] > cell_count
+            or any(earlier >= later for earlier, later in zip(entry_cells, entry_cells[1:]))):
+        return invalid("program map is not increasing cell numbers starting at cell 1")
+    positions_at = spans["cell position table"][0]
+    positions = [(u16(positions_at + 4 * i), data[positions_at + 4 * i + 2],
+                  data[positions_at + 4 * i + 3]) for i in range(cell_count)]
+    for number, (vob_id, zero, cell_id) in enumerate(positions, 1):
+        if vob_id == 0 or zero != 0 or cell_id == 0:
+            return invalid(f"cell position {number} is not a valid VOB/cell ID")
+    cells = spans["cell table"][0]
+
+    advisory: List[str] = []
+    if len({(vob_id, cell_id) for vob_id, _, cell_id in positions}) != cell_count:
+        advisory.append("cell positions repeat a VOB/cell ID")
+    if data[pgc + 0xA3] != 0:
+        advisory.append("program chain plays in shuffle or random order")
+    if data[pgc + 0xA2] != 0:
+        advisory.append("program chain ends in a still frame")
+    cell_frames = 0
+    next_sector = 0
+    tiled = True
+    for index in range(cell_count):
+        cell = cells + 24 * index
+        number = index + 1
+        cell_time = _bcd_time_frames(data[cell + 4:cell + 8])
+        if cell_time is None:
+            return invalid(f"cell {number} playback time is not a valid BCD time")
+        if cell_time[1] != fps:
+            return invalid(f"cell {number} uses a different frame rate from its program chain")
+        cell_frames += cell_time[0]
+        first, last_vobu, last = u32(cell + 8), u32(cell + 16), u32(cell + 20)
+        if not first <= last_vobu <= last:
+            return invalid(f"cell {number} sector range is inconsistent")
+        category, flags = data[cell], data[cell + 1]
+        if category & 0xF1:  # block mode, block type, seamless angle change
+            advisory.append(f"cell {number} is part of an angle block")
+        if category & 0x04:
+            advisory.append(f"cell {number} is interleaved")
+        if data[cell + 2] != 0 or flags & 0x40:
+            advisory.append(f"cell {number} has a still frame")
+        if data[cell + 3] != 0:
+            advisory.append(f"cell {number} runs a cell command")
+        if tiled and first != next_sector:
+            advisory.append(f"cells do not cover the content VOBs straight through "
+                            f"(cell {number} starts at sector {first}, expected {next_sector})")
+            tiled = False
+        next_sector = last + 1
+
+    try:
+        sizes = [v.stat().st_size for v in content_vobs]
+    except OSError as e:
+        return invalid(f"cannot be checked against the content VOBs: {e}")
+    if any(size % SECTOR_SIZE for size in sizes):
+        advisory.append("content VOB sizes are not whole sectors")
+    elif tiled and next_sector != sum(sizes) // SECTOR_SIZE:
+        advisory.append(f"cells cover {next_sector} sectors but the content VOBs "
+                        f"hold {sum(sizes) // SECTOR_SIZE}")
+    if abs(cell_frames - pgc_frames) > cell_count:
+        advisory.append(f"program chain time ({pgc_frames} frames) differs from "
+                        f"the sum of its cells ({cell_frames} frames)")
+    if advisory:
+        return IfoDuration("advisory", seconds=seconds, reason="IFO " + "; ".join(advisory))
+    return IfoDuration("supported", seconds=seconds)
+
+# DVD-Video's program stream tops out at ~10.08 Mbps; an expected duration
+# implying more than this (with margin) is provably wrong, not evidence
+# about the encode. Recorder-authored discs hit this constantly: their VOB
+# timestamps reset at every recording, so probed durations come out absurd.
+# This rule can only reject an expectation, never confirm one.
+PLAUSIBLE_DVD_BPS = 12_000_000
+
+def expected_titleset_duration(vobs: List[Path], ifo_path: Optional[Path]) -> DurationExpectation:
+    """Best usable expected duration for a titleset, or none with the reason.
+
+    The IFO's playback time is used only for a straight-through titleset
+    (see parse_ifo_playback). Otherwise the fallback is the sum of per-VOB
+    ffprobe durations — ffprobe on a concat: input can report only the
+    first segment — usable only when every VOB measures (a partial sum can
+    hide exactly the segment an encode dropped). Either is rejected when it
+    implies an impossible DVD bitrate. An unusable IFO never blocks a usable
+    VOB fallback."""
+    total_bytes = sum(v.stat().st_size for v in vobs if v.exists())
+
+    def implied_bps(seconds: float) -> float:
+        return total_bytes * 8 / seconds
+
+    ifo = parse_ifo_playback(ifo_path, vobs)
+    if ifo.status == "supported":
+        if implied_bps(ifo.seconds) <= PLAUSIBLE_DVD_BPS:
+            ifo.status = "used"
+            return DurationExpectation(seconds=ifo.seconds, source="ifo", ifo=ifo)
+        ifo.status = "advisory"
+        ifo.reason = (f"IFO time implies {implied_bps(ifo.seconds) / 1e6:.1f} Mbps over the "
+                      f"content VOBs, more than DVD-Video allows")
+
+    expectation = DurationExpectation(ifo=ifo)
     parts = [get_video_duration(v) for v in vobs]
-    if parts and all(p is not None for p in parts):
-        return sum(parts), True
-    known = [p for p in parts if p is not None]
-    return (sum(known) if known else None), False
+    measured = [p for p in parts if _usable_seconds(p)]
+    expectation.vob_probe_complete = bool(parts) and len(measured) == len(parts)
+    expectation.vob_probe_seconds = sum(measured) if measured else None
+    if not expectation.vob_probe_complete:
+        vob_reason = (f"{len(parts) - len(measured)} of {len(parts)} VOB duration(s) "
+                      f"could not be measured")
+    elif not _usable_seconds(expectation.vob_probe_seconds):
+        vob_reason = "VOB durations do not add up to a usable total"
+    elif implied_bps(expectation.vob_probe_seconds) > PLAUSIBLE_DVD_BPS:
+        vob_reason = (f"VOB durations imply {implied_bps(expectation.vob_probe_seconds) / 1e6:.1f} "
+                      f"Mbps, more than DVD-Video allows (typical of recorder-authored "
+                      f"discs whose timestamps reset)")
+    else:
+        expectation.seconds = expectation.vob_probe_seconds
+        expectation.source = "vob_probe"
+        return expectation
+    expectation.reason = (f"no usable expected duration ({ifo.reason or 'IFO ' + ifo.status}; "
+                          f"{vob_reason})")
+    return expectation
 
-def probe_stream_counts(target) -> Dict[str, int]:
-    """Count video/audio/subtitle streams via ffprobe"""
+# Duration check tolerance: max(5% of the expected duration, 1 second)
+DURATION_TOLERANCE = 0.05
+DURATION_TOLERANCE_FLOOR = 1.0
+
+# Names tried when keeping a non-canonical output before giving up
+RETENTION_ATTEMPTS = 5
+
+def duration_check(expected: Optional[float], no_expectation_reason: Optional[str],
+                   output_seconds: Optional[float], video_streams: Optional[int]
+                   ) -> Tuple[str, str, Optional[float]]:
+    """Check one encoded titleset: returns (result, reason, tolerance_seconds).
+
+    failed:     a probe confirmed the output has no video, or it is shorter
+                than a usable expectation by more than the tolerance
+    unverified: the check could not be completed — the stream probe failed,
+                the output's duration is not measurable, there is no usable
+                expectation (never compared, so never a truncation by
+                itself), or the output is longer by more than the tolerance
+    passed:     otherwise; within (or exactly on) the tolerance
+    Failure outranks unverified."""
+    failed: List[str] = []
+    unverified: List[str] = []
+    if video_streams is None:
+        unverified.append("output stream probe failed, so its video could not be confirmed")
+    elif video_streams == 0:
+        failed.append("output has no video stream")
+    tolerance = None
+    detail = ""
+    if not _usable_seconds(output_seconds):
+        unverified.append("output duration could not be measured")
+    elif not _usable_seconds(expected):
+        unverified.append(no_expectation_reason or "no usable expected duration")
+    else:
+        tolerance = max(expected * DURATION_TOLERANCE, DURATION_TOLERANCE_FLOOR)
+        difference = output_seconds - expected
+        detail = (f"output {format_timecode(output_seconds)}, expected "
+                  f"{format_timecode(expected)}, tolerance {tolerance:.2f} s")
+        if difference < -tolerance:
+            failed.append(f"output is shorter than expected beyond the tolerance ({detail}) "
+                          f"— truncated encode")
+        elif difference > tolerance:
+            unverified.append(f"output is longer than expected beyond the tolerance ({detail})")
+    if failed:
+        return "failed", "; ".join(failed), tolerance
+    if unverified:
+        return "unverified", "; ".join(unverified), tolerance
+    return "passed", f"within tolerance ({detail})", tolerance
+
+def probe_stream_counts(target) -> Optional[Dict[str, int]]:
+    """Count video/audio/subtitle streams via ffprobe.
+
+    None when the probe failed or its answer has no streams list, so
+    presence is unknown — as distinct from a successful probe that listed
+    no streams (all counts 0)."""
+    info = get_video_info(target)
+    streams = info.get("streams") if isinstance(info, dict) else None
+    if not isinstance(streams, list):
+        return None
     counts = {"video": 0, "audio": 0, "subtitle": 0}
-    for stream in get_video_info(target).get("streams", []):
-        codec_type = stream.get("codec_type")
+    for stream in streams:
+        codec_type = stream.get("codec_type") if isinstance(stream, dict) else None
         if codec_type in counts:
             counts[codec_type] += 1
     return counts
@@ -617,16 +946,17 @@ class ISOToMP4Converter:
         self.config = config
         self.start_time: Optional[datetime.datetime] = None
         self.run: Optional[RunContext] = None
-        self._failure_token: Optional[str] = None
+        self._token_suffix: Optional[str] = None
 
-    def _get_failure_token(self, kind: str = "failed") -> str:
-        """One token per run names every failure artifact (quarantined
-        partials, failure log, failure manifest), so a failed attempt's
-        evidence groups together and retries can never overwrite it"""
-        if self._failure_token is None:
-            self._failure_token = (f"{kind}-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}"
-                                   f"-{uuid4().hex[:6]}")
-        return self._failure_token
+    def _run_token(self, kind: str = "failed") -> str:
+        """One timestamp-and-random suffix per run names every non-canonical
+        artifact — partials, review copies, failure/unverified records — with
+        a kind prefix (failed | unverified | aborted), so one attempt's
+        evidence groups together and retries never overwrite it"""
+        if self._token_suffix is None:
+            self._token_suffix = (f"{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}"
+                                  f"-{uuid4().hex[:6]}")
+        return f"{kind}-{self._token_suffix}"
 
     def convert(self) -> ConversionResult:
         """Main entry point for conversion"""
@@ -655,13 +985,20 @@ class ISOToMP4Converter:
                     self._create_skip_manifest(result)
                     self._create_log_file(result, dry_run=self.config.dry_run)
                 elif result.error_message:
-                    token = self._get_failure_token("aborted" if result.aborted else "failed")
+                    token = self._run_token("aborted" if result.aborted else "failed")
+                    self._create_error_manifest(result, token)
+                    self._create_log_file(result, is_error=True, failure_token=token)
+                elif result.unverified:
+                    # Nothing was promoted: records go under the run's token,
+                    # leaving any existing canonical log and manifest untouched
+                    token = self._run_token("unverified")
                     self._create_error_manifest(result, token)
                     self._create_log_file(result, is_error=True, failure_token=token)
             except Exception as record_error:
                 log(colorize("red", f"Could not write run records: {record_error}"))
-                if result.success:
+                if result.success or result.unverified:
                     result.success = False
+                    result.unverified = False
                     # A skip without its record is not a valid skip — clear the
                     # flag so batch accounting counts this as a failure too
                     result.skipped = False
@@ -940,86 +1277,295 @@ class ISOToMP4Converter:
             names = ", ".join(v.name for v in unrecognized_vobs)
             result.warnings.append(f"unrecognized VOB name(s) not converted: {names}")
 
-        for plan in plans:
-            title = TitleOutput(vts_number=plan.vts_number, output_path=plan.output_path)
-            result.titles.append(title)
-
+        # Every planned titleset is recorded, attempted or not
+        result.titles = [TitleOutput(vts_number=p.vts_number, output_path=p.output_path)
+                         for p in plans]
+        for plan, title in zip(plans, result.titles):
             label = "main title" if plan.is_main else f"title {plan.vts_number:02d}"
             log_divider(f"Encoding {label} → {plan.output_path.name}")
 
-            # Source stream inventory (first content VOB is representative)
-            source_counts = probe_stream_counts(plan.content_vobs[0])
-            title.source_audio_streams = source_counts.get("audio")
-            title.source_subtitle_streams = source_counts.get("subtitle")
-
-            # Expected duration + whether it is provably complete (drives the
-            # truncation / completeness guard after the encode).
-            title.expected_duration, title.expected_duration_complete = \
-                probe_expected_duration(plan.content_vobs)
-
-            # A failed titleset marks the whole run failed, but remaining
-            # titlesets are still attempted so the record is complete.
-            # Ctrl-C stops here: the interrupted title is recorded as failed
-            # and remaining titlesets stay "not_attempted".
-            if self.run:
-                self.run.mark(f"encode_vts_{plan.vts_number:02d}")
+            # A titleset that does not pass blocks promotion of the whole
+            # ISO, but remaining titlesets are still attempted so the record
+            # is complete. Ctrl-C stops here: the interrupted title is
+            # recorded as failed and remaining titlesets stay "not_attempted".
             try:
+                # Source stream inventory (first content VOB is representative)
+                source_counts = probe_stream_counts(plan.content_vobs[0]) or {}
+                title.source_audio_streams = source_counts.get("audio")
+                title.source_subtitle_streams = source_counts.get("subtitle")
+
+                # Expected duration for the check after the encode: the VTS
+                # IFO's playback time when it applies, else complete VOB probes
+                ifo_path = next(
+                    (f for f in analysis.ifo_files
+                     if f.name.upper() == f"VTS_{plan.vts_number:02d}_0.IFO"), None)
+                title.expectation = expected_titleset_duration(plan.content_vobs, ifo_path)
+                title.expected_duration = title.expectation.seconds
+                title.expected_duration_source = title.expectation.source
+
+                if self.run:
+                    self.run.mark(f"encode_vts_{plan.vts_number:02d}")
                 self._encode_titleset(plan, title, result)
             except KeyboardInterrupt:
-                result.success = False
                 result.interrupted = True
                 result.conversion_time += title.encode_time
                 log(colorize("red", "Remaining titleset(s) not attempted."))
                 break
+            except Exception as e:
+                # e.g. a VOB that cannot be read while preparing: fail this
+                # titleset, never strand earlier titlesets' checked outputs
+                if title.status == "not_attempted":
+                    title.status = "failed"
+                    title.error = f"could not prepare the encode: {e}"
+                    log(colorize("red", f"{plan.output_path.name}: {title.error}"))
             result.conversion_time += title.encode_time
-            if title.status != "completed":
-                result.success = False
+
+        self._finish_titlesets(result)
 
         # Mirror the main title into the legacy top-level fields so existing
-        # log/manifest consumers keep working
+        # log/manifest consumers keep working — only for a file this run
+        # actually promoted to the final name
         main = result.titles[0] if result.titles else None
-        if main and main.status == "completed":
+        if main and main.promoted_this_run:
             result.output_size = main.output_size
             result.video_duration = main.video_duration
             result.md5_mp4 = main.md5
             result.sha256_mp4 = main.sha256
-        if not result.success:
-            failed = [t for t in result.titles if t.status == "failed"]
-            result.error_message = "; ".join(
-                f"{t.output_path.name}: {t.error}" for t in failed)
+        else:
+            result.mp4_path = None
 
+        for t in result.titles:
+            if t.retention_error:
+                where = f"it is at {t.retained_path}" if t.retained_path else "it was not found"
+                result.warnings.append(f"{t.output_path.name}: output could not be kept under "
+                                       f"its {'.partial' if t.status == 'failed' else 'review'} "
+                                       f"name ({t.retention_error}); {where}")
+
+        # Run outcome: failure outranks unverified
+        errors = [f"{t.output_path.name}: {t.error}" for t in result.titles if t.status == "failed"]
+        if result.promotion_error:
+            errors.append(result.promotion_error)
+        if result.interrupted and not any("Interrupted" in e for e in errors):
+            errors.append("Interrupted by operator (Ctrl-C)")
+        if errors:
+            result.success = False
+            result.error_message = "; ".join(errors)
+        elif not all(t.status == "completed" for t in result.titles):
+            result.success = False
+            result.unverified = True
+            result.unverified_reason = "; ".join(
+                f"{t.output_path.name}: {t.duration_check_reason}"
+                for t in result.titles if t.status == "unverified")
+        self._log_title_outcomes(result)
         return result
 
-    def _quarantine_partial(self, path: Path, display_base: Optional[Path] = None) -> Optional[Path]:
-        """Rename a partial/failed output so it can't pass for a finished
-        access copy. Named from the run's shared failure token (and the final
-        output's stem, not the temp name) so all artifacts of one failed
-        attempt group together and retries never overwrite evidence."""
-        if not path.exists():
-            return None
-        base = display_base or path
-        token = self._get_failure_token()
-        marked = path.with_name(f"{base.stem}_{token}.mp4.partial")
+    def _finish_titlesets(self, result: ConversionResult):
+        """Deferred promotion: the ISO's MP4s get their final names only when
+        every planned titleset passed its check. Otherwise nothing is promoted,
+        existing final files are left as they are, and each checked output
+        (unverified, or passed but held) is kept as a review copy."""
+        titles = result.titles
+        if not result.interrupted and all(
+                t.status == "encoded" and t.duration_check == "passed" for t in titles):
+            self._promote_titlesets(result)
+
+        remaining = [t for t in titles if t.status == "encoded"]
+        if not remaining:
+            return
+        if result.promotion_error:
+            why = f"promotion stopped partway ({result.promotion_error})"
+        else:
+            blockers = []
+            for t in titles:
+                if t.status == "failed":
+                    blockers.append(f"{t.output_path.name} failed")
+                elif t.status == "not_attempted":
+                    blockers.append(f"{t.output_path.name} was not attempted")
+                elif t.status == "encoded" and t.duration_check != "passed":
+                    blockers.append(f"{t.output_path.name} is unverified")
+            if result.interrupted:
+                blockers.append("the run was interrupted")
+            why = ", ".join(blockers)
+        for title in remaining:
+            if title.duration_check == "passed":
+                title.status = "held"
+                title.hold_reason = f"duration check passed, but not promoted: {why}"
+            else:
+                title.status = "unverified"
+            # Until it is moved, the output is wherever it was encoded
+            title.retained_path, title.retained_as = title.temp_path, "encoding_temp"
+        for title in remaining:
+            try:
+                self._retain_attempt(title, title.temp_path, "unverified")
+            except KeyboardInterrupt:
+                result.interrupted = True
+                log(colorize("red", "Interrupted while keeping review copies; "
+                                    "the rest stay at their temporary names."))
+                break
+
+    def _promote_titlesets(self, result: ConversionResult):
+        """Give every passed titleset its final name, in plan order.
+
+        This is not one atomic transaction: if a rename fails or is
+        interrupted, promotion stops, the run fails and the records name
+        exactly which final files this run changed. There is no rollback."""
+        if self.run:
+            self.run.mark("promotion")
+        for title in result.titles:
+            existed = os.path.lexists(title.output_path)
+            try:
+                os.replace(title.temp_path, title.output_path)
+            except KeyboardInterrupt:
+                result.interrupted = True
+                if not os.path.lexists(title.temp_path):  # the rename completed first
+                    self._mark_promoted(title, existed)
+                result.promotion_error = "Interrupted by operator (Ctrl-C) during promotion"
+                break
+            except OSError as e:
+                result.promotion_error = (f"{title.output_path.name}: could not be promoted "
+                                          f"to its final name: {e}")
+                break
+            self._mark_promoted(title, existed)
+        else:
+            return
+        log(colorize("red", f"Promotion stopped: {result.promotion_error}"))
+        changed = result.canonical_files_changed
+        if changed:
+            names = ", ".join(p.name for p in changed)
+            old_records = [p.name for p in (self.config.manifest_path, self.config.log_path)
+                           if p.exists()]
+            if old_records:
+                result.warnings.append(
+                    f"this run replaced or created {names} but stopped before writing its "
+                    f"own records: the existing {' and '.join(old_records)} describe an "
+                    f"earlier run and no longer match {'it' if len(changed) == 1 else 'them'}")
+            else:
+                result.warnings.append(
+                    f"this run replaced or created {names} but stopped before writing its "
+                    f"own records: no canonical manifest describes "
+                    f"{'it' if len(changed) == 1 else 'them'} (see this run's failure records)")
+
+    @staticmethod
+    def _mark_promoted(title: TitleOutput, existed: bool):
+        title.promoted_this_run = True
+        title.replaced_existing_canonical = existed
+        title.status = "completed"
+        title.temp_path = None
+
+    def _retain_attempt(self, title: TitleOutput, path: Path, kind: str):
+        """Keep this run's output for a titleset under a non-clobbering name.
+
+        kind "failed"     -> <stem>_failed-<token>.mp4.partial
+             "unverified" -> <stem>_unverified-<token>.mp4.unverified
+                             (a review copy, not a deliverable)
+        The name is reserved with an exclusive create first, so an existing
+        file is never replaced; a taken name gets another random suffix. If
+        the move fails, only this attempt's own empty reservation is removed
+        and the output stays where it is; the record names its real location.
+        Sets title.retained_path / retained_as / retention_error."""
+        title.retained_path, title.retained_as, title.retention_error = None, None, None
+        if not os.path.lexists(path):
+            return
+        # Truthful even if interrupted below: until moved, it is still here
+        title.retained_path, title.retained_as = path, "encoding_temp"
+        extension = ".mp4.partial" if kind == "failed" else ".mp4.unverified"
+        base = f"{title.output_path.stem}_{self._run_token(kind)}"
+        error = f"no free name found after {RETENTION_ATTEMPTS} attempts"
+        for attempt in range(RETENTION_ATTEMPTS):
+            name = f"{base}{extension}" if attempt == 0 else f"{base}-{uuid4().hex[:6]}{extension}"
+            target = path.with_name(name)
+            try:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                continue
+            except OSError as e:
+                error = f"could not reserve {name}: {e}"
+                break
+            try:
+                reserved = os.fstat(fd)
+            finally:
+                os.close(fd)
+            try:
+                os.replace(path, target)
+            except BaseException as e:
+                leftover = self._remove_reservation(target, reserved)
+                if not isinstance(e, OSError):
+                    raise
+                error = f"could not move it to {name}: {e}{leftover}"
+                break
+            title.retained_path = target
+            title.retained_as = "partial" if kind == "failed" else "review_copy"
+            log(colorize("yellow", f"{title.output_path.name}: kept as {target.name}"
+                                   + ("" if kind == "failed" else " (review copy, not a deliverable)")))
+            return
+        title.retention_error = error
+        if not os.path.lexists(path):
+            title.retained_path, title.retained_as = None, None
+        log(colorize("yellow", f"Warning: {title.output_path.name}: {error}; "
+                               f"the output stays at {path}"))
+
+    @staticmethod
+    def _remove_reservation(target: Path, reserved: os.stat_result) -> str:
+        """Delete this attempt's own empty placeholder, never anything else.
+        Returns a note for the record if a placeholder had to be left."""
         try:
-            path.rename(marked)
+            current = os.lstat(target)
+        except FileNotFoundError:
+            return ""
         except OSError as e:
-            # Same filesystem condition that failed the run can block the
-            # rename too; leave the temp where it is and point records at it
-            log(colorize("yellow", f"Warning: could not quarantine partial {path.name}: {e}"))
-            return path
-        log(colorize("yellow", f"Partial output renamed to: {marked.name}"))
-        return marked
+            return f" (could not check the empty placeholder {target.name}: {e})"
+        if not ((current.st_dev, current.st_ino) == (reserved.st_dev, reserved.st_ino)
+                and stat.S_ISREG(current.st_mode) and current.st_size == 0):
+            return ""  # not our placeholder any more: leave it alone
+        try:
+            os.unlink(target)
+        except OSError as e:
+            return f" (an empty placeholder {target.name} could not be removed: {e})"
+        return ""
+
+    def _log_title_outcomes(self, result: ConversionResult):
+        """One line per titleset: what the check found and where the file is"""
+        log_divider("Titleset Outcomes")
+        for t in result.titles:
+            name = t.output_path.name
+            kept = f" Kept as {t.retained_path.name}." if t.retained_path else ""
+            if t.status == "completed":
+                log(colorize("green", f"{name}: duration check passed; promoted"
+                                      + (" (replaced the earlier file)" if t.replaced_existing_canonical else "")))
+            elif t.status == "held":
+                log(colorize("yellow", f"{name}: HELD — {t.hold_reason}.{kept}"))
+            elif t.status == "unverified":
+                log(colorize("yellow", f"{name}: UNVERIFIED — {t.duration_check_reason}.{kept}"))
+            elif t.status == "failed":
+                log(colorize("red", f"{name}: FAILED — {t.error}.{kept}"))
+            else:
+                log(colorize("yellow", f"{name}: not attempted"))
+            if t.retention_error:
+                log(colorize("yellow", f"  could not be kept under its review name: {t.retention_error}"))
+        if result.titles and not all(t.status == "completed" for t in result.titles):
+            if result.canonical_files_changed:
+                log(colorize("red", "Final MP4s changed by this run: "
+                                    + ", ".join(p.name for p in result.canonical_files_changed)))
+            else:
+                log(colorize("yellow", "Nothing was promoted: existing final MP4s and records "
+                                       "were left as they were."))
+            if any(t.retained_as == "review_copy" for t in result.titles):
+                log(colorize("yellow", "Review copies (*.mp4.unverified) are not deliverables."))
 
     def _encode_titleset(self, plan: TitlesetPlan, title: TitleOutput,
                          result: ConversionResult):
-        """Encode one titleset's content VOBs to MP4 and verify the output"""
+        """Encode one titleset's content VOBs to a temp MP4 and check it.
+
+        A failed attempt is kept as .partial at once. A passed or unverified
+        output stays at title.temp_path (status "encoded") until every
+        titleset is done and the promotion decision is made."""
         for vob in plan.content_vobs:
             log(colorize("cyan", f"  + {vob.name} ({format_bytes(vob.stat().st_size)})"))
 
         # Encode to a run-private temp path; the final name is only ever
-        # written by an atomic replace() after the output verifies. ffmpeg
-        # never opens the final path, so a failed retry cannot damage a
-        # pre-existing good file there.
+        # written by an atomic replace() after every titleset of the ISO
+        # passes. ffmpeg never opens the final path, so a failed retry cannot
+        # damage a pre-existing good file there.
         while True:
             temp_path = plan.output_path.with_name(
                 f"{plan.output_path.stem}.encoding-{uuid4().hex[:6]}.mp4")
@@ -1095,7 +1641,7 @@ class ISOToMP4Converter:
                 log(colorize("red", f"ffmpeg error:\n{stderr_text}"))
                 title.status = "failed"
                 title.error = f"ffmpeg failed with return code {process.returncode}"
-                title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+                self._retain_attempt(title, temp_path, "failed")
                 return
 
         except KeyboardInterrupt:
@@ -1105,19 +1651,20 @@ class ISOToMP4Converter:
             title.encode_time = time.time() - encode_start
             title.status = "failed"
             title.error = "Interrupted by operator (Ctrl-C)"
-            title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+            self._retain_attempt(title, temp_path, "failed")
             raise
         except Exception as e:
             title.encode_time = time.time() - encode_start
             title.status = "failed"
             title.error = str(e)
-            title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+            self._retain_attempt(title, temp_path, "failed")
             return
 
-        # Post-encode verification and promotion share the encode's failure
-        # handling: any error here fails the title, quarantines the temp,
-        # and flows into the normal failure records (it must never escape
-        # the record machinery).
+        # Post-encode checks share the encode's failure handling: any error
+        # here fails the title, keeps the temp as .partial, and flows into
+        # the normal failure records (it must never escape the record
+        # machinery).
+        name = plan.output_path.name
         stage = "verification"
         try:
             if not temp_path.exists():
@@ -1126,46 +1673,40 @@ class ISOToMP4Converter:
                 return
 
             title.output_size = temp_path.stat().st_size
+            if title.output_size == 0:
+                title.status = "failed"
+                title.error = "Output file is empty"
+                log(colorize("red", f"{name}: {title.error}"))
+                self._retain_attempt(title, temp_path, "failed")
+                return
             title.video_duration = get_video_duration(temp_path)
 
-            # Record what was actually mapped (closes the loop on stream loss)
+            # Record what was actually mapped (closes the loop on stream loss);
+            # None = the probe failed, as distinct from a probe finding no video
             output_counts = probe_stream_counts(temp_path)
-            title.mapped_video_streams = output_counts.get("video", 0)
-            title.mapped_audio_streams = output_counts.get("audio", 0)
-            if title.source_audio_streams and title.mapped_audio_streams < title.source_audio_streams:
-                result.warnings.append(
-                    f"{plan.output_path.name}: only {title.mapped_audio_streams} of "
-                    f"{title.source_audio_streams} source audio stream(s) mapped")
+            if output_counts is not None:
+                title.mapped_video_streams = output_counts["video"]
+                title.mapped_audio_streams = output_counts["audio"]
+                if title.source_audio_streams and title.mapped_audio_streams < title.source_audio_streams:
+                    result.warnings.append(
+                        f"{name}: only {title.mapped_audio_streams} of "
+                        f"{title.source_audio_streams} source audio stream(s) mapped")
 
-            # Completeness guard. A truncated or unprovable encode must FAIL the
-            # title before promotion — never pass as a warning. Quarantine the
-            # temp and return so the normal failure records pick it up.
-            name = plan.output_path.name
-            if title.video_duration is None:
-                # We couldn't measure the output at all — can't confirm length.
-                result.warnings.append(
-                    f"{name}: output duration unprobeable — encode length not confirmed")
-            elif title.expected_duration and title.video_duration < title.expected_duration * 0.95:
+            # Duration check. A known truncation or missing video FAILS the
+            # title; a check that cannot be completed leaves it UNVERIFIED.
+            # Neither is promoted (see _finish_titlesets).
+            (title.duration_check, title.duration_check_reason,
+             title.duration_tolerance) = duration_check(
+                title.expected_duration,
+                title.expectation.reason if title.expectation else None,
+                title.video_duration,
+                None if output_counts is None else output_counts["video"])
+            if title.duration_check == "failed":
                 title.status = "failed"
-                title.error = (f"output duration {format_timecode(title.video_duration)} is >5% "
-                               f"shorter than expected {format_timecode(title.expected_duration)} "
-                               f"— truncated encode")
+                title.error = title.duration_check_reason
                 log(colorize("red", f"{name}: {title.error}"))
-                title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+                self._retain_attempt(title, temp_path, "failed")
                 return
-            elif not title.expected_duration_complete and len(plan.content_vobs) > 1:
-                # Some VOB durations were unprobeable on a multi-VOB titleset, so a
-                # dropped segment would be invisible. We cannot prove the encode is
-                # complete — treat that as a failure, not a warning.
-                title.status = "failed"
-                title.error = ("duration comparison incomplete; cannot prove complete encode "
-                               "(one or more source VOBs were unprobeable on a multi-VOB title)")
-                log(colorize("red", f"{name}: {title.error}"))
-                title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
-                return
-            elif title.expected_duration is None:
-                result.warnings.append(
-                    f"{name}: duration comparison unavailable (source unprobeable)")
 
             # Calculate checksums (MD5 + SHA-256 in one read)
             stage = "checksum"
@@ -1175,30 +1716,27 @@ class ISOToMP4Converter:
             title.md5, title.sha256 = calculate_checksums(temp_path)
             if title.md5 is None:
                 result.warnings.append(
-                    f"{plan.output_path.name}: checksum calculation failed — no fixity recorded")
-
-            # Everything verified — atomically promote the temp onto the final
-            # name (replaces an operator-approved overwrite target in one step)
-            stage = "promotion"
-            temp_path.replace(plan.output_path)
+                    f"{name}: checksum calculation failed — no fixity recorded")
 
         except KeyboardInterrupt:
             title.status = "failed"
             title.error = f"Interrupted by operator (Ctrl-C) during post-encode {stage}"
-            title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+            self._retain_attempt(title, temp_path, "failed")
             raise
         except Exception as e:
             title.status = "failed"
             title.error = f"post-encode {stage} failed: {e}"
-            log(colorize("red", f"{plan.output_path.name}: {title.error}"))
-            title.partial_path = self._quarantine_partial(temp_path, plan.output_path)
+            log(colorize("red", f"{name}: {title.error}"))
+            self._retain_attempt(title, temp_path, "failed")
             return
 
-        title.status = "completed"
-        log(colorize("green", f"{plan.output_path.name} complete "
-                              f"({format_bytes(title.output_size)}, "
-                              f"{format_timecode(title.video_duration) if title.video_duration else 'duration n/a'}, "
-                              f"{title.mapped_audio_streams} audio track(s))"))
+        title.temp_path = temp_path
+        title.status = "encoded"
+        colour = "green" if title.duration_check == "passed" else "yellow"
+        log(colorize(colour, f"{name} encoded ({format_bytes(title.output_size)}, "
+                             f"{format_timecode(title.video_duration) if title.video_duration else 'duration n/a'}, "
+                             f"{format_count(title.mapped_audio_streams)} audio track(s)); duration check "
+                             f"{title.duration_check}: {title.duration_check_reason}"))
     
     def _generate_summary(self, result: ConversionResult):
         """Generate timing and summary information"""
@@ -1212,7 +1750,7 @@ class ISOToMP4Converter:
                 duration_str = format_timecode(t.video_duration) if t.video_duration else "n/a"
                 log(colorize("cyan", f"  {t.output_path.name}: {t.status}, "
                                      f"{format_bytes(t.output_size)}, {duration_str}, "
-                                     f"{t.mapped_audio_streams} audio track(s)"))
+                                     f"{format_count(t.mapped_audio_streams)} audio track(s)"))
         log(colorize("cyan", f"Source size: {format_bytes(result.source_size)}"))
         log(colorize("cyan", f"Output size: {format_bytes(result.output_size) if result.output_size else 'N/A'}"))
         
@@ -1237,8 +1775,8 @@ class ISOToMP4Converter:
                          is_error: bool = False, failure_token: Optional[str] = None):
         """Create formatted log file.
 
-        Failure/aborted logs are written under the run's failure token so a
-        failed retry never overwrites the log a prior success manifest
+        Failure/aborted/unverified logs are written under the run's token so
+        such a retry never overwrites the log a prior success manifest
         references (nor an earlier failure's log)."""
         if dry_run:
             log_path = self.config.dry_run_log_path
@@ -1257,7 +1795,8 @@ class ISOToMP4Converter:
             if dry_run:
                 f.write("ISO TO MP4 ACCESS COPY CONVERSION LOG (DRY RUN)\n")
             elif is_error:
-                f.write(f"ISO TO MP4 ACCESS COPY CONVERSION LOG ({'ABORTED' if result.aborted else 'ERROR'})\n")
+                header = 'ABORTED' if result.aborted else ('UNVERIFIED' if result.unverified else 'ERROR')
+                f.write(f"ISO TO MP4 ACCESS COPY CONVERSION LOG ({header})\n")
             elif result.skipped:
                 f.write("ISO TO MP4 ACCESS COPY CONVERSION LOG (SKIPPED)\n")
             else:
@@ -1280,6 +1819,8 @@ class ISOToMP4Converter:
                 status = 'SKIPPED'
             elif result.success:
                 status = 'SUCCESS (WITH WARNINGS)' if result.warnings else 'SUCCESS'
+            elif result.unverified:
+                status = 'UNVERIFIED (nothing promoted)'
             else:
                 status = 'FAILED'
             f.write(f"Status:           {status}\n")
@@ -1287,6 +1828,15 @@ class ISOToMP4Converter:
                 f.write(f"Skip Reason:      {result.skip_reason}\n")
             if result.error_message:
                 f.write(f"Error:            {result.error_message}\n")
+            if result.unverified_reason:
+                f.write(f"Unverified:       {result.unverified_reason}\n")
+            if result.titles and not dry_run and not result.success:
+                changed = result.canonical_files_changed
+                f.write("Final MP4s:       "
+                        + (("changed by this run: " + ", ".join(p.name for p in changed))
+                           if changed else "none promoted or changed by this run") + "\n")
+                if any(t.retained_as == "review_copy" for t in result.titles):
+                    f.write("Note:             review copies (*.mp4.unverified) are not deliverables\n")
             for warning in result.warnings:
                 f.write(f"Warning:          {warning}\n")
             f.write("\n")
@@ -1312,7 +1862,7 @@ class ISOToMP4Converter:
             
             f.write("OUTPUT INFORMATION\n")
             f.write("-" * 20 + "\n")
-            f.write(f"MP4 File:         {result.mp4_path.name if result.mp4_path else 'N/A (conversion did not complete)'}\n")
+            f.write(f"MP4 File:         {result.mp4_path.name if result.mp4_path else 'N/A (no final MP4 promoted by this run)'}\n")
             f.write(f"MP4 Path:         {result.mp4_path if result.mp4_path else 'N/A'}\n")
             f.write(f"MP4 Size:         {format_bytes(result.output_size) if result.output_size else 'N/A'}\n")
             
@@ -1337,11 +1887,36 @@ class ISOToMP4Converter:
                     f.write(f"  Size:     {format_bytes(t.output_size)}\n")
                     f.write(f"  Duration: {duration_str}")
                     if t.expected_duration:
-                        f.write(f" (expected ~{format_timecode(t.expected_duration)})")
+                        f.write(f" (expected ~{format_timecode(t.expected_duration)}, "
+                                f"from {'IFO' if t.expected_duration_source == 'ifo' else 'VOB probes'})")
                     f.write("\n")
-                    f.write(f"  Audio:    {t.mapped_audio_streams} of {t.source_audio_streams if t.source_audio_streams is not None else '?'} source track(s) mapped\n")
+                    if t.duration_check:
+                        f.write(f"  Check:    {t.duration_check} — {t.duration_check_reason}\n")
+                    if t.expectation and t.expectation.ifo and t.expectation.ifo.status != "used":
+                        ifo = t.expectation.ifo
+                        advisory = (f" ({format_timecode(ifo.seconds)}, not used)"
+                                    if ifo.seconds else "")
+                        f.write(f"  IFO:      {ifo.status}{advisory} — {ifo.reason}\n")
+                    f.write(f"  Audio:    {format_count(t.mapped_audio_streams)} of "
+                            f"{format_count(t.source_audio_streams)} source track(s) mapped\n")
                     f.write(f"  MD5:      {t.md5}\n")
                     f.write(f"  SHA-256:  {t.sha256}\n")
+                    if t.status not in ("planned", "not_attempted"):
+                        f.write(f"  Intended: {t.output_path}\n")
+                        promoted = "no"
+                        if t.promoted_this_run:
+                            promoted = ("yes, replacing an earlier file" if t.replaced_existing_canonical
+                                        else "yes (new file)")
+                        f.write(f"  Promoted: {promoted}\n")
+                    if t.retained_path:
+                        kind = {"partial": "failed attempt",
+                                "review_copy": "review copy, not a deliverable",
+                                "encoding_temp": "left at its temporary name"}.get(t.retained_as, "")
+                        f.write(f"  Kept as:  {t.retained_path} ({kind})\n")
+                    if t.retention_error:
+                        f.write(f"  Not moved: {t.retention_error}\n")
+                    if t.hold_reason:
+                        f.write(f"  Held:     {t.hold_reason}\n")
                     if t.error:
                         f.write(f"  Error:    {t.error}\n")
                 f.write("\n")
@@ -1393,7 +1968,10 @@ class ISOToMP4Converter:
             "note": ("Titleset-aware (grouped by VTS number): a single titleset may still "
                      "contain multiple programs/PGCs/angles — this is not DVD-player title "
                      "parsing. Subtitle streams are recorded but deliberately not encoded "
-                     "(DVD bitmap subtitles are not MP4-compatible)."),
+                     "(DVD bitmap subtitles are not MP4-compatible). A passed duration "
+                     "check means only that the output's length matches the expectation "
+                     "within the tolerance. Review copies (*.mp4.unverified) are not "
+                     "deliverables."),
             "outputs": [
                 {
                     "vts_number": t.vts_number,
@@ -1403,17 +1981,43 @@ class ISOToMP4Converter:
                     "size_bytes": t.output_size,
                     "duration_seconds": t.video_duration,
                     "expected_duration_seconds": t.expected_duration,
+                    "duration_check": self._duration_check_record(t),
                     "encode_time_seconds": t.encode_time,
                     "md5_checksum": t.md5,
                     "sha256_checksum": t.sha256,
                     "source_audio_streams": t.source_audio_streams,
                     "source_subtitle_streams": t.source_subtitle_streams,
+                    "mapped_video_streams": t.mapped_video_streams,
                     "mapped_audio_streams": t.mapped_audio_streams,
                     "final_intended_path": str(t.output_path),
-                    "partial_renamed_to": str(t.partial_path) if t.partial_path else None,
+                    "promoted_this_run": t.promoted_this_run,
+                    "replaced_existing_canonical": t.replaced_existing_canonical,
+                    "retained_path": str(t.retained_path) if t.retained_path else None,
+                    "retained_as": t.retained_as,
+                    "retention_error": t.retention_error,
+                    "hold_reason": t.hold_reason,
+                    "partial_renamed_to": (str(t.retained_path)
+                                           if t.retained_as == "partial" else None),
                     "error": t.error
                 } for i, t in enumerate(result.titles)
             ]
+        }
+
+    @staticmethod
+    def _duration_check_record(t: TitleOutput) -> Dict[str, Any]:
+        """The duration check and the evidence behind it, for one titleset"""
+        e = t.expectation
+        return {
+            "result": t.duration_check,
+            "reason": t.duration_check_reason,
+            "expected_seconds": t.expected_duration,
+            "expected_source": t.expected_duration_source,
+            "output_seconds": t.video_duration,
+            "tolerance_seconds": t.duration_tolerance,
+            "ifo": ({"status": e.ifo.status, "seconds": e.ifo.seconds, "reason": e.ifo.reason}
+                    if e and e.ifo else None),
+            "vob_probe": ({"seconds": e.vob_probe_seconds, "complete": e.vob_probe_complete}
+                          if e and e.vob_probe_complete is not None else None),
         }
 
     def _create_manifest(self, result: ConversionResult):
@@ -1439,7 +2043,9 @@ class ISOToMP4Converter:
             "conversion_status": {
                 "overall_status": (("success_with_warnings" if result.warnings else "success")
                                    if result.success else "failed"),
-                "mp4_created": result.mp4_path is not None and result.mp4_path.exists() if result.mp4_path else False,
+                # Created or replaced by THIS run (never inferred from a file existing)
+                "mp4_created": bool(result.titles) and result.titles[0].promoted_this_run,
+                "canonical_files_changed": [str(p) for p in result.canonical_files_changed],
                 "skipped": result.skipped,
                 "skip_reason": result.skip_reason,
                 "warnings": result.warnings,
@@ -1580,14 +2186,14 @@ class ISOToMP4Converter:
         log(colorize("cyan", f"Skip manifest saved to: {self.config.skip_manifest_path}"))
     
     def _create_error_manifest(self, result: ConversionResult, failure_token: str):
-        """Create manifest for failed or operator-aborted conversions.
+        """Create manifest for failed, operator-aborted or unverified conversions.
 
         Carries the full per-titleset record so a mixed run (one title
-        completed, another failed) loses nothing machine-readable. Written
-        under the run's failure token so retries never overwrite prior
+        passed, another failed or unverified) loses nothing machine-readable.
+        Written under the run's token so retries never overwrite prior
         evidence (the success manifest or earlier failures)."""
         now = datetime.datetime.now()
-        status = "aborted" if result.aborted else "error"
+        status = "aborted" if result.aborted else ("unverified" if result.unverified else "error")
 
         manifest = {
             "conversion_metadata": {
@@ -1604,7 +2210,10 @@ class ISOToMP4Converter:
                 "skipped": False,
                 "interrupted": result.interrupted,
                 "warnings": result.warnings,
-                "error_message": result.error_message
+                "error_message": result.error_message,
+                "unverified_reason": result.unverified_reason,
+                "promotion_error": result.promotion_error,
+                "canonical_files_changed": [str(p) for p in result.canonical_files_changed]
             },
 
             "output_files": {
@@ -1630,7 +2239,11 @@ class ISOToMP4Converter:
             "archival_notes": {
                 "note": ("Conversion aborted by operator before any encoding"
                          if result.aborted else
-                         "This ISO encountered an error during processing"),
+                         ("Nothing was promoted: at least one titleset could not be "
+                          "verified. Existing final MP4s and records were left as they "
+                          "were; review copies (*.mp4.unverified) are not deliverables."
+                          if result.unverified else
+                          "This ISO encountered an error during processing")),
                 "project": "Johnson Publishing Company Archive (JPCA)"
             }
         }
@@ -1641,7 +2254,8 @@ class ISOToMP4Converter:
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
 
-        log(colorize("cyan", f"{'Aborted' if result.aborted else 'Error'} manifest saved to: {manifest_path}"))
+        label = "Aborted" if result.aborted else ("Unverified" if result.unverified else "Error")
+        log(colorize("cyan", f"{label} manifest saved to: {manifest_path}"))
     
     def _get_skip_recommendation(self, analysis: Optional[DiscContentAnalysis],
                                  skip_reason: Optional[str] = None) -> str:
@@ -1747,7 +2361,7 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
     
     if not iso_files:
         log(colorize("yellow", f"No ISO files found in: {iso_dir}"))
-        return {"processed": 0, "success": 0, "skipped": 0, "failed": 0}
+        return {"processed": 0, "success": 0, "skipped": 0, "unverified": 0, "failed": 0}
     
     log_divider("Batch Processing")
     log(colorize("cyan", f"Found {len(iso_files)} ISO files"))
@@ -1757,6 +2371,7 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
         "success": 0,
         "would_convert": 0,  # Dry-run VIDEO_TS discs
         "skipped": 0,        # Non-VIDEO_TS discs
+        "unverified": 0,     # Nothing failed, but nothing promoted either
         "failed": 0,
         "details": []
     }
@@ -1782,8 +2397,11 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
         results["processed"] += 1
         
         # Failure outranks skipped: a run can end up failed-while-skip-shaped
-        # (e.g. its skip record could not be written) and must count as failed
-        if not result.success:
+        # (e.g. its skip record could not be written) and must count as failed.
+        # An unverified run is never also failed (failure outranks it).
+        if result.unverified:
+            results["unverified"] += 1
+        elif not result.success:
             results["failed"] += 1
         elif result.skipped:
             # Differentiate dry-run skips (VIDEO_TS that would convert) from actual skips
@@ -1799,6 +2417,7 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
             "success": result.success,
             "skipped": result.skipped,
             "aborted": result.aborted,
+            "unverified": result.unverified,
             "error": result.error_message,
             "skip_reason": result.skip_reason
         })
@@ -1816,6 +2435,9 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
         log(colorize("green", f"Successfully converted: {results['success']}"))
     if results["skipped"] > 0:
         log(colorize("yellow", f"Skipped (no convertible content): {results['skipped']}"))
+    if results["unverified"] > 0:
+        log(colorize("yellow", f"Unverified (nothing promoted; review copies kept): "
+                               f"{results['unverified']}"))
     log(colorize("red", f"Failed: {results['failed']}"))
     
     return results
@@ -1874,6 +2496,25 @@ def print_help():
   18 = Visually lossless (script default)
   23 = ffmpeg default (not this script's default)
   28 = Smaller file, some quality loss
+
+{colorize('yellow', 'DURATION CHECK AND OUTCOMES:')}
+  Each titleset's MP4 is checked against its expected duration (the IFO
+  playback time for one simple straight-through layout, else complete VOB
+  probes), with a tolerance of 5% but at least 1 second.
+  • {colorize('green', 'passed:')}      within the tolerance
+  • {colorize('yellow', 'unverified:')}  check not possible (an output probe failed, no usable
+                 expected duration) or longer than expected: kept as
+                 *_unverified-<token>.mp4.unverified — NOT a deliverable
+  • {colorize('red', 'failed:')}      ffmpeg error, empty or video-less output, or shorter
+                 than expected: kept as *_failed-<token>.mp4.partial
+  MP4s get their final names only if EVERY titleset of the ISO passes;
+  otherwise nothing is promoted, existing MP4s and records stay as they
+  are, and passed titlesets are held as review copies too. A run that
+  fails once promotion has begun (a rename stops partway, or the records
+  cannot be written afterwards) keeps the MP4s it promoted: no rollback.
+  Exit status: 0 converted, skipped or successful dry run; 1 any failure,
+  unverified result or abort, or arguments without -i or --batch; 2 an
+  option or value rejected by the argument parser.
 
 {colorize('yellow', 'DISC TYPES HANDLED:')}
   • {colorize('green', 'DVD-Video (VIDEO_TS):')} Converted to MP4
@@ -1985,7 +2626,7 @@ def main():
             audio_bitrate=args.audio_bitrate
         )
         
-        if results["failed"] > 0:
+        if results["failed"] > 0 or results.get("unverified", 0) > 0:
             sys.exit(1)
         sys.exit(0)
     
@@ -2037,6 +2678,10 @@ def main():
         else:
             log(colorize("green", "Conversion completed successfully!"))
             sys.exit(0)
+    elif result.unverified:
+        log(colorize("yellow", "Unverified: nothing promoted; review copies kept "
+                               f"(not deliverables): {result.unverified_reason}"))
+        sys.exit(1)
     elif result.aborted:
         log(colorize("yellow", f"Aborted: {result.error_message}"))
         sys.exit(1)
