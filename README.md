@@ -8,6 +8,7 @@ This repository contains two Python scripts for a complete optical disc digitiza
 |--------|---------|
 | **`makeiso.py`** | Creates bit-perfect ISO preservation masters from physical discs |
 | **`makeiso-video.py`** | Converts DVD-Video ISOs to MP4 access copies |
+| **`verifyiso.py`** | Re-verifies existing ISO masters against their manifest hashes — no discs needed |
 
 Part of the Johnson Publishing Company Archive (JPCA) digitization initiative—a collaboration between the [Getty Research Institute](https://www.getty.edu/projects/johnson-publishing-company-archive/) and the [Smithsonian National Museum of African American History and Culture](https://www.searchablemuseum.com/johnson-publishing-company-image-power/).
 
@@ -38,6 +39,7 @@ Part of the Johnson Publishing Company Archive (JPCA) digitization initiative—
   - [Disc Type Handling](#disc-type-handling)
   - [Encoding Defaults](#encoding-defaults)
   - [Output Files](#output-files-1)
+- [verifyiso.py — Collection Fixity Verification](#verifyisopy--collection-fixity-verification)
 - [Troubleshooting](#troubleshooting)
 - [Technical Details](#technical-details)
   - [How Verification Works](#how-verification-works)
@@ -81,13 +83,13 @@ This toolkit provides a two-stage workflow for optical disc digitization:
 ### makeiso.py (Preservation)
 
 - **Bit-perfect copying** — Reads from raw device (`/dev/rdiskN`) for true sector-by-sector backup
-- **Parallel verification** — MD5 checksums calculated simultaneously during ISO creation
+- **Independent verification** — source hashed in-stream during creation, then the written ISO is re-read from disk and compared
 - **Real-time progress** — Live display of speed, elapsed time, and ETA
 - **Comprehensive logging** — Detailed operation log with timestamps
 - **JSON manifest** — Machine-readable metadata for archival systems
 - **Directory tree capture** — Complete file listing from source disc
 - **ISO structural analysis** — Validates ISO 9660/UDF structure via isolyzer
-- **Automatic disc handling** — Unmounts before backup, remounts and ejects after
+- **Automatic disc handling** — Unmounts before backup, ejects after
 
 ### makeiso-video.py (Access)
 
@@ -95,7 +97,7 @@ This toolkit provides a two-stage workflow for optical disc digitization:
 - **Intelligent skipping** — Gracefully handles non-video discs (data DVDs, photo discs, DVD-Audio)
 - **High-quality output** — Default CRF 18 produces visually lossless MP4 files
 - **Batch processing** — Process entire directories of ISOs with a single command
-- **Checksum verification** — MD5 hash of output for integrity verification
+- **Checksum recording** — MD5 and SHA-256 hashes of every output for fixity
 - **Comprehensive logging** — Detailed logs and JSON manifests matching preservation conventions
 
 ---
@@ -315,7 +317,7 @@ If all commands return version information, you're ready to go!
 
 Creates archival-quality ISO images from optical discs while simultaneously verifying data integrity. Designed for digital preservation workflows where verification and documentation are critical.
 
-The script reads directly from the raw device (bypassing filesystem caching) and calculates MD5 checksums during the copy process—eliminating the need for a separate verification pass and reducing total backup time by approximately 50%.
+The script reads directly from the raw device (bypassing filesystem caching) and calculates the source MD5 and SHA-256 checksums during the copy. After the copy completes, it verifies the backup by re-reading the written ISO from disk and comparing both hashes against the source — so verification reflects the bytes that actually landed on disk, not the in-memory stream.
 
 ### Quick Start
 
@@ -363,7 +365,7 @@ sudo python3 makeiso.py [options]
 Options:
   -h, --help              Show help message and exit
   --dry-run               Run without creating ISO (test mode)
-  --no-verification       Skip recording of MD5 verification results (checksums are still calculated during creation)
+  --force                 Skip the optical-media safety check (allows imaging devices diskutil does not report as optical)
   --filename NAME         ISO filename (without .iso extension)
   --dir PATH              Output directory (supports ~)
   --operator NAME         Operator name or initials for logging
@@ -415,11 +417,11 @@ The script executes the following steps:
 └─────────────────────────────────────────────────────────────────┘
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  4. ISO CREATION + VERIFICATION (parallel)                      │
+│  4. ISO CREATION + VERIFICATION (two-phase)                     │
 │     • Read from raw device (/dev/rdiskN)                        │
 │     • Write to ISO file                                         │
-│     • Calculate MD5 of written data                             │
-│     • Calculate MD5 of source stream                            │
+│     • Calculate MD5 + SHA-256 of source stream                  │
+│     • Flush to disk, re-read ISO, verify hashes                 │
 │     • Display real-time progress                                │
 └─────────────────────────────────────────────────────────────────┘
                               ▼
@@ -432,7 +434,6 @@ The script executes the following steps:
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  6. FINALIZATION                                                │
-│     • Remount disc                                              │
 │     • Eject disc                                                │
 │     • Generate formatted log file                               │
 │     • Generate JSON manifest                                    │
@@ -461,6 +462,50 @@ For a backup with filename `JPC_AV_00001`, the script creates a directory contai
 | `*_tree.txt` | Complete directory listing with file sizes, permissions, and dates |
 | `*_isolyzer.xml` | ISO 9660/UDF structural validation from isolyzer tool |
 
+#### Replacing an Existing Bundle
+
+If the folder already holds a bundle, you are asked before anything starts. Nothing is touched until the new copy has verified. Then the current bundle is moved, unchanged and under its own file names, into a new folder, and the new bundle is published in its place. (A `--dry-run` makes no copy and archives nothing: it writes its tree listing, log and manifest over the existing ones in place, so do not dry-run into an existing bundle's folder.)
+
+```
+~/Backups/JPC_AV_00001/
+├── JPC_AV_00001.iso                                  # the new master
+├── JPC_AV_00001_manifest.json                        # ... and the rest of the new bundle
+└── JPC_AV_00001_overwritten-20261024T101500-7b01de/  # the bundle it replaced
+    ├── JPC_AV_00001.iso
+    ├── JPC_AV_00001_manifest.json
+    └── ...
+```
+
+Each archived manifest still names its own ISO, so `verifyiso.py` checks every retained master against its own hashes. Inside archived records only the file names are current: their full paths (output directory, final destination) still name the canonical location, which now holds the new master. `makeiso-video.py --batch` skips these folders.
+
+The few renames that archive the old bundle and publish the new one run with Ctrl-C held, so Ctrl-C cannot stop them halfway. If a rename fails, they are rolled back as far as the filesystem allows. The rollback is best effort and never replaces a file. If this run's files cannot all be moved out of the canonical names, nothing is restored. If a restore fails partway, the files already restored are moved back into the archive folder. So after a single failing rename, a bundle that was archived whole stays complete in its archive folder, where each manifest still names its own ISO. If renames keep failing, files can be left split between canonical names and the archive folder. The failed run's records always list where each file actually is. A folder the rollback empties is removed.
+
+#### Failed Run Naming
+
+Failed or aborted runs are renamed so they can never be mistaken for finished masters. All artifacts from a failed attempt share a `failed-<timestamp>-<random>` token, and retries never overwrite them:
+
+```
+JPC_AV_00001_failed-20260612T140322-3f9a2c.iso.partial    # copy aborted partway, or a verified copy that could not be published (see its manifest)
+JPC_AV_00001_failed-20260612T140322-3f9a2c.iso.mismatch   # completed but failed verification
+JPC_AV_00001_failed-20260612T140322-3f9a2c.iso.log.txt    # log for that attempt
+JPC_AV_00001_failed-20260612T140322-3f9a2c_manifest.json  # manifest for that attempt
+JPC_AV_00001_failed-20260612T140322-3f9a2c_tree.txt       # tree listing for that attempt
+JPC_AV_00001_failed-20260612T140322-3f9a2c_isolyzer.xml   # structural analysis, if it ran
+```
+
+Successful runs use the standard names above. A failed run does not leave behind a record claiming success, except where even its rollback could not move this run's files out of the canonical names (its records then say exactly which files are where).
+
+#### Interruptions (Ctrl-C) and Recovery
+
+- **During the tree listing, unmount, copy, verification or structural analysis:** the run is recorded as failed (`Interrupted by operator (Ctrl-C)`), with its files under `failed-*` names; a complete, hash-verified copy interrupted during the analysis is kept as `.iso.partial`.
+- **During the disc eject:** recorded as the warning `disc eject interrupted by operator (Ctrl-C)` on any outcome. After a verified copy the master is kept and published as verified (`success_with_warnings`) and the run exits `130`; if the copy had failed, that failure and its exit code stand.
+- **While the run records are written:** recorded as a failed run; nothing is published.
+- **During the final renames:** Ctrl-C is held until they finish. If publication completes, the bundle and its records are final and accurate (they do not mention the Ctrl-C) and the run exits `130`. If a rename failed, the best-effort rollback runs first (see [Replacing an Existing Bundle](#replacing-an-existing-bundle)) and the run is recorded as failed.
+- **After the run is recorded** (summary, file-ownership fix): a successful run exits `130`, its bundle and records final; file ownership may not have been fixed. A failed run keeps its own exit code.
+- **In a `--dry-run`:** Ctrl-C simply stops the run, as before; nothing is recorded for it.
+
+**Only Ctrl-C is handled.** Closing the Terminal window, `kill`, `kill -9` or a power loss stops the script without clean-up, so files may be left under their canonical names, inside an `*_overwritten-*` folder, or under `attempt-*` names. Before changing anything, check each manifest's `run_id` and the `iso_filename` it names, and keep every ISO until the right one is identified. A leftover `*_attempt-*_manifest.json` belongs to an attempt whose publication did not finish; it names the canonical ISO, so if `verifyiso.py` reports `PASS` for it the canonical ISO is that attempt's master, and if `FAIL`, it is not.
+
 ### Understanding the Output
 
 #### Terminal Output
@@ -485,18 +530,26 @@ Avg Speed: 24.67MB/s
 #### Verification Output
 
 ```
-MD5 (ISO):      a1b2c3d4e5f6...
-MD5 (Raw Disk): a1b2c3d4e5f6...
-Checksum match: ISO is a true bit-for-bit copy.
+MD5 (ISO):          a1b2c3d4e5f6...
+MD5 (Raw Disk):     a1b2c3d4e5f6...
+SHA-256 (ISO):      9f8e7d6c5b4a...
+SHA-256 (Raw Disk): 9f8e7d6c5b4a...
+Checksum match: ISO on disk is a true bit-for-bit copy.
 ```
 
 #### Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| `0` | Success — backup completed and verified |
+| `0` | Success — backup completed (see note below) |
 | `1` | Failure — backup failed (see error message) |
-| `2` | Warning — backup completed but checksum mismatch detected |
+| `2` | Verification failed — written ISO does not match the source (run is marked failed) |
+| `130` | Ctrl-C was received, but the master had verified and was kept (see [Interruptions](#interruptions-ctrl-c-and-recovery); only an interrupted eject is also recorded, as a warning); a failed run keeps its own code, and a `--dry-run` just stops |
+
+> **Note:** Exit `0` covers three record states — the manifest's `overall_status` and the log header are the source of truth:
+> - `success` — verified master produced
+> - `success_with_warnings` — verified master, with a non-fatal problem recorded (e.g. a failed eject or an incomplete tree listing; this workflow is operator-attended, so these don't change the exit code)
+> - `dry_run` — `--dry-run` rehearsal; no ISO was created and nothing was verified (log header reads `DRY RUN`)
 
 ---
 
@@ -609,6 +662,7 @@ python3 makeiso-video.py -i disc.iso -o /path/to/access_copies --operator JD
 ```bash
 python3 makeiso-video.py --batch /path/to/isos --operator JD
 ```
+Batch mode skips superseded masters inside `makeiso.py` archive folders (`*_overwritten-<stamp>-<random>/`, see [Replacing an Existing Bundle](#replacing-an-existing-bundle)) and lists them; convert one explicitly with `-i`, and `-o` pointing elsewhere (otherwise its access folder is written inside the archive folder).
 
 **Preview without converting (dry run):**
 ```bash
@@ -626,13 +680,46 @@ The script automatically detects disc content and handles different types approp
 
 | Disc Type | Action | Notes |
 |-----------|--------|-------|
-| DVD-Video (VIDEO_TS) | ✅ Converted | Standard DVD movies/video content |
+| DVD-Video (VIDEO_TS) | ✅ Converted | One MP4 per titleset (see below) |
+| Menu-only VIDEO_TS | ⏭️ Skipped | No content VOBs — nothing to convert |
 | DVD-Audio (AUDIO_TS) | ⏭️ Skipped | Requires specialized audio extraction |
 | Data DVD | ⏭️ Skipped | Use file copy instead |
 | Photo/Image DVD | ⏭️ Skipped | Use file copy instead |
 | Empty/Unreadable | ⏭️ Skipped | Verify ISO integrity |
+| Analysis error (an error while reading the disc's folders, e.g. a VIDEO_TS listing that fails partway) | ❌ Failed | Nothing is planned or encoded, dry runs included; failure records are written and a batch counts it as failed |
 
 Skipped discs generate a `*_skip_manifest.json` documenting why the disc was skipped.
+
+### Titlesets: One MP4 Per Titleset
+
+DVDs group content into **titlesets** (`VTS_01_*`, `VTS_02_*`, …) — separate programs such as a main feature plus extras, or multiple episodes. The script encodes **each titleset to its own MP4**:
+
+- The lowest-numbered content titleset is the *main* title and keeps the plain name: `JPC_AV_00001.mp4`
+- Additional titlesets get suffixes matching their VTS number: `JPC_AV_00001_title02.mp4`, etc.
+- Single-titleset discs (the vast majority of the collection) produce exactly one MP4 with the same name as before.
+- The manifest's `titlesets` section records every output with its own size, duration, and checksum.
+
+> **Scope note:** grouping is *titleset-aware*, not title-aware — a single titleset can still contain multiple programs/PGCs/angles internally. This is not DVD-player-equivalent title parsing. The preservation ISO always retains the complete original structure.
+
+### Stream Handling
+
+Each encode uses explicit stream mapping (`-map 0:v:0 -map 0:a? -sn`):
+
+- **All audio tracks** on the disc are carried into the MP4 as selectable tracks (e.g. narration and ambient audio both survive).
+- **Subtitles are not encoded** — DVD bitmap subtitles are not MP4-compatible; their presence is recorded in the manifest, and they remain intact in the preservation ISO.
+- The manifest records both the source stream counts and the streams actually mapped into each output, plus a best-effort duration comparison that warns if an output is >5% shorter than expected (possible truncation).
+
+### Failed Conversion Naming
+
+Encodes write to a temporary `*.encoding-<random>.mp4` file that atomically replaces the final name only after the output verifies — a failed retry can never damage a pre-existing good MP4. All artifacts of one failed attempt share a `failed-<timestamp>-<random>` token (`aborted-…` for operator aborts) so retries never overwrite earlier evidence:
+
+```
+JPC_AV_00001_failed-20260612T150000-3f9a2c.mp4.partial   # quarantined partial encode
+JPC_AV_00001_failed-20260612T150000-3f9a2c.log.txt       # log for that attempt
+JPC_AV_00001_failed-20260612T150000-3f9a2c_manifest.json # manifest for that attempt
+```
+
+A hard kill (power loss, `kill -9`) may leave a `*.encoding-*.mp4` temp file behind, as can a filesystem failure that prevents quarantine (in that case the failure records name the leftover file). Temp files are incomplete by definition and safe to delete.
 
 ### Menu VOBs Are Intentionally Excluded
 
@@ -652,7 +739,7 @@ DVD-Video discs contain two categories of VOB files:
 
 - **Content VOBs** (`VTS_*_1.VOB`, `VTS_*_2.VOB`, etc.) — contain the actual linear video content: everything you would see by pressing Play All on the disc.
 
-The script automatically skips menu VOBs and concatenates only the content VOBs. **No video content is lost.** The full disc — including all menu structure, navigation data, logos, and interactive elements — remains intact in the preservation ISO, which can be mounted on any computer to experience the disc exactly as originally authored, menus and all.
+The script automatically skips menu VOBs and concatenates only the content VOBs, per titleset. A disc whose VIDEO_TS contains *only* menu VOBs is skipped (nothing to convert). **No video content is lost.** The full disc — including all menu structure, navigation data, logos, and interactive elements — remains intact in the preservation ISO, which can be mounted on any computer to experience the disc exactly as originally authored, menus and all.
 
 ### Encoding Defaults
 
@@ -665,7 +752,8 @@ The default encoding settings are optimized for archival access copies:
 | **Preset** | medium | Balanced speed/compression |
 | **Pixel Format** | yuv420p | Maximum compatibility |
 | **Audio Codec** | AAC | Standard audio codec |
-| **Audio Bitrate** | 192 kbps | High quality stereo audio |
+| **Audio Bitrate** | 192 kbps | High quality audio, per track |
+| **Stream Mapping** | `-map 0:v:0 -map 0:a? -sn` | First video, all audio tracks, no subtitles |
 | **Container** | MP4 | Universal playback support |
 | **Faststart** | enabled | Enables streaming/seeking |
 
@@ -715,6 +803,39 @@ For skipped ISOs (non-VIDEO_TS content):
 ```
 
 ---
+
+## verifyiso.py — Collection Fixity Verification
+
+Audits existing ISO preservation masters **without reloading any discs**: it re-hashes each ISO and compares against the source hash recorded in its manifest at imaging time. The `source_hash` was always computed by streaming the physical disc, so it is a valid fixity baseline for ISOs made by *any* version of `makeiso.py`; newer manifests' SHA-256 hashes are compared too when present.
+
+Sudo-free, and it never changes an existing file. `--csv` creates one **new** report file: its path is reserved before anything is hashed, and an existing path (a file, folder, symlink or `/dev/stdout`) or a name ending in `.iso` or `_manifest.json` is refused with exit `1`. Give each report a new name, for example with the date.
+
+```bash
+# Verify everything under a collection directory (searched recursively)
+python3 verifyiso.py /Volumes/Archive/JPC_AV
+
+# Multiple locations, with a CSV report for record-keeping
+python3 verifyiso.py /Volumes/Archive /Volumes/Backup --csv "fixity_$(date +%Y%m%d_%H%M%S).csv"
+```
+
+Every `*_manifest.json` found is examined, whatever it is called; what it is comes from its content. `makeiso.py` preservation records are checked; `makeiso-video.py` access-copy records and macOS AppleDouble (`._*`) metadata files are skipped. Masters kept in `*_overwritten-*` archive folders are checked like any other. Each manifest is reported as one of:
+
+| Status | Meaning |
+|--------|---------|
+| `PASS` | ISO hash matches the manifest (MD5, plus SHA-256 when recorded) |
+| `FAIL` | Hash mismatch — the ISO has changed since imaging (bit rot, bad copy, truncation) |
+| `MISSING_ISO` | Manifest exists but its ISO is gone |
+| `UNVERIFIABLE` | The record cannot be trusted to verify: missing or unrecognized run status, missing integrity record, missing MD5 source hash, a blank, non-text or malformed hash (including a declared SHA-256 with no SHA-256 hash), fields of the wrong type, an ISO name outside its folder, a dry-run record next to an existing ISO (a dry run replaced that master's own manifest), markers of both record families, or a manifest that is neither a `makeiso.py` nor a `makeiso-video.py` record |
+| `SKIPPED` | Nothing to check: an explicitly `failed` or `verification_failed` run, a dry-run record with no ISO beside it, a `makeiso-video.py` record, or an AppleDouble metadata file |
+| `ERROR` | Manifest unreadable, not valid UTF-8 or JSON, or not a JSON object; or the ISO could not be read. One bad item never stops the run |
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Every checked ISO verified (skips are not failures) |
+| `1` | At least one `FAIL`, `MISSING_ISO`, `UNVERIFIABLE` or `ERROR` (listed at the end of the run); or the `--csv` report was refused or could not be written |
+| `130` | Interrupted with Ctrl-C; an unfinished report is removed |
+
+Suitable for a scheduled fixity-audit job, provided each run gets a new report name.
 
 ## Troubleshooting
 
@@ -804,28 +925,34 @@ python3 makeiso-video.py -i disc.iso --preset slow
 
 ### How Verification Works
 
-`makeiso.py` uses **parallel hash calculation** during the copy process:
+`makeiso.py` verifies in **two phases**, so the two hashes being compared come from independent reads:
 
 ```
+Phase 1 — Creation (single pass over the disc)
+
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │  Raw Device  │────▶│  4MB Chunk   │────▶│   ISO File   │
 │ /dev/rdisk2  │     │              │     │              │
 └──────────────┘     └──────┬───────┘     └──────────────┘
-                           │
-                     ┌─────┴─────┐
-                     ▼           ▼
-              ┌──────────┐ ┌──────────┐
-              │ MD5 Hash │ │ MD5 Hash │
-              │  (raw)   │ │  (iso)   │
-              └──────────┘ └──────────┘
+                            │
+                            ▼
+                     ┌────────────┐
+                     │  MD5 Hash  │
+                     │   (raw)    │
+                     └────────────┘
+
+Phase 2 — Verification (after forcing the file to physical disk)
+
+┌──────────────┐     ┌──────────────┐     ┌────────────┐
+│   ISO File   │────▶│  4MB Chunk   │────▶│  MD5 Hash  │
+│  re-read,    │     │              │     │   (iso)    │
+│ cache bypass │     └──────────────┘     └────────────┘
+└──────────────┘
 ```
 
-Each 4MB chunk is:
-1. Read from the raw device
-2. Written to the ISO file
-3. Fed to **two** MD5 hashers simultaneously
+During creation, each 4MB chunk is read from the raw device, written to the ISO file, and fed to the source (raw) hashers — both MD5 and SHA-256. After the copy completes, the script forces the file to physical media (`F_FULLFSYNC`), then re-reads the written ISO from disk with the page cache bypassed (`F_NOCACHE`) and hashes it independently with both algorithms. A match requires both digest pairs to agree; MD5 is retained for continuity with existing collection manifests, SHA-256 for current archival fixity practice.
 
-This ensures both hashes are calculated from the same data stream in a single pass.
+Because the second hash comes from the bytes that actually landed on disk — not from the in-memory stream — a mismatch catches write errors, truncated writes, and destination-disk corruption. Verification always runs; there is no option to skip it.
 
 ### Manifest Structure
 

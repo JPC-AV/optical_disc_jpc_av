@@ -17,12 +17,45 @@ import platform
 import argparse
 import json
 import logging
+import fcntl
+import signal
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
-from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass, field
 from uuid import uuid4
+from xml.sax.saxutils import escape as xml_escape
 
 ### === DATA STRUCTURES ===
+
+@dataclass(frozen=True)
+class ArtifactSet:
+    """The five artifacts a run can produce."""
+    iso: Path
+    tree: Path
+    isolyzer: Path
+    log: Path
+    manifest: Path
+
+    @property
+    def archive_order(self) -> List[Path]:
+        return [self.iso, self.log, self.manifest, self.tree, self.isolyzer]
+
+    @property
+    def sidecars(self) -> List[Path]:
+        return [self.tree, self.isolyzer, self.log, self.manifest]
+
+    def publish_pairs(self, canonical: "ArtifactSet") -> List[Tuple[Path, Path]]:
+        return [
+            (self.iso, canonical.iso),
+            (self.tree, canonical.tree),
+            (self.isolyzer, canonical.isolyzer),
+            (self.log, canonical.log),
+            (self.manifest, canonical.manifest),
+        ]
+
+    def sidecar_pairs(self, target: "ArtifactSet") -> List[Tuple[Path, Path]]:
+        return list(zip(self.sidecars, target.sidecars))
+
 
 @dataclass
 class BackupConfig:
@@ -33,28 +66,84 @@ class BackupConfig:
     operator: str
     output_dir: Path
     dry_run: bool = False
-    no_verification: bool = False
+    force: bool = False
     media_type: str = "Unknown"
+    mount_point: Optional[str] = None
+    # Set when a run fails; sidecar paths then resolve to failure-marked names
+    # so a retry can never overwrite the failed attempt's records.
+    failure_token: Optional[str] = None
+    # Set while a run is in progress; ISO/tree/isolyzer writes go to private
+    # attempt paths and only replace the canonical artifacts after verification.
+    attempt_token: Optional[str] = None
+
+    def _sidecar_token(self) -> str:
+        token = self.failure_token or self.attempt_token
+        return f"_{token}" if token else ""
+
+    def _named(self, suffix: str) -> Path:
+        token = self._sidecar_token()
+        return self.output_dir / f"{self.filename}{token}{suffix}"
 
     @property
     def output_path(self) -> Path:
+        token = f"_{self.attempt_token}" if self.attempt_token else ""
+        return self.output_dir / f"{self.filename}{token}.iso"
+
+    @property
+    def canonical_output_path(self) -> Path:
         return self.output_dir / f"{self.filename}.iso"
     
     @property
     def log_path(self) -> Path:
+        return self._named(".iso.log.txt")
+
+    @property
+    def canonical_log_path(self) -> Path:
         return self.output_dir / f"{self.filename}.iso.log.txt"
     
     @property
     def manifest_path(self) -> Path:
+        return self._named("_manifest.json")
+
+    @property
+    def canonical_manifest_path(self) -> Path:
         return self.output_dir / f"{self.filename}_manifest.json"
     
     @property
     def tree_path(self) -> Path:
+        return self._named("_tree.txt")
+
+    @property
+    def canonical_tree_path(self) -> Path:
         return self.output_dir / f"{self.filename}_tree.txt"
     
     @property
     def isolyzer_path(self) -> Path:
+        return self._named("_isolyzer.xml")
+
+    @property
+    def canonical_isolyzer_path(self) -> Path:
         return self.output_dir / f"{self.filename}_isolyzer.xml"
+
+    @property
+    def artifacts(self) -> ArtifactSet:
+        return ArtifactSet(
+            iso=self.output_path,
+            tree=self.tree_path,
+            isolyzer=self.isolyzer_path,
+            log=self.log_path,
+            manifest=self.manifest_path,
+        )
+
+    @property
+    def canonical_artifacts(self) -> ArtifactSet:
+        return ArtifactSet(
+            iso=self.canonical_output_path,
+            tree=self.canonical_tree_path,
+            isolyzer=self.canonical_isolyzer_path,
+            log=self.canonical_log_path,
+            manifest=self.canonical_manifest_path,
+        )
 
 @dataclass
 class BackupResult:
@@ -62,17 +151,32 @@ class BackupResult:
     success: bool
     iso_path: Path
     disk_size: int
+    creation_path: Optional[Path] = None
     md5_iso: Optional[str] = None
     md5_raw: Optional[str] = None
+    sha256_iso: Optional[str] = None
+    sha256_raw: Optional[str] = None
     creation_time: float = 0.0
     verification_time: float = 0.0
     error_message: Optional[str] = None
+    unmount_ok: Optional[bool] = None  # None = unmount not attempted (dry run)
+    finalized: Optional[bool] = None   # disc ejected; None = not attempted (dry run)
+    eject_interrupted: bool = False    # Ctrl-C arrived during the eject
+    unmount_interrupted: bool = False  # Ctrl-C arrived during the unmount
+    warnings: List[str] = field(default_factory=list)  # non-fatal problems (run still valid)
     
     @property
     def checksum_match(self) -> Optional[bool]:
-        """Whether checksums match (None if verification skipped)"""
-        if self.md5_iso and self.md5_raw:
-            return self.md5_iso == self.md5_raw
+        """Whether checksums match.
+
+        False if any recorded pair mismatches; True only when both the MD5
+        and SHA-256 pairs are present and match; None when verification
+        never produced a complete set of hashes."""
+        pairs = [(self.md5_iso, self.md5_raw), (self.sha256_iso, self.sha256_raw)]
+        if any(a and b and a != b for a, b in pairs):
+            return False
+        if all(a and b for a, b in pairs):
+            return True
         return None
     
     @property
@@ -85,6 +189,80 @@ class BackupResult:
             return round((self.disk_size / duration) / (1024 * 1024), 2)
         return 0.0
 
+@dataclass
+class RunContext:
+    """Identity and step timing for a single backup run.
+
+    Generated once per run and shared by the log and manifest writers so
+    both records carry the same run_id/uuid and real step timestamps.
+    """
+    run_id: str
+    run_uuid: str
+    start_time: datetime.datetime
+    step_times: Dict[str, datetime.datetime] = field(default_factory=dict)
+
+    def mark(self, step: str):
+        """Record the moment a step actually happened"""
+        self.step_times[step] = datetime.datetime.now()
+
+@dataclass
+class IsoCreationResult:
+    """Hashes and timing produced by the copy and verification passes"""
+    creation_time: float
+    verification_time: float
+    md5_raw: str
+    md5_iso: Optional[str]
+    sha256_raw: str
+    sha256_iso: Optional[str]
+    output_path: Path
+    warnings: List[str] = field(default_factory=list)  # degraded-but-not-fatal conditions
+
+@dataclass(frozen=True)
+class RecordView:
+    """Artifact names to write inside records, plus the path to stat."""
+    files: ArtifactSet
+    iso_stat_path: Path
+
+    @classmethod
+    def from_run(cls, config: BackupConfig, result: BackupResult,
+                 log_path: Optional[Path] = None) -> "RecordView":
+        staged_success = bool(
+            result.success and config.attempt_token
+            and result.creation_path
+            and result.creation_path != config.canonical_output_path
+        )
+        if staged_success:
+            files = config.canonical_artifacts
+        else:
+            files = ArtifactSet(
+                iso=result.iso_path,
+                tree=config.tree_path,
+                isolyzer=config.isolyzer_path,
+                log=log_path or config.log_path,
+                manifest=config.manifest_path,
+            )
+        iso_stat_path = (result.creation_path if result.creation_path
+                         and result.creation_path.exists() else result.iso_path)
+        return cls(files, iso_stat_path)
+
+@dataclass
+class BackupPreparation:
+    """State gathered before any copy work starts."""
+    disk_info: Dict[str, Any]
+    disk_size: int
+    created_output_dir: bool
+    attempt: ArtifactSet
+
+@dataclass
+class CopyPhaseResult:
+    """Outputs from tree listing, unmount, copy, analysis, and eject."""
+    tree_ok: bool
+    iso_result: Optional[IsoCreationResult]
+    iso_analysis: Dict[str, Any]
+    backup_error: Optional[str]
+    unmount_ok: Optional[bool]
+    finalized: Optional[bool]
+
 ### === COLOR UTILITIES ===
 
 COLOR = {
@@ -96,8 +274,14 @@ COLOR = {
     "off": "\033[0m"
 }
 
+# ANSI output (color + progress cursor codes) only when stdout is a terminal
+# and NO_COLOR is unset (https://no-color.org). Decided once at import time.
+ANSI_ENABLED = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
 def colorize(color: str, text: str) -> str:
-    """Apply ANSI color to text"""
+    """Apply ANSI color to text (no-op when output is not a terminal)"""
+    if not ANSI_ENABLED:
+        return text
     return f"{COLOR[color]}{text}{COLOR['off']}"
 
 ### === LOGGING SETUP ===
@@ -208,13 +392,19 @@ def fmt_diskutil_size(bytes_val: int, total_bytes: int = None) -> str:
         result += f" ({pct:.1f}%)"
     return result
 
-def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult, 
+def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult,
                         start_time: datetime.datetime, disk_info: Dict[str, Any],
-                        iso_analysis: Dict[str, Any] = None):
+                        iso_analysis: Dict[str, Any] = None, run: RunContext = None):
     """Create a properly formatted log file"""
-    
+
     end_time = datetime.datetime.now()
     total_duration = (end_time - start_time).total_seconds()
+    record = RecordView.from_run(config, result, log_path)
+
+    def step_time(step: str, fallback: datetime.datetime) -> str:
+        """Real captured timestamp for a step, or the fallback if it never ran"""
+        t = run.step_times.get(step, fallback) if run else fallback
+        return t.strftime('%H:%M:%S')
     
     with open(log_path, "w") as f:
         # === HEADER SUMMARY ===
@@ -224,12 +414,23 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         
         f.write("BACKUP SUMMARY\n")
         f.write("-" * 20 + "\n")
-        f.write(f"Run ID:           {datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}_{config.operator}_{config.disk_id}\n")
+        run_id = run.run_id if run else f"{start_time.strftime('%Y%m%dT%H%M%S')}_{config.operator}_{config.disk_id}"
+        f.write(f"Run ID:           {run_id}\n")
         f.write(f"Operator:         {config.operator}\n")
         f.write(f"Start Time:       {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"End Time:         {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total Duration:   {format_duration(total_duration)}\n")
-        f.write(f"Status:           {'SUCCESS' if result.success else 'FAILED'}\n")
+        if config.dry_run:
+            status = 'DRY RUN'
+        elif result.success:
+            status = 'SUCCESS (WITH WARNINGS)' if result.warnings else 'SUCCESS'
+        else:
+            status = 'VERIFICATION FAILED' if result.checksum_match is False else 'FAILED'
+        f.write(f"Status:           {status}\n")
+        if result.error_message:
+            f.write(f"Error:            {result.error_message}\n")
+        for warning in result.warnings:
+            f.write(f"Warning:          {warning}\n")
         if result.checksum_match is not None:
             f.write(f"Verification:     {'PASS' if result.checksum_match else 'FAIL'}\n")
         f.write("\n")
@@ -248,14 +449,14 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         # === OUTPUT FILES ===
         f.write("OUTPUT FILES\n")
         f.write("-" * 20 + "\n")
-        f.write(f"ISO File:         {result.iso_path.name}\n")
+        f.write(f"ISO File:         {record.files.iso.name}\n")
         f.write(f"Output Directory: {config.output_dir}\n")
-        f.write(f"Log File:         {config.log_path.name}\n")
-        f.write(f"Tree File:        {config.tree_path.name}\n")
-        f.write(f"Isolyzer File:    {config.isolyzer_path.name}\n")
-        f.write(f"Manifest File:    {config.manifest_path.name}\n")
-        if result.iso_path.exists():
-            iso_size = result.iso_path.stat().st_size
+        f.write(f"Log File:         {record.files.log.name}\n")
+        f.write(f"Tree File:        {record.files.tree.name}\n")
+        f.write(f"Isolyzer File:    {record.files.isolyzer.name}\n")
+        f.write(f"Manifest File:    {record.files.manifest.name}\n")
+        if record.iso_stat_path.exists():
+            iso_size = record.iso_stat_path.stat().st_size
             f.write(f"ISO File Size:    {iso_size / (1024 * 1024):.0f} MB\n")
         f.write("\n")
         
@@ -265,42 +466,67 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write("-" * 20 + "\n")
         
         # Tree generation
-        f.write(f"[{start_time.strftime('%H:%M:%S')}] Tree Listing Generation\n")
-        f.write(f"  Command: tree -RapugD --si --du /Volumes/{config.volume_name}\n")
-        f.write(f"  Output:  {config.tree_path.name}\n\n")
+        f.write(f"[{step_time('tree', start_time)}] Tree Listing Generation\n")
+        tree_target = config.mount_point or f"/Volumes/{config.volume_name}"
+        f.write(f"  Command: tree -RapugD --si --du {tree_target}\n")
+        f.write(f"  Output:  {record.files.tree.name}\n\n")
         
         # Disk unmount
-        f.write(f"[{start_time.strftime('%H:%M:%S')}] Disk Unmount\n")
+        if result.unmount_interrupted:
+            unmount_status = "INTERRUPTED (Ctrl-C; the disc may or may not be unmounted)"
+        elif result.unmount_ok is None:
+            unmount_status = "Skipped (dry run)" if config.dry_run else "Not attempted"
+        else:
+            unmount_status = "Success" if result.unmount_ok else "FAILED"
+        f.write(f"[{step_time('unmount', start_time)}] Disk Unmount\n")
         f.write(f"  Command: diskutil unmountDisk /dev/{config.disk_id}\n")
-        f.write(f"  Status:  Success\n\n")
+        f.write(f"  Status:  {unmount_status}\n\n")
         
-        # ISO Creation and Verification
-        create_start = start_time + datetime.timedelta(seconds=1)  # Approximate
-        create_end = create_start + datetime.timedelta(seconds=result.creation_time)
+        # ISO Creation and Verification (real captured times; approximation
+        # only as fallback for steps that never ran)
+        create_start = (run.step_times.get("copy_start") if run else None) or (start_time + datetime.timedelta(seconds=1))
+        create_end = (run.step_times.get("copy_end") if run else None) or (create_start + datetime.timedelta(seconds=result.creation_time))
         
-        f.write(f"[{create_start.strftime('%H:%M:%S')}] ISO Creation & Verification\n")
-        f.write(f"  Command: dd if=/dev/r{config.disk_id} of={result.iso_path} bs=4m\n")
-        f.write(f"  Method:  Parallel processing (creation + hashing)\n")
-        f.write(f"  Duration: {format_duration(result.creation_time)}\n")
-        speed = result.speed_mb_s(result.creation_time)
-        multiplier = calculate_disc_speed_multiplier(speed, config.media_type)
-        f.write(f"  Speed:    {speed:.2f} MB/s ({multiplier})\n")
-        f.write(f"  Completed: {create_end.strftime('%H:%M:%S')}\n\n")
+        f.write(f"[{create_start.strftime('%H:%M:%S')}] ISO Creation\n")
+        if config.dry_run:
+            f.write(f"  Status:  Skipped (dry run)\n\n")
+        elif result.unmount_ok is not True or result.creation_path is None:
+            f.write(f"  Status:  Not started ({result.error_message or 'aborted before copy'})\n\n")
+        else:
+            creation_path = result.creation_path or config.output_path
+            f.write(f"  Command: dd if=/dev/r{config.disk_id} of={creation_path} bs=4m\n")
+            f.write(f"  Method:  Streamed copy with in-stream source (raw disk) hashing\n")
+            if creation_path != config.canonical_output_path:
+                f.write(f"  Attempt: Run-private path; promoted to {config.canonical_output_path.name} only after successful verification\n")
+            if result.md5_raw is None and result.error_message:
+                f.write(f"  Status:  FAILED ({result.error_message})\n\n")
+            else:
+                f.write(f"  Duration: {format_duration(result.creation_time)}\n")
+                speed = result.speed_mb_s(result.creation_time)
+                multiplier = calculate_disc_speed_multiplier(speed, config.media_type)
+                f.write(f"  Speed:    {speed:.2f} MB/s ({multiplier})\n")
+                f.write(f"  Completed: {create_end.strftime('%H:%M:%S')}\n\n")
         
         # Hash verification results
         if result.md5_iso and result.md5_raw:
             f.write("VERIFICATION RESULTS\n")
             f.write("-" * 20 + "\n")
-            f.write(f"MD5 (ISO):      {result.md5_iso}\n")
-            f.write(f"MD5 (Raw Disk): {result.md5_raw}\n")
+            f.write(f"Method:         Written ISO re-read from disk, compared to streamed raw disk hashes\n")
+            f.write(f"MD5 (ISO):          {result.md5_iso}\n")
+            f.write(f"MD5 (Raw Disk):     {result.md5_raw}\n")
+            if result.sha256_iso and result.sha256_raw:
+                f.write(f"SHA-256 (ISO):      {result.sha256_iso}\n")
+                f.write(f"SHA-256 (Raw Disk): {result.sha256_raw}\n")
+            algorithms = "MD5 (128-bit), SHA-256 (256-bit)" if result.sha256_iso else "MD5 (128-bit)"
             f.write(f"Match:          {'YES' if result.checksum_match else 'NO'}\n")
-            f.write(f"Algorithm:      MD5 (128-bit)\n\n")
+            f.write(f"Algorithms:     {algorithms}\n")
+            f.write(f"Duration:       {format_duration(result.verification_time)}\n\n")
         
         # ISO Structure Analysis
         if config.isolyzer_path.exists():
-            f.write(f"[{create_end.strftime('%H:%M:%S')}] ISO Structure Analysis\n")
+            f.write(f"[{step_time('isolyzer', create_end)}] ISO Structure Analysis\n")
             f.write(f"  Tool:    isolyzer\n")
-            f.write(f"  Output:  {config.isolyzer_path.name}\n")
+            f.write(f"  Output:  {record.files.isolyzer.name}\n")
             
             if iso_analysis and 'error' not in iso_analysis:
                 f.write("  Results:\n")
@@ -327,14 +553,27 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
                     f.write(f"  Size check: ISO is {size_diff} bytes ({iso_analysis.get('size_difference_sectors', 0)} sectors) larger than the filesystem declares.\n")
                     f.write(f"  This is normal for optical media — extra sectors are lead-out/padding and do not indicate data loss.\n")
             
-            f.write("  Status:  Complete\n\n")
+            if iso_analysis and 'error' in iso_analysis:
+                f.write(f"  Status:  FAILED ({iso_analysis['error']})\n\n")
+            elif iso_analysis and iso_analysis.get('skipped'):
+                f.write(f"  Status:  Skipped ({iso_analysis.get('reason', 'unknown')})\n\n")
+            else:
+                f.write("  Status:  Complete\n\n")
         
         # Finalization
-        final_time = create_end + datetime.timedelta(seconds=1)
-        f.write(f"[{final_time.strftime('%H:%M:%S')}] Finalization\n")
-        f.write(f"  Remount: diskutil mount /dev/{config.disk_id}\n")
+        f.write(f"[{step_time('finalize', create_end + datetime.timedelta(seconds=1))}] Finalization\n")
         f.write(f"  Eject:   diskutil eject /dev/{config.disk_id}\n")
-        f.write(f"  Status:  Complete\n\n")
+        if config.dry_run:
+            final_status = "Skipped (dry run)"
+        elif result.finalized:
+            final_status = "Complete"
+        elif result.eject_interrupted:
+            final_status = "INTERRUPTED (Ctrl-C during the eject)"
+        elif result.unmount_ok is not True:
+            final_status = "Skipped (disc was never unmounted)"
+        else:
+            final_status = "FAILED (eject error — see console output)"
+        f.write(f"  Status:  {final_status}\n\n")
         
         # === SYSTEM INFORMATION ===
         f.write("SYSTEM INFORMATION\n")
@@ -358,7 +597,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
             fmt_field("File System",        disk_info.get('FilesystemName', disk_info.get('FilesystemType')))
             fmt_field("Connection",         disk_info.get('BusProtocol'))
             # Physical Size = actual ISO/disc size; TotalSize in plist returns volume size on optical media
-            physical_size = result.iso_path.stat().st_size if result.iso_path.exists() else disk_info.get('TotalSize')
+            physical_size = record.iso_stat_path.stat().st_size if record.iso_stat_path.exists() else disk_info.get('TotalSize')
             volume_size = disk_info.get('TotalSize')
             fmt_field("Physical Size",      fmt_diskutil_size(physical_size))
             fmt_field("Volume Capacity",    fmt_diskutil_size(volume_size))
@@ -373,6 +612,35 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"Log generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("=" * 70 + "\n")
 
+class DeferredInterrupt:
+    """Hold Ctrl-C (SIGINT) for one short critical section: the bundle's
+    archive/publication renames and any rollback of them. A Ctrl-C that
+    arrives meanwhile only sets .received, so the section can never stop
+    halfway; the caller acts on it afterwards. The previous handler is always
+    restored. Off the main thread (where handlers cannot be set) the section
+    simply runs unprotected."""
+
+    def __init__(self):
+        self.received = False
+        self._previous = None
+        self._installed = False
+
+    def _hold(self, signum, frame):
+        self.received = True
+
+    def __enter__(self) -> "DeferredInterrupt":
+        try:
+            self._previous = signal.signal(signal.SIGINT, self._hold)
+            self._installed = True
+        except ValueError:
+            pass
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        if self._installed:
+            signal.signal(signal.SIGINT, self._previous)
+        return False
+
 ### === MAIN BACKUP CLASS ===
 
 class OpticalDiscBackup:
@@ -380,79 +648,578 @@ class OpticalDiscBackup:
     
     def __init__(self, config: BackupConfig):
         self.config = config
-        
+        self.run: Optional[RunContext] = None
+        self._progress_marks = set()  # deciles already reported in non-TTY mode
+        # Ctrl-C was received but the run's real outcome stands (eject cut
+        # short after a verified copy, or Ctrl-C held while publishing); a
+        # successful run then exits 130 (see main)
+        self.interrupted = False
+        self._eject_interrupted = False
+        self._unmount_interrupted = False
+        self._held_interrupt: Optional[DeferredInterrupt] = None
+        self._published = False
+        self._archive_dir: Optional[Path] = None  # this run's overwritten-* folder
+        self._rollback_problems: List[str] = []    # files rollback could not put back
+
+    def _standard_artifacts(self) -> List[Path]:
+        """Canonical artifacts that a successful run publishes."""
+        return self.config.canonical_artifacts.archive_order
+
+    def _relative(self, path: Path) -> str:
+        """A path as shown in messages: relative to the output directory"""
+        try:
+            return str(path.relative_to(self.config.output_dir))
+        except ValueError:
+            return str(path)
+
+    def _rollback_problem(self, message: str):
+        """Record a file rollback could not put back (it reaches the records)"""
+        self._rollback_problems.append(message)
+        log(colorize("yellow", f"Warning: {message}"))
+
+    def _restore_archived_artifacts(self, archived: List[Tuple[Path, Path]],
+                                    clear: bool = True):
+        """Put archived canonical artifacts back after a failed promotion.
+
+        Best effort, and never replacing a file: if any canonical slot is
+        occupied (or the caller could not clear them), nothing is restored and
+        the prior files stay in the archive folder. If a restore fails partway,
+        the files already restored are moved back into the folder. If renames
+        keep failing, files can be left split between canonical names and the
+        folder: the recorded problem then names where each one actually is.
+        The archive folder is removed only when it is empty again."""
+        pending = [(o, a) for o, a in archived if os.path.lexists(a)]
+        occupied = [o.name for o, _ in pending if os.path.lexists(o)]
+        if pending and (occupied or not clear):
+            where = self._relative(self._archive_dir) if self._archive_dir else "its archive folder"
+            reason = (f"{', '.join(occupied)} still occupied" if occupied
+                      else "this run's files could not all be moved out of the canonical names")
+            self._rollback_problem(f"prior bundle left intact in {where} ({reason}); "
+                                   f"nothing was restored over this run's files")
+            return
+        restored: List[Tuple[Path, Path]] = []
+        for original, archive in reversed(archived):
+            if not os.path.lexists(archive):
+                continue
+            problem = None
+            if os.path.lexists(original):
+                problem = f"{original.name} is occupied"
+            else:
+                try:
+                    archive.replace(original)
+                    restored.append((original, archive))
+                    log(colorize("yellow", f"Restored prior artifact: {original.name}"))
+                    continue
+                except OSError as e:
+                    problem = f"could not restore {original.name}: {e}"
+            # Keep the prior bundle together: move back what was restored
+            for done_original, done_archive in reversed(restored):
+                try:
+                    if os.path.lexists(done_archive):
+                        raise OSError(f"{self._relative(done_archive)} is occupied")
+                    done_original.rename(done_archive)
+                except OSError as e:
+                    self._rollback_problem(f"could not return {done_original.name} to "
+                                           f"{self._relative(done_archive)}: {e}")
+            # Say where every file this rollback handled actually is now
+            where = self._relative(self._archive_dir) if self._archive_dir else "the archive folder"
+            in_folder = [o.name for o, a in archived if os.path.lexists(a)]
+            at_canonical = [o.name for o, a in archived
+                            if not os.path.lexists(a) and os.path.lexists(o)]
+            missing = [o.name for o, a in archived
+                       if not os.path.lexists(a) and not os.path.lexists(o)]
+            if not at_canonical and not missing:
+                outcome = (f"the files it had restored were moved back, so they are all in "
+                           f"{where} ({', '.join(in_folder)})")
+            else:
+                outcome = ("continuing rename errors left the prior files split: "
+                           + "; ".join(part for part in (
+                               f"at canonical names: {', '.join(at_canonical)}" if at_canonical else "",
+                               f"in {where}: {', '.join(in_folder)}" if in_folder else "",
+                               f"not found: {', '.join(missing)}" if missing else "") if part))
+            self._rollback_problem(f"rollback stopped ({problem}); {outcome}; nothing was "
+                                   f"restored over this run's files")
+            return
+        if self._archive_dir is not None:
+            try:
+                os.rmdir(self._archive_dir)  # only ever succeeds when empty
+            except OSError:
+                pass
+            else:
+                log(colorize("yellow", f"Removed empty archive folder: {self._archive_dir.name}"))
+                self._archive_dir = None
+
+    def _archive_existing_artifacts(self) -> List[Tuple[Path, Path]]:
+        """Move the existing canonical bundle into a new per-replacement
+        folder, <filename>_overwritten-<stamp>-<rand>/, keeping each file's
+        canonical name. Every archived manifest then still names its own
+        sibling ISO, so verifyiso checks each retained master against its own
+        hashes; no record is rewritten. Called only after the new ISO has
+        verified, so a failed retry leaves the existing master untouched.
+
+        The folder is created exclusively (an existing one is never reused),
+        and only when there is something to archive."""
+        existing = [p for p in self._standard_artifacts() if os.path.lexists(p)]
+        archived: List[Tuple[Path, Path]] = []
+        if not existing:
+            return archived
+        token = f"overwritten-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
+        folder = self.config.output_dir / f"{self.config.filename}_{token}"
+        os.mkdir(folder)  # FileExistsError is an OSError: nothing has moved yet
+        self._archive_dir = folder
+        try:
+            for path in existing:
+                if path.is_symlink():
+                    raise OSError(f"Symlink appeared at canonical artifact path during publish: {path}")
+                archive_path = folder / path.name
+                if os.path.lexists(archive_path):
+                    raise OSError(f"{self._relative(archive_path)} already exists; not replacing it")
+                path.rename(archive_path)
+                archived.append((path, archive_path))
+                log(colorize("yellow", f"Existing artifact archived to: {self._relative(archive_path)}"))
+        except OSError:
+            self._restore_archived_artifacts(archived)
+            raise
+        return archived
+
+    def _move_published_attempts_back(self, published: List[Tuple[Path, Path]]) -> bool:
+        """Move any already-published attempt artifacts back out of canonical
+        slots so prior canonical artifacts can be restored. Returns False if
+        any of this run's files is still at a canonical name."""
+        cleared = True
+        for attempt, canonical in reversed(published):
+            if not os.path.lexists(canonical):
+                continue
+            if os.path.lexists(attempt):
+                self._rollback_problem(f"could not move {canonical.name} back: "
+                                       f"{attempt.name} is occupied")
+                cleared = False
+                continue
+            try:
+                canonical.rename(attempt)
+                log(colorize("yellow", f"Moved failed publish back to attempt path: {attempt.name}"))
+            except OSError as e:
+                self._rollback_problem(f"could not move {canonical.name} back to "
+                                       f"{attempt.name}: {e}; this run's copy stays at "
+                                       f"the canonical name")
+                cleared = False
+        return cleared
+
+    def _check_publish_symlinks(self, paths: List[Path]):
+        linked = [p.name for p in paths if p.is_symlink()]
+        if linked:
+            raise OSError(f"Symlink appeared at publish path(s): {', '.join(linked)}")
+
+    def _promote_successful_attempt(self, result: BackupResult, attempt: ArtifactSet):
+        """Publish verified attempt artifacts at the canonical names.
+
+        The old canonical artifacts are archived only after the new copy has
+        passed completeness and checksum verification. Archiving, publishing
+        and any rollback run as one short section with Ctrl-C held
+        (DeferredInterrupt), so a Ctrl-C can never leave a half-moved
+        bundle; the caller acts on a held Ctrl-C afterwards. If promotion
+        fails (OSError), the prior bundle is restored as far as the
+        filesystem allows (best effort, see _restore_archived_artifacts) and
+        the attempt falls through the normal failed-run record path."""
+        archived: List[Tuple[Path, Path]] = []
+        published: List[Tuple[Path, Path]] = []
+        publish_order = attempt.publish_pairs(self.config.canonical_artifacts)
+        self._held_interrupt = DeferredInterrupt()
+        with self._held_interrupt:
+            try:
+                self._check_publish_symlinks(self._standard_artifacts())
+                self._check_publish_symlinks([src for src, _ in publish_order if src.exists()])
+                archived = self._archive_existing_artifacts()
+                for src, dst in publish_order:
+                    if not src.exists():
+                        continue
+                    self._check_publish_symlinks([src, dst])
+                    if os.path.lexists(dst):
+                        raise OSError(f"{dst.name} appeared during publish; not replacing it")
+                    src.replace(dst)
+                    published.append((src, dst))
+                    log(colorize("green", f"Published verified artifact: {dst.name}"))
+            except OSError:
+                cleared = self._move_published_attempts_back(published)
+                self._restore_archived_artifacts(archived, clear=cleared)
+                raise
+            self.config.attempt_token = None
+            result.iso_path = self.config.canonical_output_path
+            self._published = True
+
+    def _mark_failed_attempt(self, result: BackupResult, attempt: ArtifactSet):
+        """Move this run's attempt artifacts to failure-marked names.
+
+        Only attempt paths are touched here; canonical artifacts from a prior
+        successful run are never relabelled as failed evidence for this run."""
+        fail_token = f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
+        self.config.failure_token = fail_token
+        self.config.attempt_token = None
+        if attempt.iso.exists():
+            marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
+            marked_path = self.config.output_dir / f"{self.config.filename}_{fail_token}{marker}"
+            try:
+                attempt.iso.rename(marked_path)
+                result.iso_path = marked_path
+                log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
+            except OSError as e:
+                log(colorize("yellow", f"Could not rename partial ISO to {marked_path.name}: {e} "
+                                      f"(leaving it in place; run still recorded as failed)"))
+        for src, dst in attempt.sidecar_pairs(self.config.artifacts):
+            if src.exists():
+                try:
+                    src.rename(dst)
+                    log(colorize("yellow", f"{src.name} renamed to: {dst.name}"))
+                except OSError as e:
+                    log(colorize("yellow", f"Could not rename {src.name} to {dst.name}: {e}"))
+
+    def _write_run_records(self, result: BackupResult, start_time: datetime.datetime,
+                           disk_info: Dict[str, Any], iso_analysis: Dict[str, Any]):
+        create_formatted_log(self.config.log_path, self.config, result,
+                             start_time, disk_info, iso_analysis, self.run)
+        self._create_manifest(result, disk_info, iso_analysis)
+
+    def _write_failure_records_best_effort(self, result: BackupResult,
+                                           start_time: datetime.datetime,
+                                           disk_info: Dict[str, Any],
+                                           iso_analysis: Dict[str, Any]):
+        try:
+            self._write_run_records(result, start_time, disk_info, iso_analysis)
+        except Exception as record_error:
+            log(colorize("red", f"Could not write failure records: {record_error}"))
+        except KeyboardInterrupt:
+            self.interrupted = True
+            log(colorize("red", "Interrupted by operator (Ctrl-C) while writing failure records; "
+                                "they may be incomplete"))
+
+    def _discard_staged_records(self, attempt: ArtifactSet):
+        """Delete this run's staged attempt log/manifest. They were written
+        for a success that then did not happen, so they must never survive
+        (renamed as failure records) claiming success."""
+        for path in (attempt.log, attempt.manifest):
+            try:
+                if path.is_file() and not path.is_symlink():
+                    path.unlink()
+            except OSError as e:
+                log(colorize("yellow", f"Warning: could not remove staged record {path.name}: {e}"))
+
+    def _fail_staged_success(self, result: BackupResult, attempt: ArtifactSet,
+                             start_time: datetime.datetime, disk_info: Dict[str, Any],
+                             iso_analysis: Dict[str, Any]):
+        """A verified run that could not then be recorded or published:
+        drop its staged success records first, then mark the attempt failed
+        and write failure records (best effort). If those cannot be written,
+        no record is left claiming success."""
+        # Removing the staged records and renaming the attempt are a few
+        # local unlinks/renames: held like publication, so Ctrl-C cannot stop them halfway
+        held = DeferredInterrupt()
+        with held:
+            self._discard_staged_records(attempt)
+            self._mark_failed_attempt(result, attempt)
+        if held.received:
+            self.interrupted = True
+        self._write_failure_records_best_effort(result, start_time, disk_info, iso_analysis)
+
+    def _prepare_backup(self) -> Tuple[Optional[BackupPreparation], Optional[BackupResult]]:
+        if os.geteuid() != 0:
+            log(colorize("red", "This script must be run with sudo."))
+            return None, BackupResult(False, self.config.output_path, 0,
+                                      error_message="Not running as root")
+
+        disk_info = self._get_disk_info()
+        if not disk_info:
+            return None, BackupResult(False, self.config.output_path, 0,
+                                      error_message=f"Could not get disk info for {self.config.disk_id}")
+
+        disk_size = disk_info.get("TotalSize", 0)
+        self.config.media_type = disk_info.get("OpticalMediaType", "Unknown")
+        self.config.mount_point = disk_info.get("MountPoint") or f"/Volumes/{self.config.volume_name}"
+
+        if not disk_info.get("OpticalMediaType") and not self.config.force:
+            device_desc = disk_info.get('MediaName', disk_info.get('IORegistryEntryName', 'unknown device'))
+            log(colorize("red", f"/dev/{self.config.disk_id} does not appear to be an optical disc "
+                                f"(device: {device_desc}). Refusing to continue. Use --force to override."))
+            return None, BackupResult(False, self.config.output_path, disk_size,
+                                      error_message=f"/dev/{self.config.disk_id} is not optical media")
+
+        try:
+            self.config.output_dir.mkdir(parents=True)
+            created_output_dir = True
+        except FileExistsError:
+            created_output_dir = False
+
+        if self.config.output_dir.is_symlink() or not self.config.output_dir.is_dir():
+            log(colorize("red", f"Output path {self.config.output_dir} exists but is not a real directory "
+                                f"(file or symlink). Refusing to continue."))
+            return None, BackupResult(False, self.config.output_path, disk_size,
+                                      error_message=f"Output path {self.config.output_dir} is not a directory")
+
+        planned = self._standard_artifacts()
+        linked = [p.name for p in planned if p.is_symlink()]
+        if linked:
+            log(colorize("red", f"Refusing to continue: symlink(s) at planned output path(s): {', '.join(linked)}"))
+            return None, BackupResult(False, self.config.output_path, disk_size,
+                                      error_message=f"Symlink at planned output path(s): {', '.join(linked)}")
+
+        replace_candidates = (
+            [self.config.canonical_log_path, self.config.canonical_manifest_path,
+             self.config.canonical_tree_path]
+            if self.config.dry_run else planned
+        )
+        existing_artifacts = [p for p in replace_candidates if p.exists()]
+        if existing_artifacts and not self._confirm_overwrite(existing_artifacts):
+            names = ", ".join(p.name for p in existing_artifacts)
+            return None, BackupResult(False, self.config.output_path, disk_size,
+                                      error_message=f"Aborted to avoid replacing existing artifact(s): {names}")
+
+        if not self.config.dry_run:
+            self.config.attempt_token = f"attempt-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
+        prepared = BackupPreparation(disk_info, disk_size, created_output_dir,
+                                     self.config.artifacts)
+        return prepared, None
+
+    def _run_copy_phase(self, disk_size: int) -> CopyPhaseResult:
+        tree_ok = False
+        backup_error = None
+        unmount_ok = None
+        finalized = None
+
+        try:
+            self.run.mark("tree")
+            tree_ok = self._generate_tree_listing()
+            if not self.config.dry_run:
+                self.run.mark("unmount")
+                unmount_ok = self._unmount_disk()
+                if not unmount_ok:
+                    backup_error = f"Failed to unmount /dev/{self.config.disk_id}"
+        except KeyboardInterrupt:
+            if self.config.dry_run:
+                raise  # a dry run makes no master: Ctrl-C simply stops it, as before
+            # Recorded like any failed run: attempt files get failed-* names
+            self._unmount_interrupted = "unmount" in self.run.step_times
+            backup_error = "Interrupted by operator (Ctrl-C) before the copy started"
+            log(colorize("red", f"Backup failed: {backup_error}"))
+
+        iso_result = None
+        iso_analysis = {"skipped": True, "reason": backup_error or "not started"}
+        if backup_error is None:
+            try:
+                if self.config.dry_run:
+                    iso_analysis = {"skipped": True, "reason": "dry run"}
+                    log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Skipping .iso creation and verification."))
+                else:
+                    iso_result = self._create_and_verify_iso(disk_size)
+                    iso_analysis = self._analyze_iso_structure(self.config.output_path)
+            except (Exception, KeyboardInterrupt) as e:
+                if isinstance(e, KeyboardInterrupt) and self.config.dry_run:
+                    raise  # a dry run makes no master: Ctrl-C simply stops it
+                backup_error = "Interrupted by operator (Ctrl-C)" if isinstance(e, KeyboardInterrupt) else str(e)
+                iso_analysis = {"skipped": True, "reason": f"backup failed: {backup_error}"}
+                log(colorize("red", f"Backup failed: {backup_error}"))
+            finally:
+                # Eject the disc even if the backup failed
+                self.run.mark("finalize")
+                try:
+                    finalized = self._finalize_disk()
+                except KeyboardInterrupt:
+                    if self.config.dry_run:
+                        raise  # a dry run makes no master: Ctrl-C simply stops it
+                    # Only the eject was cut short: a copy that verified stays
+                    # verified, with a warning, and the run exits 130 (main);
+                    # any failure keeps its own outcome
+                    finalized = False
+                    self._eject_interrupted = True
+                    self.interrupted = True
+                    log(colorize("yellow", "Disc eject interrupted by operator (Ctrl-C)"))
+
+        if (backup_error is None and not self.config.dry_run
+                and iso_analysis.get('smaller_than_expected')):
+            backup_error = (f"ISO is structurally smaller than the filesystem declares by "
+                            f"{iso_analysis.get('size_difference_bytes', 0)} bytes — "
+                            f"truncated read, master not certified")
+            log(colorize("red", f"Backup failed: {backup_error}"))
+
+        return CopyPhaseResult(tree_ok, iso_result, iso_analysis,
+                               backup_error, unmount_ok, finalized)
+
+    def _build_backup_result(self, phase: CopyPhaseResult, disk_size: int,
+                             attempt: ArtifactSet) -> BackupResult:
+        iso_result = phase.iso_result
+        result = BackupResult(
+            success=phase.backup_error is None,
+            iso_path=self.config.output_path,
+            disk_size=disk_size,
+            creation_path=(iso_result.output_path if iso_result else
+                           (attempt.iso if attempt.iso.exists() else None)),
+            md5_iso=iso_result.md5_iso if iso_result else None,
+            md5_raw=iso_result.md5_raw if iso_result else None,
+            sha256_iso=iso_result.sha256_iso if iso_result else None,
+            sha256_raw=iso_result.sha256_raw if iso_result else None,
+            creation_time=iso_result.creation_time if iso_result else 0.0,
+            verification_time=iso_result.verification_time if iso_result else 0.0,
+            error_message=phase.backup_error,
+            unmount_ok=phase.unmount_ok,
+            finalized=phase.finalized,
+            eject_interrupted=self._eject_interrupted,
+            unmount_interrupted=self._unmount_interrupted
+        )
+        self._classify_result(result, phase.tree_ok, iso_result, phase.iso_analysis)
+        return result
+
+    def _classify_result(self, result: BackupResult, tree_ok: bool,
+                         iso_result: Optional[IsoCreationResult],
+                         iso_analysis: Dict[str, Any]):
+        if result.checksum_match is False:
+            result.success = False
+            result.error_message = "Checksum mismatch: written ISO does not match source stream"
+
+        # Non-fatal problems on otherwise-valid runs: the master is good, but
+        # the record should make these findable (success_with_warnings).
+        if result.eject_interrupted:
+            # Recorded on every outcome; a verified copy stays verified
+            result.warnings.append("disc eject interrupted by operator (Ctrl-C)")
+        elif result.success and not self.config.dry_run and not result.finalized:
+            result.warnings.append("disc finalization (eject) failed")
+        if result.success and not tree_ok:
+            result.warnings.append("tree listing failed or incomplete")
+        if result.success and not self.config.dry_run and iso_analysis.get('error'):
+            result.warnings.append(f"isolyzer structural analysis not performed ({iso_analysis['error']})")
+        # Degraded-independence notes from the copy/verify pass (fsync or page-cache
+        # fallbacks) are recorded regardless of overall success.
+        if iso_result and iso_result.warnings:
+            result.warnings.extend(iso_result.warnings)
+
+    def _record_and_publish(self, result: BackupResult, start_time: datetime.datetime,
+                            disk_info: Dict[str, Any], iso_analysis: Dict[str, Any],
+                            attempt: ArtifactSet):
+        # Failed or aborted runs keep all their records under failure-marked
+        # names, so they are obvious in the output directory and a retry can
+        # never overwrite the evidence of a previous attempt.
+        if not result.success and not self.config.dry_run:
+            self._mark_failed_attempt(result, attempt)
+
+        # Write the log and manifest before publishing a successful ISO. This
+        # makes the record bundle part of the same promotion step as the master,
+        # so a sidecar write failure cannot leave a canonical ISO with missing
+        # evidence.
+        try:
+            self._write_run_records(result, start_time, disk_info, iso_analysis)
+        except (Exception, KeyboardInterrupt) as e:
+            if isinstance(e, KeyboardInterrupt):
+                if self.config.dry_run:
+                    raise  # a dry run makes no master: Ctrl-C simply stops it
+                self.interrupted = True
+                problem = "Interrupted by operator (Ctrl-C) while writing run records"
+            else:
+                problem = f"Could not write run records before publish: {e}"
+            if result.success:
+                result.success = False
+                result.error_message = problem
+                log(colorize("red", f"Backup failed: {result.error_message}"))
+                if not self.config.dry_run:
+                    self._fail_staged_success(result, attempt, start_time,
+                                              disk_info, iso_analysis)
+            else:
+                log(colorize("red", f"Could not write failure records: {problem}"))
+
+        if result.success and not self.config.dry_run:
+            try:
+                self._promote_successful_attempt(result, attempt)
+            except (OSError, KeyboardInterrupt) as e:
+                if self._published:
+                    # Ctrl-C landed just after the held section ended: every
+                    # file is already published and its records are final
+                    self.interrupted = True
+                else:
+                    if isinstance(e, KeyboardInterrupt):
+                        self.interrupted = True
+                        result.error_message = ("Interrupted by operator (Ctrl-C) before the "
+                                                "verified bundle was published")
+                        if isinstance(e.__context__, OSError):
+                            result.error_message += (f" (after publication had failed: "
+                                                     f"{e.__context__})")
+                    else:
+                        result.error_message = f"Could not publish verified attempt artifacts: {e}"
+                    result.success = False
+                    result.warnings.extend(self._rollback_problems)
+                    log(colorize("red", f"Backup failed: {result.error_message}"))
+                    self._fail_staged_success(result, attempt, start_time,
+                                              disk_info, iso_analysis)
+            if self._held_interrupt is not None and self._held_interrupt.received:
+                # A Ctrl-C held during publication is acknowledged, never
+                # half-acted on: a published bundle stays published (exit 130),
+                # a failed one's best-effort rollback has already run
+                self.interrupted = True
+                log(colorize("yellow",
+                             "Ctrl-C was held until publication finished: the verified bundle "
+                             "is complete and its records are accurate" if result.success else
+                             "Ctrl-C was held until the failed publication's rollback had run "
+                             "(any file it could not put back is listed in the warnings)"))
+
+    def _fix_ownership(self, result: BackupResult, created_output_dir: bool):
+        sudo_user = os.environ.get("SUDO_USER")
+        if not sudo_user:
+            return
+        artifacts = [result.iso_path] + self.config.artifacts.sidecars
+        if created_output_dir:
+            artifacts.insert(0, self.config.output_dir)
+        # The archive folder this run created, but not the archived files:
+        # they keep whatever ownership their own run gave them
+        if (self._archive_dir is not None and self._archive_dir.is_dir()
+                and not self._archive_dir.is_symlink()):
+            artifacts.append(self._archive_dir)
+        existing = [str(p) for p in artifacts if p.exists()]
+        try:
+            subprocess.run(["chown", sudo_user] + existing, check=True)
+        except subprocess.CalledProcessError as e:
+            log(colorize("yellow", f"Warning: Could not set ownership of output files: {e}"))
+
     def create_backup(self) -> BackupResult:
         """Main entry point for creating backup"""
         start_time = datetime.datetime.now()
-        
-        # No title divider here - already shown in main()
-        
-        # Validate we're running as root
-        if os.geteuid() != 0:
-            log(colorize("red", "This script must be run with sudo."))
-            return BackupResult(False, self.config.output_path, 0, error_message="Not running as root")
-        
-        # Get disk info
-        disk_info = self._get_disk_info()
-        if not disk_info:
-            return BackupResult(False, self.config.output_path, 0, error_message=f"Could not get disk info for {self.config.disk_id}")
-        
-        disk_size = disk_info.get("TotalSize", 0)
-        self.config.media_type = disk_info.get("OpticalMediaType", "Unknown")
-        if self.config.output_path.exists() and not self._confirm_overwrite():
-            return BackupResult(False, self.config.output_path, disk_size, error_message="Aborted to avoid overwrite")
-        
-        # Create output directory
-        self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Fix ownership — since we're running under sudo, the dir would be owned
-        # by root. Chown it back to the real user so other scripts can write into it.
-        sudo_user = os.environ.get("SUDO_USER")
-        if sudo_user:
-            try:
-                subprocess.run(["chown", "-R", sudo_user, str(self.config.output_dir)], check=True)
-            except subprocess.CalledProcessError as e:
-                log(colorize("yellow", f"Warning: Could not set ownership of output directory: {e}"))
-        
-        # Generate tree listing (this is the first divider after user inputs)
-        self._generate_tree_listing()
-        
-        # Unmount disk
-        if not self.config.dry_run:
-            self._unmount_disk()
-        
-        # Create and verify ISO (with parallel hashing unless dry run)
-        if self.config.dry_run:
-            creation_time, md5_iso, md5_raw = 0.0, "dry_run_hash", "dry_run_hash"
-            iso_analysis = {"skipped": True, "reason": "dry run"}
-            log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Skipping .iso creation and verification."))
-        else:
-            creation_time, md5_iso, md5_raw = self._create_and_verify_iso(disk_size)
-            # Analyze ISO structure
-            iso_analysis = self._analyze_iso_structure(self.config.output_path)
-        
-        # Remount and finalize
-        self._finalize_disk()
-        
-        # Create result
-        result = BackupResult(
-            success=True,
-            iso_path=self.config.output_path,
-            disk_size=disk_size,
-            md5_iso=md5_iso,
-            md5_raw=md5_raw,
-            creation_time=creation_time,
-            verification_time=0.0  # Verification is done during creation
+        self.run = RunContext(
+            run_id=f"{start_time.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.disk_id}",
+            run_uuid=str(uuid4()),
+            start_time=start_time,
         )
-        
-        # Generate outputs
-        self._generate_summary(result)
-        
-        # Save formatted log with all the details
-        create_formatted_log(self.config.log_path, self.config, result, start_time, disk_info, iso_analysis)
-        
-        self._create_manifest(result, disk_info, iso_analysis)
-        
+
+        prepared, early_result = self._prepare_backup()
+        if early_result:
+            return early_result
+
+        phase = self._run_copy_phase(prepared.disk_size)
+        result = self._build_backup_result(phase, prepared.disk_size, prepared.attempt)
+        try:
+            self._record_and_publish(result, start_time, prepared.disk_info,
+                                     phase.iso_analysis, prepared.attempt)
+        except KeyboardInterrupt:
+            if self.config.dry_run or self._published:
+                raise
+            # A further Ctrl-C landed inside the failure handling itself.
+            # Finish its essential part (held): no staged record may survive
+            # claiming success, and the attempt gets failed-* names.
+            self.interrupted = True
+            result.success = False
+            result.error_message = result.error_message or "Interrupted by operator (Ctrl-C)"
+            held = DeferredInterrupt()
+            with held:
+                self._discard_staged_records(prepared.attempt)
+                if self.config.attempt_token:
+                    self._mark_failed_attempt(result, prepared.attempt)
+            self._write_failure_records_best_effort(result, start_time, prepared.disk_info,
+                                                    phase.iso_analysis)
+        try:
+            self._generate_summary(result)
+            self._fix_ownership(result, prepared.created_output_dir)
+        except KeyboardInterrupt:
+            if self.config.dry_run:
+                raise  # a dry run makes no master: Ctrl-C simply stops it
+            # The bundle and its records are already final; only the summary
+            # or the ownership fix was cut short
+            self.interrupted = True
+            log(colorize("yellow", "Interrupted by operator (Ctrl-C) after the run was recorded: "
+                                   "the summary or the file-ownership fix may be incomplete"))
+
         return result
     
     def _get_disk_info(self) -> Dict[str, Any]:
@@ -463,97 +1230,208 @@ class OpticalDiscBackup:
             log(colorize("red", f"Failed to get disk info: {e}"))
             return {}
     
-    def _confirm_overwrite(self) -> bool:
-        """Confirm file overwrite"""
-        response = get_input(colorize("yellow", f"{self.config.output_path} exists. Overwrite? (y/n): "))
+    def _confirm_overwrite(self, existing_paths: List[Path]) -> bool:
+        """Confirm replacement of existing canonical artifacts.
+
+        A confirmed replacement does not truncate anything up front. Existing
+        artifacts remain in place until the new attempt verifies, then they are
+        moved, unchanged, into a <filename>_overwritten-<stamp>-<rand>/ folder
+        before the new artifacts publish.
+        """
+        names = ", ".join(p.name for p in existing_paths)
+        if self.config.dry_run:
+            question = (f"This dry run writes its tree listing, log and manifest over the existing "
+                        f"ones ({names}) in place; nothing is archived. Continue? (y/n): ")
+        else:
+            question = (f"Existing artifact(s) may be replaced by this run ({names}); if the new "
+                        f"copy verifies, the current ones are kept in a "
+                        f"{self.config.filename}_overwritten-* folder. Continue? (y/n): ")
+        response = get_input(colorize("yellow", question))
         return response.lower() == 'y'
     
-    def _generate_tree_listing(self):
-        """Generate tree listing of volume contents"""
+    def _generate_tree_listing(self) -> bool:
+        """Generate tree listing of volume contents; returns True on success"""
         log_divider("Generating Tree Listing")
-        tree_cmd = ["tree", "-RapugD", "--si", "--du", f"/Volumes/{self.config.volume_name}"]
+        target = self.config.mount_point or f"/Volumes/{self.config.volume_name}"
+        tree_cmd = ["tree", "-RapugD", "--si", "--du", target]
         try:
             log(colorize("cyan", "Generating tree listing..."))
             log(colorize("cyan", "Running command:") + " " + colorize("yellow", " ".join(tree_cmd)))
             with open(self.config.tree_path, "w", encoding="utf-8") as f:
-                subprocess.run(tree_cmd, stdout=f, stderr=subprocess.STDOUT,
+                proc = subprocess.run(tree_cmd, stdout=f, stderr=subprocess.STDOUT,
                              env={**os.environ, "LANG": "en_US.UTF-8"})
+            if proc.returncode != 0:
+                log(colorize("yellow", f"Warning: tree exited with status {proc.returncode}; listing may be missing or incomplete."))
+                return False
             log(colorize("cyan", "Tree saved to:") + " " + colorize("yellow", str(self.config.tree_path)))
+            return True
         except Exception as e:
             log(colorize("red", f"Tree generation failed: {e}"))
+            return False
     
-    def _create_and_verify_iso(self, disk_size: int) -> Tuple[float, str, str]:
-        """Create ISO with parallel hash calculation"""
-        log_divider("Creating and Verifying ISO")
+    def _create_and_verify_iso(self, disk_size: int) -> IsoCreationResult:
+        """Create ISO with in-stream source hashing, then verify by re-reading the written file"""
+        log_divider("Creating ISO")
         log(colorize("cyan", "Creating ISO from:") + " " + colorize("yellow", self.config.disk_id))
-        
+
         raw_disk = f"r{self.config.disk_id}"
         dd_command = f"dd if=/dev/{raw_disk} of={self.config.output_path} bs=4m"
         log(colorize("cyan", "Running command:") + " " + colorize("yellow", dd_command))
-        log(colorize("cyan", "Verifying using:") + " " + colorize("yellow", f"md5 {self.config.output_path.name} and streamed raw disk hash"))
-        
-        # Show shell equivalent
-        shell_equiv = f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
-        log(colorize("cyan", "Shell equivalent:") + " " + colorize("yellow", shell_equiv))
-        
-        iso_hasher = hashlib.md5()
+
         raw_hasher = hashlib.md5()
+        raw_sha_hasher = hashlib.sha256()
         bytes_written = 0
+        warnings: List[str] = []
         start_time = time.time()
-        
+        if self.run:
+            self.run.mark("copy_start")
+
         # Initialize progress display
-        print("\n" * 4, end="")
-        
-        try:
-            with open(self.config.output_path, 'wb') as iso_file:
-                with subprocess.Popen(["dd", f"if=/dev/{raw_disk}", "bs=4m"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
-                    while True:
-                        chunk = proc.stdout.read(4 * 1024 * 1024)  # 4MB chunks
-                        if not chunk:
-                            break
-                        
-                        # Write to file and update hashes
-                        iso_file.write(chunk)
-                        iso_hasher.update(chunk)
-                        raw_hasher.update(chunk)
-                        bytes_written += len(chunk)
-                        
-                        # Update progress (with "ISO Creation:" label to match expected output)
-                        self._display_progress("ISO Creation", bytes_written, disk_size, start_time)
-                    
-                    # Wait for dd to complete and get stderr (which contains the transfer stats)
-                    _, stderr = proc.communicate()
-                    if proc.returncode != 0:
-                        raise RuntimeError(f"dd failed: {stderr.decode()}")
-                    
-                    # Print dd output (records in/out, transfer stats) - decode and strip
-                    if stderr:
-                        # Decode bytes to string and clean up the output
-                        dd_output = stderr.strip() if isinstance(stderr, str) else stderr.decode().strip()
-                        log(dd_output)
-        
-        except KeyboardInterrupt:
-            log(colorize("red", "Operation interrupted by user."))
-            sys.exit(1)
-        
+        if ANSI_ENABLED:
+            print("\n" * 4, end="")
+
+        # A KeyboardInterrupt here propagates to create_backup(), which records
+        # the interruption as a failed run and renames the partial ISO.
+        with open(self.config.output_path, 'wb') as iso_file:
+            with subprocess.Popen(["dd", f"if=/dev/{raw_disk}", "bs=4m"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                while True:
+                    chunk = proc.stdout.read(4 * 1024 * 1024)  # 4MB chunks
+                    if not chunk:
+                        break
+
+                    # Write to file and update the streamed source hashes
+                    iso_file.write(chunk)
+                    raw_hasher.update(chunk)
+                    raw_sha_hasher.update(chunk)
+                    bytes_written += len(chunk)
+
+                    # Update progress (with "ISO Creation:" label to match expected output)
+                    self._display_progress("ISO Creation", bytes_written, disk_size, start_time)
+
+                # Wait for dd to complete and get stderr (which contains the transfer stats)
+                _, stderr = proc.communicate()
+                if proc.returncode != 0:
+                    raise RuntimeError(f"dd failed: {stderr.decode()}")
+
+                # Print dd output (records in/out, transfer stats) - decode and strip
+                if stderr:
+                    # Decode bytes to string and clean up the output
+                    dd_output = stderr.strip() if isinstance(stderr, str) else stderr.decode().strip()
+                    log(dd_output)
+
+            # Force data to physical media before the verification pass below;
+            # plain fsync on macOS stops at the drive cache, F_FULLFSYNC does not.
+            iso_file.flush()
+            try:
+                fcntl.fcntl(iso_file.fileno(), fcntl.F_FULLFSYNC)
+            except (OSError, AttributeError):
+                os.fsync(iso_file.fileno())
+                warnings.append("F_FULLFSYNC unavailable; fell back to fsync, which on "
+                                "macOS may not flush the drive's own write cache before "
+                                "verification")
+
+        # Completeness check: a bit-perfect *equal* copy is not enough — it must
+        # also be *complete*. dd exits 0 on a short read (bad sector, flaky USB
+        # optical drive), and the streamed and re-read hashes would then match
+        # over the same truncated bytes. Compare what we wrote against the disc's
+        # reported size and fail hard on any shortfall. (disk_size == 0 means the
+        # size was unknown up front, so there is nothing to compare against.)
+        if disk_size and bytes_written < disk_size:
+            raise RuntimeError(
+                f"Short read: copied {bytes_written} of {disk_size} bytes "
+                f"({disk_size - bytes_written} bytes missing). The disc may have a "
+                f"read error; the ISO is incomplete and will not be certified.")
+
         creation_time = time.time() - start_time
-        iso_hash = iso_hasher.hexdigest()
         raw_hash = raw_hasher.hexdigest()
-        
+        raw_sha = raw_sha_hasher.hexdigest()
+        if self.run:
+            self.run.mark("copy_end")
+
         log(colorize("green", "ISO creation complete."))
+        log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
+        log(colorize("cyan", "SHA-256 (Raw Disk):") + " " + colorize("yellow", raw_sha))
+
+        # Independent verification: re-read the written ISO from disk and hash it,
+        # so the comparison reflects the bytes that actually landed on disk.
+        log_divider("Verifying ISO")
+        log(colorize("cyan", "Verifying using:") + " " + colorize("yellow", f"md5 {self.config.output_path.name} (re-read from disk) vs streamed raw disk hash"))
+
+        # Optional operator check: this performs a fresh raw-device read, unlike
+        # the script's automated verification, which uses the streamed source hash.
+        manual_check = (f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] '
+                        f'&& echo "MATCH" || echo "MISMATCH"')
+        log(colorize("cyan", "Optional manual spot-check (fresh raw-device read; not run automatically):")
+            + " " + colorize("yellow", manual_check))
+
+        iso_hasher = hashlib.md5()
+        iso_sha_hasher = hashlib.sha256()
+        verify_start = time.time()
+        bytes_read = 0
+        if self.run:
+            self.run.mark("verify_start")
+
+        # Initialize progress display
+        if ANSI_ENABLED:
+            print("\n" * 4, end="")
+
+        with open(self.config.output_path, 'rb') as iso_file:
+            # Bypass the page cache so we hash what is on disk, not the
+            # copy of the data still sitting in memory from the write.
+            try:
+                fcntl.fcntl(iso_file.fileno(), fcntl.F_NOCACHE, 1)
+            except (OSError, AttributeError):
+                warnings.append("F_NOCACHE unavailable; the verification read may have "
+                                "been served from the page cache rather than re-read from "
+                                "disk, weakening the independence of the verification pass")
+            while True:
+                chunk = iso_file.read(4 * 1024 * 1024)  # 4MB chunks
+                if not chunk:
+                    break
+                iso_hasher.update(chunk)
+                iso_sha_hasher.update(chunk)
+                bytes_read += len(chunk)
+                self._display_progress("Verification", bytes_read, bytes_written, verify_start)
+
+        verification_time = time.time() - verify_start
+        iso_hash = iso_hasher.hexdigest()
+        iso_sha = iso_sha_hasher.hexdigest()
+        if self.run:
+            self.run.mark("verify_end")
+
         log(colorize("cyan", "MD5 (ISO):") + " " + colorize("yellow", iso_hash))
         log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
-        
-        if iso_hash == raw_hash:
-            log(colorize("green", "Checksum match: ISO is a true bit-for-bit copy."))
+        log(colorize("cyan", "SHA-256 (ISO):") + " " + colorize("yellow", iso_sha))
+        log(colorize("cyan", "SHA-256 (Raw Disk):") + " " + colorize("yellow", raw_sha))
+
+        if iso_hash == raw_hash and iso_sha == raw_sha:
+            log(colorize("green", "Checksum match: ISO on disk is a true bit-for-bit copy."))
         else:
-            log(colorize("red", "Checksum mismatch! ISO may not be identical."))
-        
-        return creation_time, iso_hash, raw_hash
+            log(colorize("red", "Checksum mismatch! ISO on disk does not match the source stream."))
+
+        return IsoCreationResult(
+            creation_time=creation_time,
+            verification_time=verification_time,
+            md5_raw=raw_hash,
+            md5_iso=iso_hash,
+            sha256_raw=raw_sha,
+            sha256_iso=iso_sha,
+            output_path=self.config.output_path,
+            warnings=warnings,
+        )
     
     def _display_progress(self, title: str, current: int, total: int, start_time: float):
         """Display progress information"""
+        if not ANSI_ENABLED:
+            # Redirected output: one plain line per ~10% instead of cursor codes
+            if total > 0:
+                decile = min(10, current * 10 // total)
+                key = (title, decile)
+                if decile > 0 and key not in self._progress_marks:
+                    self._progress_marks.add(key)
+                    log(f"{title}: {decile * 10}% ({current / (1024*1024):.0f}MB / {total / (1024*1024):.0f}MB)")
+            return
         elapsed = time.time() - start_time
         speed = current / elapsed if elapsed > 0 else 0
         remaining = max(0, total - current)
@@ -585,36 +1463,44 @@ class OpticalDiscBackup:
             log(colorize("red", f"Failed to unmount:\n{e.stderr}"))
             return False
     
-    def _finalize_disk(self):
-        """Remount and eject disk"""
+    def _finalize_disk(self) -> Optional[bool]:
+        """Eject the disc; True if ejected, False if the eject failed,
+        None when nothing was attempted (dry run)"""
         log_divider("Finalizing")
         if self.config.dry_run:
-            # Check if already mounted
-            mount_info = run_cmd(["diskutil", "info", self.config.disk_id])
-            already_mounted = any(re.match(r"\s*Mounted:\s*Yes", line) for line in mount_info.splitlines())
-            if already_mounted:
-                log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "No actions necessary. Disk already mounted."))
-            else:
-                log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "Mounting disk but skipping eject."))
-                log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil mount {self.config.disk_id}"))
-                subprocess.run(["diskutil", "mount", self.config.disk_id])
+            # Inspect only — a dry run must not change system state
+            try:
+                mounted = bool(run_cmd(["diskutil", "info", "-plist", f"/dev/{self.config.disk_id}"],
+                                       plist=True).get("MountPoint"))
+                state = "mounted" if mounted else "not mounted"
+                log(colorize("cyan", "Dry run:") + " " + colorize("yellow", f"Disk is {state}; leaving as-is (no mount, no eject)."))
+            except Exception as e:
+                log(colorize("yellow", f"Dry run: could not read mount state: {e}"))
+            return None
         else:
-            log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil mount /dev/{self.config.disk_id}"))
-            subprocess.run(["diskutil", "mount", f"/dev/{self.config.disk_id}"])
+            # Eject directly — diskutil eject works on an unmounted disk, and
+            # the goal of finalization is physical release of the disc.
             log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil eject /dev/{self.config.disk_id}"))
-            subprocess.run(["diskutil", "eject", f"/dev/{self.config.disk_id}"])
-            log(colorize("green", "Disk remounted and ejected. All done."))
+            eject_proc = subprocess.run(["diskutil", "eject", f"/dev/{self.config.disk_id}"],
+                                        capture_output=True, text=True)
+            if eject_proc.returncode != 0:
+                log(colorize("yellow", f"Warning: eject failed: {eject_proc.stderr.strip() or eject_proc.stdout.strip()}"))
+                return False
+            log(colorize("green", "Disk ejected. All done."))
+            return True
     
     def _generate_summary(self, result: BackupResult):
         """Generate timing summary"""
         log_divider("Summary")
         if not self.config.dry_run:
-            elapsed = result.creation_time
-            speed = result.speed_mb_s(elapsed)
+            speed = result.speed_mb_s(result.creation_time)
             multiplier = calculate_disc_speed_multiplier(speed, self.config.media_type)
-            log(colorize("cyan", "Time to create + verify:") + " " + colorize("yellow", f"{elapsed:.2f} seconds") +
-                f" ({format_duration(elapsed)})")
-            log(colorize("cyan", "Average speed:") + " " + colorize("yellow", f"{speed:.2f} MB/s ({multiplier})"))
+            log(colorize("cyan", "Time to create:") + " " + colorize("yellow", f"{result.creation_time:.2f} seconds") +
+                f" ({format_duration(result.creation_time)})")
+            if result.verification_time:
+                log(colorize("cyan", "Time to verify:") + " " + colorize("yellow", f"{result.verification_time:.2f} seconds") +
+                    f" ({format_duration(result.verification_time)})")
+            log(colorize("cyan", "Average creation speed:") + " " + colorize("yellow", f"{speed:.2f} MB/s ({multiplier})"))
         else:
             log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "No timing summary available."))
     
@@ -787,19 +1673,20 @@ class OpticalDiscBackup:
         """Create comprehensive manifest file with improved organization"""
         # Get current timestamp
         now = datetime.datetime.now()
+        record = RecordView.from_run(self.config, result)
         
         # Extract tree listing summary
         tree_summary = self._extract_tree_summary()
         
         # Calculate additional metrics
         # Get ISO file size
-        iso_file_size = result.iso_path.stat().st_size if result.iso_path.exists() else None
+        iso_file_size = record.iso_stat_path.stat().st_size if record.iso_stat_path.exists() else None
         
         # Build comprehensive manifest
         manifest = {
             "backup_metadata": {
-                "run_id": f"{now.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.disk_id}",
-                "uuid": str(uuid4()),
+                "run_id": self.run.run_id if self.run else f"{now.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.disk_id}",
+                "uuid": self.run.run_uuid if self.run else str(uuid4()),
                 "tool_name": "Optical Disc ISO Backup Utility",
                 "tool_version": "v14-streamlined",
                 "created": now.isoformat(timespec="seconds"),
@@ -808,10 +1695,13 @@ class OpticalDiscBackup:
             },
             
             "backup_status": {
-                "overall_status": "success" if result.success else "failed",
+                "overall_status": ("dry_run" if self.config.dry_run
+                                   else (("success_with_warnings" if result.warnings else "success") if result.success
+                                         else ("verification_failed" if result.checksum_match is False else "failed"))),
                 "iso_created": iso_file_size is not None,
-                "verification_performed": not self.config.no_verification and not self.config.dry_run,
+                "verification_performed": result.md5_iso is not None,
                 "verification_passed": result.checksum_match if result.checksum_match is not None else "skipped",
+                "warnings": result.warnings,
                 "errors": result.error_message if result.error_message else None
             },
             
@@ -839,43 +1729,53 @@ class OpticalDiscBackup:
             },
             
             "output_files": {
-                "iso_filename": result.iso_path.name,
+                "iso_filename": record.files.iso.name,
                 "iso_file_size_bytes": iso_file_size,
                 "iso_file_size_formatted": format_bytes(iso_file_size) if iso_file_size else None,
                 "output_directory": str(self.config.output_dir),
-                "log_filename": self.config.log_path.name,
-                "tree_filename": self.config.tree_path.name,
-                "isolyzer_filename": self.config.isolyzer_path.name,
-                "manifest_filename": self.config.manifest_path.name
+                "log_filename": record.files.log.name,
+                "tree_filename": record.files.tree.name,
+                "isolyzer_filename": record.files.isolyzer.name,
+                "manifest_filename": record.files.manifest.name
             },
             
             "operations_performed": {
                 "tree_listing": {
-                    "command": f"tree -RapugD --si --du /Volumes/{self.config.volume_name}",
-                    "output_file": self.config.tree_path.name,
+                    "command": f"tree -RapugD --si --du {self.config.mount_point or '/Volumes/' + self.config.volume_name}",
+                    "output_file": record.files.tree.name,
                     "summary": tree_summary
                 },
                 "disk_unmount": {
                     "command": f"diskutil unmountDisk /dev/{self.config.disk_id}",
-                    "status": "success" if not self.config.dry_run else "skipped"
+                    "status": ("interrupted" if result.unmount_interrupted else
+                               ("skipped" if self.config.dry_run else "not_attempted")
+                               if result.unmount_ok is None else ("success" if result.unmount_ok else "failed"))
                 },
                 "iso_creation": {
-                    "command": f"dd if=/dev/r{self.config.disk_id} of={result.iso_path} bs=4m",
-                    "method": "parallel processing with simultaneous hash calculation",
+                    "command": (f"dd if=/dev/r{self.config.disk_id} of={result.creation_path or self.config.output_path} bs=4m"
+                                if self.config.dry_run or result.creation_path else None),
+                    "method": "streamed copy with in-stream source hash calculation",
+                    "publish_method": (("run-private attempt ISO promoted to canonical filename after verification"
+                                        if result.success else
+                                        "run-private attempt ISO was not promoted because the run failed")
+                                       if result.creation_path and result.creation_path != self.config.canonical_output_path
+                                       else "written directly to canonical filename"),
                     "block_size": "4MB",
-                    "performed": not self.config.dry_run
+                    "performed": bool(result.creation_path) and not self.config.dry_run
                 },
                 "verification": {
-                    "method": "md5 hash comparison (ISO file vs raw device stream)",
-                    "algorithm": "MD5",
-                    "algorithm_bits": 128,
-                    "performed": not self.config.no_verification and not self.config.dry_run,
-                    "shell_equivalent": f'[ "$(md5 -q {result.iso_path.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] && echo "MATCH" || echo "MISMATCH"'
+                    "method": "md5 + sha-256 hash comparison (written ISO re-read from disk vs raw device stream)",
+                    "algorithms": ["MD5", "SHA-256"],
+                    "performed": result.md5_iso is not None,
+                    "note": "The script does not perform a second raw-device read during verification; it compares the source hash captured during the copy stream to a re-read of the written ISO.",
+                    "optional_manual_spot_check": (f'[ "$(md5 -q {record.files.iso.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] '
+                                                   f'&& echo "MATCH" || echo "MISMATCH"')
                 },
                 "finalization": {
-                    "remount_command": f"diskutil mount /dev/{self.config.disk_id}",
                     "eject_command": f"diskutil eject /dev/{self.config.disk_id}",
-                    "status": "completed" if not self.config.dry_run else "skipped"
+                    "status": ("interrupted" if result.eject_interrupted else
+                               "skipped" if self.config.dry_run or result.unmount_ok is not True
+                               else ("completed" if result.finalized else "failed"))
                 }
             },
             
@@ -888,24 +1788,25 @@ class OpticalDiscBackup:
                     "average_speed_multiplier": calculate_disc_speed_multiplier(result.speed_mb_s(result.creation_time), self.config.media_type)
                 },
                 "verification": {
-                    "duration_seconds": 0.0,  # Done in parallel
-                    "duration_formatted": "Performed during creation",
-                    "note": "Verification performed during ISO creation (parallel processing)"
+                    "duration_seconds": result.verification_time,
+                    "duration_formatted": format_duration(result.verification_time),
+                    "note": "Written ISO re-read from disk and hashed after creation"
                 },
                 "total_operation": {
-                    "duration_seconds": result.creation_time,
-                    "duration_formatted": format_duration(result.creation_time),
-                    "efficiency_note": "~50% time savings vs sequential read/verify operations"
+                    "duration_seconds": result.total_time,
+                    "duration_formatted": format_duration(result.total_time),
+                    "efficiency_note": "Source hash computed in-stream during creation; verification adds one sequential read of the ISO"
                 }
             },
             
             "integrity_verification": {
-                "hash_algorithm": "MD5",
-                "hash_length_bits": 128,
+                "hash_algorithms": ["MD5", "SHA-256"],
                 "iso_hash": result.md5_iso,
                 "source_hash": result.md5_raw,
+                "sha256_iso_hash": result.sha256_iso,
+                "sha256_source_hash": result.sha256_raw,
                 "hashes_match": result.checksum_match,
-                "verification_method": "Parallel hash calculation during creation",
+                "verification_method": "Source hashed in-stream during creation; written ISO re-read from disk (cache bypassed) and hashed",
                 "integrity_status": "verified" if result.checksum_match else ("failed" if result.checksum_match is False else "not_performed"),
                 "notes": "ISO verified as bit-perfect copy" if result.checksum_match else None
             },
@@ -994,9 +1895,11 @@ class OpticalDiscBackup:
                 "backup_parameters": {
                     "dd_block_size": "4MB",
                     "read_device": f"/dev/r{self.config.disk_id}",
-                    "write_destination": str(result.iso_path),
+                    "write_destination": (str(result.creation_path or self.config.output_path)
+                                          if self.config.dry_run or result.creation_path else None),
+                    "final_destination": str(record.files.iso),
                     "parallel_processing": True,
-                    "verification_during_creation": True,
+                    "verification_during_creation": False,
                     "error_handling": "standard dd error handling"
                 }
             },
@@ -1005,9 +1908,9 @@ class OpticalDiscBackup:
                 "verification_levels": [
                     {
                         "type": "bit_perfect_copy",
-                        "method": "MD5 hash comparison",
-                        "status": "verified" if result.checksum_match else "failed",
-                        "confidence": "100%" if result.checksum_match else "0%"
+                        "method": "MD5 + SHA-256 hash comparison",
+                        "status": "verified" if result.checksum_match else ("failed" if result.checksum_match is False else "not_performed"),
+                        "confidence": "100%" if result.checksum_match else ("0%" if result.checksum_match is False else "n/a")
                     },
                     {
                         "type": "structural_integrity", 
@@ -1035,7 +1938,7 @@ class OpticalDiscBackup:
         # Write manifest with proper formatting
         with open(self.config.manifest_path, "w") as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
-        
+
         log(colorize("cyan", "Manifest saved to:") + " " + colorize("yellow", str(self.config.manifest_path)))
     
     def _extract_filesystem_info(self, iso_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1073,6 +1976,8 @@ class OpticalDiscBackup:
     def _analyze_iso_structure(self, iso_path: Path) -> Dict[str, Any]:
         """Analyze ISO structure with isolyzer"""
         log_divider("Analyzing ISO Structure")
+        if self.run:
+            self.run.mark("isolyzer")
         log(colorize("cyan", "Running isolyzer analysis..."))
         
         try:
@@ -1144,7 +2049,7 @@ class OpticalDiscBackup:
                 f.write('  <image>\n')
                 f.write('    <statusInfo>\n')
                 f.write('      <success>False</success>\n')
-                f.write(f'      <error>{str(e)}</error>\n')
+                f.write(f'      <error>{xml_escape(str(e))}</error>\n')
                 f.write('    </statusInfo>\n')
                 f.write('  </image>\n')
                 f.write('</isolyzer>\n')
@@ -1186,17 +2091,6 @@ class OpticalDiscBackup:
     
 ### === HELPER FUNCTIONS ===
 
-def get_volume_name(disk_id: str) -> str:
-    """Extract volume name from disk info"""
-    try:
-        info = run_cmd(["diskutil", "info", f"/dev/{disk_id}"])
-        for line in info.splitlines():
-            if "Volume Name:" in line:
-                return line.split(":", 1)[1].strip()
-    except subprocess.CalledProcessError:
-        pass
-    return "Unknown"
-
 def list_disks() -> str:
     """List available disks"""
     try:
@@ -1219,7 +2113,7 @@ def print_help():
 {colorize('yellow', 'OPTIONS:')}
   {colorize('green', '-h, --help')}              Show this help message and exit
   {colorize('green', '--dry-run')}               Run without writing ISO or verifying checksum
-  {colorize('green', '--no-verification')}       Skip ISO checksum verification  
+  {colorize('green', '--force')}                 Skip the optical-media safety check
   {colorize('green', '--filename NAME')}         ISO filename (without extension)
   {colorize('green', '--dir PATH')}              Output directory path (can use ~)
   {colorize('green', '--operator NAME')}         Operator name or initials
@@ -1235,12 +2129,26 @@ def print_help():
   sudo python3 makeiso.py --dry-run
 
 {colorize('yellow', 'KEY FEATURES:')}
-  • {colorize('green', 'Parallel processing:')} Creates ISO while calculating checksums
+  • {colorize('green', 'Parallel processing:')} Creates ISO while calculating the source checksum
   • {colorize('green', 'Progress tracking:')} Real-time speed and remaining time
   • {colorize('green', 'Comprehensive logging:')} Detailed logs saved to .log.txt
   • {colorize('green', 'Metadata manifest:')} JSON file with complete backup metadata
   • {colorize('green', 'Tree listing:')} Directory structure saved to .txt file
-  • {colorize('green', 'Cross-verification:')} Compares ISO and raw disk MD5 hashes
+  • {colorize('green', 'Cross-verification:')} Compares ISO and raw disk MD5 and SHA-256 hashes
+
+{colorize('yellow', 'REPLACING AN EXISTING BUNDLE:')}
+  Nothing is touched until the new copy verifies (a --dry-run, which makes no
+  copy, writes its tree, log and manifest over the existing ones in place and
+  archives nothing). Then the current bundle is
+  moved, unchanged, into {colorize('cyan', '<name>_overwritten-<stamp>-<rand>/')} and the new one is
+  published. Ctrl-C is held during those few renames, so it cannot stop them
+  halfway; if a rename fails they are rolled back as far as the filesystem
+  allows, and the records say where every file is.
+
+{colorize('yellow', 'EXIT STATUS:')}
+  0 success; 1 failure; 2 checksum mismatch; 130 a Ctrl-C was received but
+  the master had verified and was kept (only an interrupted eject is also
+  recorded, as a warning). In a --dry-run, Ctrl-C simply stops the run.
 
 {colorize('red', 'IMPORTANT:')} This script must be run with sudo privileges.
 """
@@ -1266,9 +2174,9 @@ def parse_args() -> argparse.Namespace:
     )
     
     parser.add_argument(
-        '--no-verification', 
-        action='store_true', 
-        help='Skip ISO checksum verification'
+        '--force',
+        action='store_true',
+        help='Skip the optical-media safety check'
     )
     
     parser.add_argument(
@@ -1298,24 +2206,38 @@ def gather_user_inputs(args: argparse.Namespace) -> BackupConfig:
     """Gather all necessary inputs from user and command line"""
     # Get disk ID
     disk_id = get_input(colorize("cyan", "Enter disk ID (e.g. disk2): "))
-    
-    # Get volume name
-    volume_name = get_volume_name(disk_id)
-    log(colorize("cyan", "Volume name detected:") + " " + colorize("yellow", volume_name))
-    
-    # Get disk info to show volume size and media type
+    # Whole-disk identifiers only: this tool images/unmounts/ejects an entire
+    # optical disc, so reject partition slices (diskNsM) and anything that could
+    # turn into a traversing device path like /dev/rdisk2/../... reaching dd.
+    if not re.fullmatch(r"disk\d+", disk_id):
+        log(colorize("red", f"Invalid disk ID: {disk_id!r}. Expected a whole-disk "
+                            f"identifier like 'disk2' (no partition slice, no path)."))
+        sys.exit(1)
+
+    # One plist fetch covers volume name, size, and media type (the same
+    # structured source create_backup() uses, rather than scraping text output)
+    volume_name = "Unknown"
     try:
         disk_info = run_cmd(["diskutil", "info", "-plist", f"/dev/{disk_id}"], plist=True)
-        disk_size = disk_info.get("TotalSize", 0)
-        disk_size_mb = disk_size / (1024 * 1024)
+        volume_name = disk_info.get("VolumeName") or "Unknown"
+        log(colorize("cyan", "Volume name detected:") + " " + colorize("yellow", volume_name))
+        disk_size_mb = disk_info.get("TotalSize", 0) / (1024 * 1024)
         log(colorize("cyan", "Volume size:") + " " + colorize("yellow", f"{disk_size_mb:.0f} MB"))
         media_type = disk_info.get("OpticalMediaType", "Unknown")
         log(colorize("cyan", "Media type:") + " " + colorize("yellow", media_type))
-    except:
-        pass
+    except Exception:
+        log(colorize("yellow", f"Could not read disk info for /dev/{disk_id} (re-checked at backup start)."))
     
     # Get other inputs
     filename = args.filename or get_input(colorize("cyan", "Enter output ISO filename (no extension): "))
+    # The filename becomes a directory component and its files are chowned as
+    # root later; require a simple basename so it cannot point outside the
+    # output directory (rejects '..', absolute paths, and anything with '/').
+    if (not filename or filename != Path(filename).name or filename in (".", "..")
+            or filename.startswith(("-", "~"))):
+        log(colorize("red", f"Invalid filename: {filename!r}. Use a simple name with no path separators "
+                            f"that does not start with '-' or '~'."))
+        sys.exit(1)
     base_dir = Path(args.dir or get_input(colorize("cyan", "Enter output directory: "))).expanduser()
     operator = args.operator or get_input(colorize("cyan", "Enter operator name or initials: "))
     
@@ -1329,7 +2251,7 @@ def gather_user_inputs(args: argparse.Namespace) -> BackupConfig:
         operator=operator,
         output_dir=output_dir,
         dry_run=args.dry_run,
-        no_verification=args.no_verification
+        force=args.force
     )
 
 ### === MAIN FUNCTION ===
@@ -1356,14 +2278,23 @@ def main():
     backup = OpticalDiscBackup(config)
     result = backup.create_backup()
     
-    # Exit with appropriate code
+    # Exit with appropriate code. A failure keeps its own code even if Ctrl-C
+    # was pressed; a run whose master verified but that saw a Ctrl-C (during
+    # the eject, held during publication, or after recording) exits 130.
     if result.success:
-        if result.checksum_match is False:
-            log(colorize("yellow", "Warning: Checksum mismatch detected!"))
-            sys.exit(2)  # Warning exit code
+        if config.dry_run:
+            log(colorize("green", "Dry run completed — no ISO was created."))
         else:
             log(colorize("green", "Backup completed successfully!"))
-            sys.exit(0)
+        if backup.interrupted and not config.dry_run:
+            log(colorize("yellow", "Ctrl-C was received, but the master had verified and was "
+                                   "kept (an interrupted eject is also recorded as a warning). "
+                                   "Exit status 130."))
+            sys.exit(130)
+        sys.exit(0)
+    elif result.checksum_match is False:
+        log(colorize("red", "Backup failed verification: checksum mismatch!"))
+        sys.exit(2)  # Distinct exit code for verification failure
     else:
         log(colorize("red", f"Backup failed: {result.error_message}"))
         sys.exit(1)
