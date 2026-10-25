@@ -366,7 +366,7 @@ sudo python3 makeiso.py [options]
 
 Options:
   -h, --help              Show help message and exit
-  --dry-run               Run without creating ISO (test mode)
+  --dry-run               Rehearse without creating an ISO (still writes tree, log and manifest; see Dry Runs)
   --force                 Skip the optical-media safety check (allows imaging devices diskutil does not report as optical)
   --filename NAME         ISO filename (without .iso extension)
   --dir PATH              Output directory (supports ~)
@@ -385,7 +385,7 @@ sudo python3 makeiso.py
 sudo python3 makeiso.py --filename "My_DVD_Backup" --dir ~/Backups --operator JD
 ```
 
-**Test run without creating files:**
+**Rehearsal without creating an ISO** (it still writes a tree listing, log and manifest, so the output folder must not hold this filename's bundle; see [Dry Runs](#dry-runs)):
 ```bash
 sudo python3 makeiso.py --dry-run
 ```
@@ -466,7 +466,7 @@ For a backup with filename `JPC_AV_00001`, the script creates a directory contai
 
 #### Replacing an Existing Bundle
 
-If the folder already holds a bundle, you are asked before anything starts. Nothing is touched until the new copy has verified. Then the current bundle is moved, unchanged and under its own file names, into a new folder, and the new bundle is published in its place. (A `--dry-run` makes no copy and archives nothing: it writes its tree listing, log and manifest over the existing ones in place, so do not dry-run into an existing bundle's folder.)
+If the folder already holds a bundle, you are asked before anything starts. Nothing is touched until the new copy has verified. Then the current bundle is moved, unchanged and under its own file names, into a new folder, and the new bundle is published in its place. (A `--dry-run` never replaces a bundle; see [Dry Runs](#dry-runs).)
 
 ```
 ~/Backups/JPC_AV_00001/
@@ -481,6 +481,14 @@ If the folder already holds a bundle, you are asked before anything starts. Noth
 Each archived manifest still names its own ISO, so `verifyiso.py` checks every retained master against its own hashes. Inside archived records only the file names are current: their full paths (output directory, final destination) still name the canonical location, which now holds the new master. `makeiso-video.py --batch` skips these folders.
 
 The few renames that archive the old bundle and publish the new one run with Ctrl-C held, so Ctrl-C cannot stop them halfway. If a rename fails, they are rolled back as far as the filesystem allows. The rollback is best effort and never replaces a file. If this run's files cannot all be moved out of the canonical names, nothing is restored. If a restore fails partway, the files already restored are moved back into the archive folder. So after a single failing rename, a bundle that was archived whole stays complete in its archive folder, where each manifest still names its own ISO. If renames keep failing, files can be left split between canonical names and the archive folder. The failed run's records always list where each file actually is. A folder the rollback empties is removed.
+
+#### Dry Runs
+
+A `--dry-run` makes no ISO and verifies nothing, but it does write its own tree listing, log and manifest (`overall_status` `dry_run`) under the canonical names. So it is refused before anything is written (exit `1`, no prompt) if any of the five bundle names — `<name>.iso`, `<name>.iso.log.txt`, `<name>_manifest.json`, `<name>_tree.txt`, `<name>_isolyzer.xml` — is already taken in the output folder, by a file (even an empty one), a folder or a symlink (even a broken one). Choose a fresh `--dir` or `--filename`. Other files in the folder are allowed and left alone.
+
+Each dry-run file is created new, never over an existing file or through a symlink; if a name is taken while the run is going, the run stops there and leaves that file alone. A dry run whose tree listing or records fail stops with exit `1` and lists the exact paths of the files it created, which may be incomplete: remove only those if they are not wanted, never the whole folder. A successful dry run's manifest names no existing ISO, so `verifyiso.py` reports it `SKIPPED`.
+
+Under `sudo`, the files a dry run creates are handed to the invoking user through their own open descriptors. An output folder the dry run creates keeps its owner (root), because the run cannot prove that the folder at that path is still the one it made; create the folder yourself first if you want to manage the dry run's files without `sudo`.
 
 #### Failed Run Naming
 
@@ -504,7 +512,7 @@ Successful runs use the standard names above. A failed run does not leave behind
 - **While the run records are written:** recorded as a failed run; nothing is published.
 - **During the final renames:** Ctrl-C is held until they finish. If publication completes, the bundle and its records are final and accurate (they do not mention the Ctrl-C) and the run exits `130`. If a rename failed, the best-effort rollback runs first (see [Replacing an Existing Bundle](#replacing-an-existing-bundle)) and the run is recorded as failed.
 - **After the run is recorded** (summary, file-ownership fix): a successful run exits `130`, its bundle and records final; file ownership may not have been fixed. A failed run keeps its own exit code.
-- **In a `--dry-run`:** Ctrl-C simply stops the run, as before; nothing is recorded for it.
+- **In a `--dry-run`:** Ctrl-C simply stops the run, as before; nothing more is recorded, and the tree listing, log or manifest it had already created may be incomplete (see [Dry Runs](#dry-runs)).
 
 **Only Ctrl-C is handled.** Closing the Terminal window, `kill`, `kill -9` or a power loss stops the script without clean-up, so files may be left under their canonical names, inside an `*_overwritten-*` folder, or under `attempt-*` names. Before changing anything, check each manifest's `run_id` and the `iso_filename` it names, and keep every ISO until the right one is identified. A leftover `*_attempt-*_manifest.json` belongs to an attempt whose publication did not finish; it names the canonical ISO, so if `verifyiso.py` reports `PASS` for it the canonical ISO is that attempt's master, and if `FAIL`, it is not.
 
@@ -544,7 +552,7 @@ Checksum match: ISO on disk is a true bit-for-bit copy.
 | Code | Meaning |
 |------|---------|
 | `0` | Success — backup completed (see note below) |
-| `1` | Failure — backup failed (see error message) |
+| `1` | Failure — backup failed (see error message), or a dry run was refused or failed |
 | `2` | Verification failed — written ISO does not match the source (run is marked failed) |
 | `130` | Ctrl-C was received, but the master had verified and was kept (see [Interruptions](#interruptions-ctrl-c-and-recovery); only an interrupted eject is also recorded, as a warning); a failed run keeps its own code, and a `--dry-run` just stops |
 

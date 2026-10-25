@@ -19,6 +19,7 @@ import json
 import logging
 import fcntl
 import signal
+import pwd
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
@@ -394,8 +395,10 @@ def fmt_diskutil_size(bytes_val: int, total_bytes: int = None) -> str:
 
 def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult,
                         start_time: datetime.datetime, disk_info: Dict[str, Any],
-                        iso_analysis: Dict[str, Any] = None, run: RunContext = None):
-    """Create a properly formatted log file"""
+                        iso_analysis: Dict[str, Any] = None, run: RunContext = None,
+                        opener=None):
+    """Create a properly formatted log file (opener, when given, creates it:
+    a dry run's exclusive creation)"""
 
     end_time = datetime.datetime.now()
     total_duration = (end_time - start_time).total_seconds()
@@ -406,7 +409,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         t = run.step_times.get(step, fallback) if run else fallback
         return t.strftime('%H:%M:%S')
     
-    with open(log_path, "w") as f:
+    with (opener(log_path) if opener else open(log_path, "w")) as f:
         # === HEADER SUMMARY ===
         f.write("=" * 70 + "\n")
         f.write("OPTICAL DISC TO ISO BACKUP LOG\n")
@@ -641,6 +644,10 @@ class DeferredInterrupt:
             signal.signal(signal.SIGINT, self._previous)
         return False
 
+class DryRunStopped(Exception):
+    """A dry run that cannot finish truthfully (its tree listing failed, or
+    one of its file names was taken): it stops before writing anything more"""
+
 ### === MAIN BACKUP CLASS ===
 
 class OpticalDiscBackup:
@@ -660,10 +667,95 @@ class OpticalDiscBackup:
         self._published = False
         self._archive_dir: Optional[Path] = None  # this run's overwritten-* folder
         self._rollback_problems: List[str] = []    # files rollback could not put back
+        self._dry_run_files: List[Path] = []       # files a dry run created, in order
+        self._operator_uid_value: Optional[int] = None
+        self._operator_uid_known = False
 
     def _standard_artifacts(self) -> List[Path]:
         """Canonical artifacts that a successful run publishes."""
         return self.config.canonical_artifacts.archive_order
+
+    ### --- dry runs: exclusive creation and owned-object ownership ---
+
+    def _operator_uid(self) -> Optional[int]:
+        """The uid of SUDO_USER, the account _fix_ownership hands a normal
+        run's files to; None when there is none (or it is unknown)"""
+        if not self._operator_uid_known:
+            self._operator_uid_known = True
+            sudo_user = os.environ.get("SUDO_USER")
+            if sudo_user:
+                try:
+                    self._operator_uid_value = pwd.getpwnam(sudo_user).pw_uid
+                except KeyError:
+                    log(colorize("yellow", f"Warning: unknown SUDO_USER {sudo_user!r}; "
+                                           f"this dry run's files stay owned by root"))
+        return self._operator_uid_value
+
+    def _give_to_operator(self, fd: int, path: Path):
+        """Change the owner of an object this run holds open (never by name)"""
+        uid = self._operator_uid()
+        if uid is None:
+            return
+        try:
+            os.fchown(fd, uid, -1)
+        except OSError as e:
+            log(colorize("yellow", f"Warning: could not change the owner of {path}: {e}"))
+
+    def _keep_new_dry_run_folder_owner(self, folder: Path):
+        """A dry run never changes the owner of the output folder it created.
+        mkdir gives no descriptor, and reopening the path cannot prove the
+        folder now there is the one it made (another folder, even one with the
+        same owner, could have been moved in), so the folder keeps its owner,
+        with a warning. Only the files this run creates exclusively change
+        owner, through their own descriptors."""
+        if self._operator_uid() is None:
+            return
+        log(colorize("yellow", f"Warning: the output folder {folder} was created by this dry "
+                               f"run and keeps its owner (root); only the files it creates are "
+                               f"handed to {os.environ.get('SUDO_USER')}. Create the folder "
+                               f"yourself first to manage it without sudo."))
+
+    def _create_dry_run_file(self, path: Path, encoding: Optional[str] = None):
+        """Create one of a dry run's files (tree listing, log, manifest). A dry
+        run writes at the canonical names, so it only ever creates a new file
+        there: mode "x" (O_CREAT|O_EXCL) never truncates an existing file and
+        never follows a symlink; a taken name raises FileExistsError. The file
+        counts as this run's own at once, and changes owner through its open
+        descriptor."""
+        f = open(path, "x", encoding=encoding)
+        self._dry_run_files.append(path)
+        try:
+            self._give_to_operator(f.fileno(), path)
+        except BaseException:
+            f.close()
+            raise
+        return f
+
+    def _dry_run_problem(self, error: Exception, what: str) -> str:
+        if isinstance(error, FileExistsError):
+            name = Path(error.filename).name if error.filename else what
+            return (f"{name} appeared in {self.config.output_dir} during the dry run and was "
+                    f"left unchanged; choose a fresh --dir or --filename")
+        return f"{what} failed: {error}"
+
+    def _dry_run_files_note(self) -> str:
+        """Exact paths of a stopped dry run's own files (possibly incomplete)"""
+        if not self._dry_run_files:
+            return "It created no files."
+        return ("Files this dry run created, possibly incomplete (remove only these if "
+                f"they are not wanted): {', '.join(str(p) for p in self._dry_run_files)}")
+
+    def _dry_run_refusal(self, occupied: List[Path], disk_size: int) -> BackupResult:
+        names = ", ".join(p.name for p in occupied)
+        message = (f"Dry run refused: {self.config.output_dir} already holds {names}. A dry run "
+                   f"writes its own tree listing, log and manifest under {self.config.filename}'s "
+                   f"canonical names, so it runs only where none of them is taken. Nothing was "
+                   f"changed; choose a fresh --dir or --filename.")
+        return BackupResult(False, self.config.output_path, disk_size, error_message=message)
+
+    def _dry_run_stopped(self, reason: str, disk_size: int) -> BackupResult:
+        message = f"Dry run stopped: {reason}. {self._dry_run_files_note()}"
+        return BackupResult(False, self.config.output_path, disk_size, error_message=message)
 
     def _relative(self, path: Path) -> str:
         """A path as shown in messages: relative to the output directory"""
@@ -875,8 +967,9 @@ class OpticalDiscBackup:
 
     def _write_run_records(self, result: BackupResult, start_time: datetime.datetime,
                            disk_info: Dict[str, Any], iso_analysis: Dict[str, Any]):
+        opener = self._create_dry_run_file if self.config.dry_run else None
         create_formatted_log(self.config.log_path, self.config, result,
-                             start_time, disk_info, iso_analysis, self.run)
+                             start_time, disk_info, iso_analysis, self.run, opener=opener)
         self._create_manifest(result, disk_info, iso_analysis)
 
     def _write_failure_records_best_effort(self, result: BackupResult,
@@ -947,6 +1040,8 @@ class OpticalDiscBackup:
             created_output_dir = True
         except FileExistsError:
             created_output_dir = False
+        if created_output_dir and self.config.dry_run:
+            self._keep_new_dry_run_folder_owner(self.config.output_dir)
 
         if self.config.output_dir.is_symlink() or not self.config.output_dir.is_dir():
             log(colorize("red", f"Output path {self.config.output_dir} exists but is not a real directory "
@@ -955,24 +1050,28 @@ class OpticalDiscBackup:
                                       error_message=f"Output path {self.config.output_dir} is not a directory")
 
         planned = self._standard_artifacts()
+        if self.config.dry_run:
+            # A dry run writes its tree listing, log and manifest at the
+            # canonical names, so it runs only where none of the five is taken
+            # by anything (a file, an empty file, a folder, a live or broken
+            # symlink). There is no overwrite prompt.
+            occupied = [p for p in planned if os.path.lexists(p)]
+            if occupied:
+                return None, self._dry_run_refusal(occupied, disk_size)
+
         linked = [p.name for p in planned if p.is_symlink()]
         if linked:
             log(colorize("red", f"Refusing to continue: symlink(s) at planned output path(s): {', '.join(linked)}"))
             return None, BackupResult(False, self.config.output_path, disk_size,
                                       error_message=f"Symlink at planned output path(s): {', '.join(linked)}")
 
-        replace_candidates = (
-            [self.config.canonical_log_path, self.config.canonical_manifest_path,
-             self.config.canonical_tree_path]
-            if self.config.dry_run else planned
-        )
-        existing_artifacts = [p for p in replace_candidates if p.exists()]
-        if existing_artifacts and not self._confirm_overwrite(existing_artifacts):
-            names = ", ".join(p.name for p in existing_artifacts)
-            return None, BackupResult(False, self.config.output_path, disk_size,
-                                      error_message=f"Aborted to avoid replacing existing artifact(s): {names}")
-
         if not self.config.dry_run:
+            existing_artifacts = [p for p in planned if p.exists()]
+            if existing_artifacts and not self._confirm_overwrite(existing_artifacts):
+                names = ", ".join(p.name for p in existing_artifacts)
+                return None, BackupResult(False, self.config.output_path, disk_size,
+                                          error_message=f"Aborted to avoid replacing existing artifact(s): {names}")
+
             self.config.attempt_token = f"attempt-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
         prepared = BackupPreparation(disk_info, disk_size, created_output_dir,
                                      self.config.artifacts)
@@ -1110,13 +1209,16 @@ class OpticalDiscBackup:
                     raise  # a dry run makes no master: Ctrl-C simply stops it
                 self.interrupted = True
                 problem = "Interrupted by operator (Ctrl-C) while writing run records"
+            elif self.config.dry_run:
+                problem = (f"Dry run stopped: {self._dry_run_problem(e, 'writing its log and manifest')}. "
+                           f"{self._dry_run_files_note()}")
             else:
                 problem = f"Could not write run records before publish: {e}"
             if result.success:
                 result.success = False
                 result.error_message = problem
-                log(colorize("red", f"Backup failed: {result.error_message}"))
-                if not self.config.dry_run:
+                if not self.config.dry_run:  # main reports a dry run's message
+                    log(colorize("red", f"Backup failed: {result.error_message}"))
                     self._fail_staged_success(result, attempt, start_time,
                                               disk_info, iso_analysis)
             else:
@@ -1157,6 +1259,8 @@ class OpticalDiscBackup:
                              "(any file it could not put back is listed in the warnings)"))
 
     def _fix_ownership(self, result: BackupResult, created_output_dir: bool):
+        if self.config.dry_run:
+            return  # a dry run's files changed owner as it created them; its new folder keeps its owner
         sudo_user = os.environ.get("SUDO_USER")
         if not sudo_user:
             return
@@ -1187,7 +1291,11 @@ class OpticalDiscBackup:
         if early_result:
             return early_result
 
-        phase = self._run_copy_phase(prepared.disk_size)
+        try:
+            phase = self._run_copy_phase(prepared.disk_size)
+        except DryRunStopped as e:
+            # A failed dry-run tree listing: no record is written after it
+            return self._dry_run_stopped(str(e), prepared.disk_size)
         result = self._build_backup_result(phase, prepared.disk_size, prepared.attempt)
         try:
             self._record_and_publish(result, start_time, prepared.disk_info,
@@ -1239,33 +1347,43 @@ class OpticalDiscBackup:
         before the new artifacts publish.
         """
         names = ", ".join(p.name for p in existing_paths)
-        if self.config.dry_run:
-            question = (f"This dry run writes its tree listing, log and manifest over the existing "
-                        f"ones ({names}) in place; nothing is archived. Continue? (y/n): ")
-        else:
-            question = (f"Existing artifact(s) may be replaced by this run ({names}); if the new "
-                        f"copy verifies, the current ones are kept in a "
-                        f"{self.config.filename}_overwritten-* folder. Continue? (y/n): ")
+        question = (f"Existing artifact(s) may be replaced by this run ({names}); if the new "
+                    f"copy verifies, the current ones are kept in a "
+                    f"{self.config.filename}_overwritten-* folder. Continue? (y/n): ")
         response = get_input(colorize("yellow", question))
         return response.lower() == 'y'
     
     def _generate_tree_listing(self) -> bool:
-        """Generate tree listing of volume contents; returns True on success"""
+        """Generate tree listing of volume contents; returns True on success.
+
+        A normal run treats a failed listing as a warning. A dry run's listing
+        is one of its own outputs, so there any failure (its name taken, the
+        file not creatable, writable or closable, tree missing or failing)
+        raises DryRunStopped instead."""
         log_divider("Generating Tree Listing")
         target = self.config.mount_point or f"/Volumes/{self.config.volume_name}"
         tree_cmd = ["tree", "-RapugD", "--si", "--du", target]
         try:
             log(colorize("cyan", "Generating tree listing..."))
             log(colorize("cyan", "Running command:") + " " + colorize("yellow", " ".join(tree_cmd)))
-            with open(self.config.tree_path, "w", encoding="utf-8") as f:
+            with (self._create_dry_run_file(self.config.tree_path, encoding="utf-8")
+                  if self.config.dry_run else
+                  open(self.config.tree_path, "w", encoding="utf-8")) as f:
                 proc = subprocess.run(tree_cmd, stdout=f, stderr=subprocess.STDOUT,
                              env={**os.environ, "LANG": "en_US.UTF-8"})
             if proc.returncode != 0:
+                if self.config.dry_run:
+                    raise DryRunStopped(f"tree exited with status {proc.returncode}, so the "
+                                        f"listing is missing or incomplete")
                 log(colorize("yellow", f"Warning: tree exited with status {proc.returncode}; listing may be missing or incomplete."))
                 return False
             log(colorize("cyan", "Tree saved to:") + " " + colorize("yellow", str(self.config.tree_path)))
             return True
+        except DryRunStopped:
+            raise
         except Exception as e:
+            if self.config.dry_run:
+                raise DryRunStopped(self._dry_run_problem(e, "the tree listing")) from e
             log(colorize("red", f"Tree generation failed: {e}"))
             return False
     
@@ -1936,7 +2054,8 @@ class OpticalDiscBackup:
         }
         
         # Write manifest with proper formatting
-        with open(self.config.manifest_path, "w") as f:
+        with (self._create_dry_run_file(self.config.manifest_path) if self.config.dry_run
+              else open(self.config.manifest_path, "w")) as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
 
         log(colorize("cyan", "Manifest saved to:") + " " + colorize("yellow", str(self.config.manifest_path)))
@@ -2112,7 +2231,7 @@ def print_help():
 
 {colorize('yellow', 'OPTIONS:')}
   {colorize('green', '-h, --help')}              Show this help message and exit
-  {colorize('green', '--dry-run')}               Run without writing ISO or verifying checksum
+  {colorize('green', '--dry-run')}               Rehearse without an ISO; still writes tree, log and manifest
   {colorize('green', '--force')}                 Skip the optical-media safety check
   {colorize('green', '--filename NAME')}         ISO filename (without extension)
   {colorize('green', '--dir PATH')}              Output directory path (can use ~)
@@ -2125,7 +2244,7 @@ def print_help():
   {colorize('cyan', '# Specify filename, directory, and operator')}
   sudo python3 makeiso.py --filename MyDisc --dir ~/Backups --operator JD
 
-  {colorize('cyan', '# Test run without creating ISO')}
+  {colorize('cyan', '# Rehearsal without an ISO (writes tree, log and manifest; see DRY RUNS)')}
   sudo python3 makeiso.py --dry-run
 
 {colorize('yellow', 'KEY FEATURES:')}
@@ -2137,18 +2256,28 @@ def print_help():
   • {colorize('green', 'Cross-verification:')} Compares ISO and raw disk MD5 and SHA-256 hashes
 
 {colorize('yellow', 'REPLACING AN EXISTING BUNDLE:')}
-  Nothing is touched until the new copy verifies (a --dry-run, which makes no
-  copy, writes its tree, log and manifest over the existing ones in place and
-  archives nothing). Then the current bundle is
+  Nothing is touched until the new copy verifies. Then the current bundle is
   moved, unchanged, into {colorize('cyan', '<name>_overwritten-<stamp>-<rand>/')} and the new one is
   published. Ctrl-C is held during those few renames, so it cannot stop them
   halfway; if a rename fails they are rolled back as far as the filesystem
   allows, and the records say where every file is.
 
+{colorize('yellow', 'DRY RUNS:')}
+  A --dry-run makes no ISO, but writes its own tree listing, log and manifest
+  under the canonical names. It is refused (exit 1, nothing written) if any
+  <name>.iso, .iso.log.txt, _manifest.json, _tree.txt or _isolyzer.xml is
+  already there, as a file, folder or symlink: choose a fresh --dir or
+  --filename. Other files in the folder are left alone. A dry run that fails
+  exits 1 and lists the files it created, which may be incomplete; remove only
+  those. Ctrl-C simply stops it and can leave them incomplete too. Under sudo,
+  the files a dry run creates are handed to you, but a folder it creates stays
+  owned by root; create the folder yourself first to manage it without sudo.
+
 {colorize('yellow', 'EXIT STATUS:')}
-  0 success; 1 failure; 2 checksum mismatch; 130 a Ctrl-C was received but
-  the master had verified and was kept (only an interrupted eject is also
-  recorded, as a warning). In a --dry-run, Ctrl-C simply stops the run.
+  0 success; 1 failure (including a refused or failed dry run); 2 checksum
+  mismatch; 130 a Ctrl-C was received but the master had verified and was
+  kept (only an interrupted eject is also recorded, as a warning). In a
+  --dry-run, Ctrl-C simply stops the run.
 
 {colorize('red', 'IMPORTANT:')} This script must be run with sudo privileges.
 """
@@ -2296,7 +2425,8 @@ def main():
         log(colorize("red", "Backup failed verification: checksum mismatch!"))
         sys.exit(2)  # Distinct exit code for verification failure
     else:
-        log(colorize("red", f"Backup failed: {result.error_message}"))
+        log(colorize("red", result.error_message if config.dry_run
+                     else f"Backup failed: {result.error_message}"))
         sys.exit(1)
 
 ### === SCRIPT ENTRYPOINT ===

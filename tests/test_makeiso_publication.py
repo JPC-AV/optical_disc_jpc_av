@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Synthetic tests for makeiso.py's bundle replacement: the per-replacement
 archive folder, rollback, Ctrl-C handling and truthful records (T-123,
-T-124), plus overwrite-then-verify with verifyiso.py.
+T-124), plus overwrite-then-verify with verifyiso.py, and dry runs that never
+change an existing file, a symlink's target or ownership (T-128).
 
 Standard library only. The drive is fake: disk info, tree listing, unmount,
 copy, isolyzer and eject are synthetic stand-ins writing small byte strings
-into a private directory. The guards in synthetic_support.py block child
+into a private directory (dry-run tests keep makeiso's own tree-listing
+method and fake only the tree command, chown and ownership calls). The guards in synthetic_support.py block child
 processes, sockets, devices and writes outside TMPDIR; the only child is this
 interpreter re-running this file with --sigint-child, so that a REAL SIGINT
 can be delivered mid-publication without disturbing the test runner. No
@@ -55,8 +57,11 @@ def hashes(data: bytes):
 
 @contextlib.contextmanager
 def synthetic_drive(payload: bytes, mismatch=False, finalize=None, tree=None, unmount=None,
-                    create_fails=False):
-    """Replace makeiso's native boundaries with synthetic ones"""
+                    create_fails=False, real_tree=False, confirm=None, sudo_user=None):
+    """Replace makeiso's native boundaries with synthetic ones. real_tree keeps
+    makeiso's own tree-listing method (the caller then fakes subprocess.run
+    for the tree command); confirm replaces the overwrite prompt; sudo_user
+    sets SUDO_USER inside the drive."""
     def disk_info(self):
         return {"TotalSize": len(payload), "OpticalMediaType": "DVD-ROM",
                 "MountPoint": "/Volumes/SYNTHETIC"}
@@ -89,11 +94,15 @@ def synthetic_drive(payload: bytes, mismatch=False, finalize=None, tree=None, un
                             ("_unmount_disk", unmount or (lambda self: True)),
                             ("_create_and_verify_iso", create),
                             ("_analyze_iso_structure", analyze), ("_finalize_disk", eject),
-                            ("_confirm_overwrite", lambda self, paths: True)):
+                            ("_confirm_overwrite", confirm or (lambda self, paths: True))):
+            if attr == "_generate_tree_listing" and real_tree:
+                continue
             stack.enter_context(mock.patch.object(imaging.OpticalDiscBackup, attr, value))
         stack.enter_context(mock.patch.object(imaging.os, "geteuid", lambda: 0))
         stack.enter_context(mock.patch.dict(os.environ, {}, clear=False))
         os.environ.pop("SUDO_USER", None)
+        if sudo_user:
+            os.environ["SUDO_USER"] = sudo_user
         yield
 
 
@@ -412,6 +421,432 @@ class PublicationTests(Base):
         self.assertFalse(any(c.startswith(str(folder) + os.sep) for c in chowned), chowned)
 
 
+# --- dry runs (T-128) -------------------------------------------------------
+
+TREE, LOG, MANIFEST = f"{NAME}_tree.txt", f"{NAME}.iso.log.txt", f"{NAME}_manifest.json"
+DRY_RUN_FILES = (TREE, LOG, MANIFEST)  # in the order a dry run creates them
+LISTING = "Synthetic tree: 1 directories, 1 files\n"
+OPERATOR_UID = 4242
+REAL_OPEN, REAL_FSTAT = open, os.fstat
+
+
+def state(folder: Path) -> dict:
+    """Every entry under folder, never following a link: relative path ->
+    (kind, bytes or link target, mode, size, mtime_ns, uid, gid, inode)"""
+    out = {}
+    for root, dirs, files in os.walk(folder, followlinks=False):
+        for name in dirs + files:
+            p = Path(root) / name
+            st = os.lstat(p)
+            if os.path.islink(p):
+                kind, data = "link", os.readlink(p)
+            elif p.is_dir():
+                kind, data = "dir", None
+            else:
+                kind, data = "file", p.read_bytes()
+            out[str(p.relative_to(folder))] = (kind, data, st.st_mode, st.st_size,
+                                               st.st_mtime_ns, st.st_uid, st.st_gid, st.st_ino)
+    return out
+
+
+def ident(path: Path):
+    st = os.lstat(path)
+    return st.st_dev, st.st_ino
+
+
+class FakeTools:
+    """subprocess.run for makeiso's own tree-listing method and its chown:
+    every call is recorded; the tree command writes LISTING into the file it
+    is given, or fails as asked"""
+
+    def __init__(self, status=0, missing=False):
+        self.status, self.missing = status, missing
+        self.trees, self.chowned = [], []
+
+    def run(self, cmd, *args, **kwargs):
+        cmd = [str(c) for c in cmd]
+        if cmd[0] == "chown":
+            self.chowned.append(cmd[2:])
+            return subprocess.CompletedProcess(cmd, 0)
+        if cmd[0] != "tree":
+            raise AssertionError(f"unexpected command {cmd!r}")
+        self.trees.append(cmd)
+        if self.missing:
+            raise FileNotFoundError(2, "No such file or directory", "tree")
+        kwargs["stdout"].write(LISTING)
+        return subprocess.CompletedProcess(cmd, self.status)
+
+
+class FailingFile:
+    """A file whose writes or close fail (disk full), as asked"""
+
+    def __init__(self, f, fail_on):
+        self.f, self.fail_on = f, fail_on
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+        if self.fail_on == "close" and exc[0] is None:
+            raise OSError(28, "synthetic: no space left on device")
+        return False
+
+    def fileno(self):
+        return self.f.fileno()
+
+    def write(self, data):
+        if self.fail_on == "write":
+            raise OSError(28, "synthetic: no space left on device")
+        return self.f.write(data)
+
+    def flush(self):
+        return self.f.flush()
+
+    def close(self):
+        self.f.close()
+
+
+@contextlib.contextmanager
+def at_creation(path: Path, action):
+    """Call action(file, mode, args, kwargs) just before makeiso opens path for
+    writing: the dry-run creation boundary. A non-None return replaces the file."""
+    def hooked_open(file, mode="r", *args, **kwargs):
+        if Path(file) == path and mode in ("x", "w"):
+            replacement = action(file, mode, args, kwargs)
+            if replacement is not None:
+                return replacement
+        return REAL_OPEN(file, mode, *args, **kwargs)
+    with mock.patch.object(imaging, "open", hooked_open, create=True):
+        yield
+
+
+@contextlib.contextmanager
+def fake_ownership(before=None, foreign=()):
+    """Ownership as if run as root under sudo: the operator's uid comes from a
+    fake pwd lookup; fchown is recorded with the identity of the object behind
+    the descriptor (before(fd) runs first); fstat reports this process's
+    objects as root's, except the identities in foreign. Ownership must never
+    change by path."""
+    calls = []
+
+    def fchown(fd, uid, gid):
+        if before:
+            before(fd)
+        st = REAL_FSTAT(fd)
+        calls.append(((st.st_dev, st.st_ino), uid, gid))
+
+    def fstat(fd):
+        st = REAL_FSTAT(fd)
+        values = list(st[:10])
+        values[4] = 501 if (st.st_dev, st.st_ino) in foreign else 0
+        return os.stat_result(values)
+
+    def by_path(*args, **kwargs):
+        raise AssertionError(f"ownership changed by path: {args!r}")
+
+    with mock.patch("pwd.getpwnam", lambda name: types.SimpleNamespace(pw_uid=OPERATOR_UID)), \
+            mock.patch.object(imaging.os, "fchown", fchown), \
+            mock.patch.object(imaging.os, "fstat", fstat), \
+            mock.patch.object(imaging.os, "chown", by_path), \
+            mock.patch.object(imaging.os, "lchown", by_path):
+        yield calls
+
+
+class DryRunTests(Base):
+    """T-128: a dry run never changes an existing file, a symlink's target or
+    anything's ownership; it creates its own tree, log and manifest exclusively"""
+
+    def setUp(self):
+        super().setUp()
+        self.tools = FakeTools()
+        self.prompts = []
+
+        def confirm(obj, paths):
+            self.prompts.append(sorted(p.name for p in paths))
+            return True
+        self.confirm = confirm
+
+    def dry_main(self, folder: Path, sudo_user=None):
+        """makeiso's main() as a dry run into folder: (exit status, log lines)"""
+        lines = []
+        with mock.patch.object(imaging.subprocess, "run", self.tools.run), \
+                mock.patch.object(imaging, "log", lines.append):
+            code = run_main(folder, b"", dry_run=True, real_tree=True,
+                            confirm=self.confirm, sudo_user=sudo_user)
+        return code, lines
+
+    def stop_message(self, lines) -> str:
+        found = [l for l in lines if l.startswith(("Dry run refused:", "Dry run stopped:"))]
+        self.assertEqual(len(found), 1, lines)
+        return found[0]
+
+    def case(self, label: str) -> Path:
+        folder = self.dir / label
+        folder.mkdir()
+        return folder
+
+    def assert_refused(self, before, code, lines):
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(state(self.dir), before, "something that existed changed")
+        self.assertEqual((self.tools.trees, self.prompts), ([], []), "tree or a prompt ran")
+        self.assertTrue(self.stop_message(lines).startswith("Dry run refused:"))
+
+    def assert_lists_own_files(self, message: str, own):
+        if own:
+            self.assertIn("Files this dry run created", message)
+            self.assertTrue(message.endswith(": " + ", ".join(str(p) for p in own)), message)
+        else:
+            self.assertTrue(message.endswith("It created no files."), message)
+
+    # refusal before anything is written
+
+    def test_each_canonical_name_refuses_the_dry_run(self):
+        for name in CANONICAL:
+            for kind in ("file", "empty", "folder"):
+                with self.subTest(name=name, kind=kind):
+                    folder = self.case(f"{kind}-{name}")
+                    if kind == "folder":
+                        (folder / name).mkdir()
+                    else:
+                        (folder / name).write_bytes(b"" if kind == "empty" else b"existing " + name.encode())
+                    before = state(self.dir)
+                    code, lines = self.dry_main(folder)
+                    self.assert_refused(before, code, lines)
+                    self.assertIn(name, self.stop_message(lines))
+
+    def test_a_whole_bundle_refuses_the_dry_run(self):
+        self.old_bundle()
+        before = state(self.dir)
+        code, lines = self.dry_main(self.dir)
+        self.assert_refused(before, code, lines)
+        self.assertEqual(verify_cli(self.dir)[0], 0, "the existing master no longer verifies")
+
+    def test_live_and_broken_symlinks_refuse_and_their_targets_stay(self):
+        targets = self.case("targets")
+        for i, name in enumerate(CANONICAL):
+            for kind in ("live", "broken"):
+                with self.subTest(name=name, kind=kind):
+                    folder = self.case(f"{kind}-link-{i}")
+                    target = targets / f"{kind}-{i}"
+                    if kind == "live":
+                        target.write_bytes(b"symlink target " + name.encode())
+                    (folder / name).symlink_to(target)
+                    before = state(self.dir)
+                    code, lines = self.dry_main(folder)
+                    self.assert_refused(before, code, lines)
+
+    # successful dry runs
+
+    def test_fresh_missing_and_empty_folders_succeed(self):
+        for folder in (self.dir / "missing" / "deeper", self.case("empty")):
+            with self.subTest(folder=folder.name):
+                code, lines = self.dry_main(folder)
+                self.assertEqual(code, 0, lines)
+                self.assertEqual(sorted(os.listdir(folder)), sorted(DRY_RUN_FILES))
+                self.assertEqual((folder / TREE).read_text(), LISTING)
+                manifest = json.loads((folder / MANIFEST).read_text())
+                self.assertEqual(manifest["backup_status"]["overall_status"], "dry_run")
+                checked = verify.check_manifest(folder / MANIFEST)
+                self.assertEqual((checked.status, checked.detail),
+                                 ("SKIPPED", "dry-run record — no master was made"))
+                self.assertEqual(verify_cli(folder)[0], 0)
+                self.assertEqual(self.prompts, [])
+
+    def test_unrelated_contents_are_allowed_and_untouched(self):
+        folder = self.case("shared")
+        (folder / "notes.txt").write_text("operator notes\n")
+        (folder / "other_disc.iso").write_bytes(b"another master")
+        (folder / f"{NAME}_failed-20261024T120000-abcdef_manifest.json").write_text("{}")
+        archive = folder / f"{NAME}_overwritten-20261024T101500-7b01de"
+        archive.mkdir()
+        (archive / f"{NAME}.iso").write_bytes(b"archived master")
+        before = state(folder)
+        code, lines = self.dry_main(folder)
+        self.assertEqual(code, 0, lines)
+        after = state(folder)
+        self.assertEqual({k: v for k, v in after.items() if k in before}, before)
+        self.assertEqual(sorted(set(after) - set(before)), sorted(DRY_RUN_FILES))
+
+    # names taken during the run, and failures
+
+    def test_a_name_taken_just_before_its_creation_stops_the_run(self):
+        targets = self.case("targets")
+        for i, name in enumerate(DRY_RUN_FILES):
+            for kind in ("file", "symlink"):
+                with self.subTest(name=name, kind=kind):
+                    folder = self.case(f"taken-{kind}-{i}")
+                    target = targets / f"target-{kind}-{i}"
+                    target.write_bytes(b"someone else's file")
+
+                    def take(file, mode, args, kwargs, path=folder / name, target=target, kind=kind):
+                        if kind == "file":
+                            path.write_bytes(b"appeared meanwhile")
+                        else:
+                            path.symlink_to(target)
+
+                    with at_creation(folder / name, take):
+                        code, lines = self.dry_main(folder)
+                    self.assertEqual(code, 1, lines)
+                    message = self.stop_message(lines)
+                    self.assertIn(f"{name} appeared", message)
+                    if kind == "file":
+                        self.assertEqual((folder / name).read_bytes(), b"appeared meanwhile")
+                    else:
+                        self.assertEqual(os.readlink(folder / name), str(target))
+                    self.assertEqual(target.read_bytes(), b"someone else's file")
+                    own = [folder / n for n in DRY_RUN_FILES[:i]]
+                    self.assertEqual(sorted(os.listdir(folder)), sorted([name] + [p.name for p in own]))
+                    self.assert_lists_own_files(message, own)
+
+    def test_creation_write_and_close_failures_stop_with_exit_1(self):
+        def fail_create(file, mode, args, kwargs):
+            raise PermissionError(13, "synthetic: permission denied", str(file))
+
+        def failing(fail_on):
+            return lambda file, mode, args, kwargs: FailingFile(REAL_OPEN(file, mode, *args, **kwargs),
+                                                                fail_on)
+
+        cases = (("create", TREE, fail_create, ()), ("close", TREE, failing("close"), (TREE,)),
+                 ("write", LOG, failing("write"), (TREE, LOG)),
+                 ("close", MANIFEST, failing("close"), (TREE, LOG, MANIFEST)))
+        for failure, name, action, own in cases:
+            with self.subTest(failure=failure, name=name):
+                folder = self.case(f"{failure}-{name}")
+                with at_creation(folder / name, action):
+                    code, lines = self.dry_main(folder)
+                self.assertEqual(code, 1, lines)
+                message = self.stop_message(lines)
+                self.assertIn("synthetic:", message)
+                self.assertEqual(sorted(os.listdir(folder)), sorted(own))
+                self.assert_lists_own_files(message, [folder / n for n in own])
+
+    def test_a_failing_or_missing_tree_command_stops_with_exit_1(self):
+        for label, tools, words in (("status", FakeTools(status=1), "tree exited with status 1"),
+                                    ("missing", FakeTools(missing=True), "No such file or directory")):
+            with self.subTest(label):
+                self.tools = tools
+                folder = self.case(f"tree-{label}")
+                code, lines = self.dry_main(folder)
+                self.assertEqual(code, 1, lines)
+                message = self.stop_message(lines)
+                self.assertIn(words, message)
+                self.assertEqual(os.listdir(folder), [TREE])
+                self.assert_lists_own_files(message, [folder / TREE])
+
+    # ownership: only objects this run created, through their descriptors
+
+    def test_ownership_changes_only_through_descriptors_of_created_files(self):
+        # A folder the dry run creates keeps its owner, with a warning
+        for label in ("created", "existing"):
+            with self.subTest(folder=label):
+                folder = self.dir / f"{label}-folder"
+                if label == "existing":
+                    folder.mkdir()
+                with fake_ownership() as calls:
+                    code, lines = self.dry_main(folder, sudo_user="synthetic-operator")
+                self.assertEqual(code, 0, lines)
+                self.assertEqual([c[0] for c in calls], [ident(folder / n) for n in DRY_RUN_FILES])
+                self.assertTrue(all(c[1:] == (OPERATOR_UID, -1) for c in calls), calls)
+                self.assertEqual(self.tools.chowned, [], "ownership changed by name")
+                warned = [l for l in lines if "keeps its owner (root)" in l]
+                self.assertEqual(len(warned), 1 if label == "created" else 0, lines)
+
+    def test_a_created_file_replaced_before_its_owner_change_is_left_alone(self):
+        folder = self.case("swapped")
+        elsewhere = self.case("elsewhere")
+        target = elsewhere / "target"
+        target.write_bytes(b"not this run's file")
+        before = state(elsewhere)
+        tree = folder / TREE
+        created = {}
+
+        def swap(fd):
+            st = REAL_FSTAT(fd)
+            if not created and os.path.lexists(tree) and ident(tree) == (st.st_dev, st.st_ino):
+                created["tree"] = (st.st_dev, st.st_ino)
+                tree.unlink()
+                tree.symlink_to(target)
+
+        with fake_ownership(before=swap) as calls:
+            code, lines = self.dry_main(folder, sudo_user="synthetic-operator")
+        self.assertIn("tree", created, "no owner change ran on the created tree listing")
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(os.readlink(tree), str(target))
+        self.assertEqual(state(elsewhere), before)
+        owned = [c[0] for c in calls]
+        self.assertIn(created["tree"], owned)
+        self.assertNotIn(ident(target), owned)
+        self.assertEqual(self.tools.chowned, [])
+
+    def test_a_folder_substituted_after_mkdir_never_changes_owner(self):
+        # mkdir gives no descriptor: whatever is then at the path - a
+        # preexisting folder with the same (root) owner or a different one, or
+        # a symlink to one - keeps its owner, and so does the folder made
+        real_mkdir = Path.mkdir
+        for kind in ("same owner", "different owner", "symlink"):
+            with self.subTest(kind=kind):
+                label = kind.replace(" ", "-")
+                folder = self.dir / f"requested-{label}"
+                preexisting = self.case(f"preexisting-{label}")
+                (preexisting / "keep.txt").write_text("preexisting unrelated material\n")
+                replacement = ident(preexisting)
+                foreign = {replacement} if kind == "different owner" else set()
+                made = []
+
+                def mkdir(path, *args, folder=folder, preexisting=preexisting, kind=kind,
+                          label=label, made=made, **kwargs):
+                    real_mkdir(path, *args, **kwargs)
+                    if path == folder:
+                        made.append(ident(folder))
+                        folder.rename(self.dir / f"actually-created-{label}")
+                        if kind == "symlink":
+                            folder.symlink_to(preexisting, target_is_directory=True)
+                        else:
+                            preexisting.rename(folder)
+
+                with mock.patch.object(Path, "mkdir", mkdir), \
+                        fake_ownership(foreign=foreign) as calls:
+                    code, lines = self.dry_main(folder, sudo_user="synthetic-operator")
+                owned = [c[0] for c in calls]
+                self.assertTrue(made, "the substitution point was never reached")
+                self.assertNotIn(replacement, owned, "the substituted folder changed owner")
+                self.assertNotIn(made[0], owned, "the folder this run made changed owner")
+                self.assertTrue(any("keeps its owner (root)" in l for l in lines), lines)
+                now = preexisting if kind == "symlink" else folder
+                self.assertEqual(ident(now), replacement)
+                self.assertEqual((now / "keep.txt").read_text(), "preexisting unrelated material\n")
+                if kind == "symlink":
+                    self.assertEqual(code, 1, lines)  # no longer a real folder: refused
+                    self.assertEqual(calls, [])
+                else:
+                    self.assertEqual(code, 0, lines)
+                    self.assertEqual(owned, [ident(folder / n) for n in DRY_RUN_FILES])
+                self.assertEqual(self.tools.chowned, [])
+
+    # normal runs keep their behavior
+
+    def test_normal_replacement_still_asks_and_archives(self):
+        self.old_bundle()
+        with synthetic_drive(b"new verified synthetic master", confirm=self.confirm):
+            result = imaging.OpticalDiscBackup(config(self.dir)).create_backup()
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(self.prompts, [sorted(CANONICAL)])
+        self.assertEqual(len(archives(self.dir)), 1)
+        self.assertEqual(canonical(self.dir)[f"{NAME}.iso"], b"new verified synthetic master")
+
+    def test_normal_tree_failure_is_still_only_a_warning(self):
+        self.tools = FakeTools(status=1)
+        with synthetic_drive(b"synthetic master", real_tree=True), \
+                mock.patch.object(imaging.subprocess, "run", self.tools.run):
+            result = imaging.OpticalDiscBackup(config(self.dir)).create_backup()
+        self.assertTrue(result.success, result.error_message)
+        self.assertIn("tree listing failed or incomplete", result.warnings)
+        self.assertEqual(sorted(canonical(self.dir)), sorted(CANONICAL))
+        manifest = json.loads((self.dir / MANIFEST).read_text())
+        self.assertEqual(manifest["backup_status"]["overall_status"], "success_with_warnings")
+
+
 # --- the child that receives a real SIGINT ---------------------------------
 
 def _send_sigint_once(state):
@@ -427,7 +862,8 @@ def _child_main(scenario: str, folder: Path) -> int:
     old = b"old verified synthetic master"
     new = b"new verified synthetic master"
     state = {}
-    if scenario not in ("tree", "unmount", "eject_verified", "eject_mismatch", "dry_tree"):
+    if scenario not in ("tree", "unmount", "eject_verified", "eject_mismatch",
+                        "dry_tree", "dry_records"):
         obj, result = backup(folder, old)
         assert result.success
     restore_exit = None
@@ -469,9 +905,19 @@ def _child_main(scenario: str, folder: Path) -> int:
     real_log = imaging.create_formatted_log
 
     def formatted_log(*args, **kwargs):
-        if scenario == "records":
+        if scenario in ("records", "dry_records"):
             _send_sigint_once(state)
         return real_log(*args, **kwargs)
+
+    def tree_command(cmd, *args, **kwargs):
+        # A dry run's real tree-listing method runs; only the tree command is fake
+        if cmd[0] != "tree":
+            raise AssertionError(f"unexpected command {cmd!r}")
+        kwargs["stdout"].write("Synthetic tree: partial\n")
+        if scenario == "dry_tree":
+            kwargs["stdout"].flush()
+            _send_sigint_once(state)
+        return subprocess.CompletedProcess(cmd, 0)
 
     def eject(self):
         _send_sigint_once(state)
@@ -490,16 +936,21 @@ def _child_main(scenario: str, folder: Path) -> int:
     if scenario.startswith("eject"):
         drive["finalize"] = eject
         drive["mismatch"] = scenario == "eject_mismatch"
-    if scenario in ("tree", "dry_tree"):
+    if scenario == "tree":
         drive["tree"] = tree
+    dry_run = scenario.startswith("dry_")
+    if dry_run:
+        drive["real_tree"] = True
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.object(Path, "replace", replace))
         stack.enter_context(mock.patch.object(Path, "rename", rename))
         stack.enter_context(mock.patch.object(imaging, "create_formatted_log", formatted_log))
+        if dry_run:
+            stack.enter_context(mock.patch.object(imaging.subprocess, "run", tree_command))
         if restore_exit is not None:
             stack.enter_context(restore_exit)
         try:
-            code = run_main(folder, new, dry_run=scenario == "dry_tree", **drive)
+            code = run_main(folder, new, dry_run=dry_run, **drive)
         finally:
             print("SIGINT_SENT:", bool(state.get("sent")))
     print("HANDLER_RESTORED:", signal.getsignal(signal.SIGINT) is signal.default_int_handler)
@@ -559,12 +1010,17 @@ class InterruptTests(Base):
         self.assertEqual(list(self.dir.glob(f"{NAME}_failed-*")), [])
 
     def test_sigint_in_a_dry_run_stops_it_as_before(self):
-        old = self.old_bundle()
+        # In a fresh location (a dry run over an existing bundle is refused
+        # before its tree listing: DryRunTests). Only its own partial listing stays.
         code, output = self.child("dry_tree")
         self.assertEqual(code, -signal.SIGINT, output)
-        self.assertEqual({n: d for n, d in canonical(self.dir).items()
-                          if n != f"{NAME}_tree.txt"},
-                         {n: d for n, d in old.items() if n != f"{NAME}_tree.txt"})
+        self.assertEqual(sorted(os.listdir(self.dir)), [f"{NAME}_tree.txt"])
+        self.assertEqual((self.dir / f"{NAME}_tree.txt").read_text(), "Synthetic tree: partial\n")
+
+    def test_sigint_while_a_dry_run_writes_its_records_stops_it(self):
+        code, output = self.child("dry_records")
+        self.assertEqual(code, -signal.SIGINT, output)
+        self.assertEqual(sorted(os.listdir(self.dir)), [f"{NAME}_tree.txt"])
 
     def test_sigint_during_rollback_lets_the_rollback_finish(self):
         code, output = self.child("rollback_mid")
