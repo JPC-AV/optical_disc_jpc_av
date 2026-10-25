@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Synthetic tests for verifyiso.py: CSV report safety, manifest families and
 statuses, malformed items, and the eight fixture scenarios (T-122, T-125,
-T-126).
+T-126); and discovery that reports every part of the search it could not
+complete (T-134).
 
 Standard library only. Every file is synthetic and private (TMPDIR); the
 guards in synthetic_support.py block child processes, sockets, devices and
 writes outside the private directory. These tests check verifyiso's
-decisions, files and exit codes - not real collection media.
+decisions, files and exit codes - not real collection media. Discovery faults
+are injected through os.scandir and os.stat fakes that delegate everything
+else, with DirEntry stand-ins; symlinks and FIFOs are real files in the
+private directory, and a tripwire (installed before the product is loaded)
+stops any open of a FIFO or device before it can block.
 
 Run:  python3 tests/test_verifyiso.py
 OPTICAL_UNDER_TEST=/dir runs the same tests against another copy.
@@ -14,12 +19,15 @@ OPTICAL_UNDER_TEST=/dir runs the same tests against another copy.
 
 import contextlib
 import copy
+import csv
+import errno
 import hashlib
 import importlib.util
 import io
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -31,6 +39,37 @@ _spec = importlib.util.spec_from_file_location(
 support = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(support)
 support.install()
+
+# Special-file tripwire, installed before the product is loaded: an open of a
+# FIFO, device or socket fails at once with SpecialFileTripwire instead of
+# blocking the runner (an open is audited before the open call itself).
+# Every DiscoveryTests case asserts that no such open was attempted. It uses
+# the os.stat saved here, never a test's patched one, so a fault injected
+# into os.stat cannot hide a FIFO from it.
+class SpecialFileTripwire(RuntimeError):
+    """The product (or a negative control) tried to open a special file"""
+
+
+TRIPWIRE_OPENS = []
+_REAL_STAT = os.stat
+
+
+def _special_file_tripwire(event, args):
+    if event != "open" or not args or isinstance(args[0], int):
+        return
+    try:
+        mode = _REAL_STAT(args[0]).st_mode
+    except (OSError, TypeError, ValueError):
+        return
+    name = os.fsdecode(args[0])
+    if stat.S_ISREG(mode) or stat.S_ISDIR(mode) or os.path.realpath(name).startswith("/dev/"):
+        return
+    TRIPWIRE_OPENS.append(name)
+    raise SpecialFileTripwire(f"blocked an open of special file {name}")
+
+
+sys.addaudithook(_special_file_tripwire)
+
 
 verify = support.load("verifyiso_under_test", "verifyiso.py")
 fixtures = support.load("verify_fixtures_under_test", "tests/make_verify_fixtures.py")
@@ -452,6 +491,566 @@ class FixtureScenarioTests(Base):
         for name, expected in fixtures.EXPECTED.items():
             with self.subTest(scenario=name):
                 self.assertEqual(status_of(self.dir / name / f"{name}_manifest.json"), expected)
+
+
+# --- discovery (T-134) ---------------------------------------------------------
+
+class FakeEntry:
+    """A DirEntry stand-in: the real entry, except for the calls a test makes
+    fail. predicates_false makes is_dir/is_file/is_symlink return False, as
+    the real ones do once an entry has disappeared"""
+
+    def __init__(self, real, stat_error=None, stat_result=None, predicates_false=False):
+        self._real, self._stat_error, self._stat_result = real, stat_error, stat_result
+        self._false = predicates_false
+        self.name, self.path = real.name, real.path
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def is_dir(self, *, follow_symlinks=True):
+        return False if self._false else self._real.is_dir(follow_symlinks=follow_symlinks)
+
+    def is_file(self, *, follow_symlinks=True):
+        return False if self._false else self._real.is_file(follow_symlinks=follow_symlinks)
+
+    def is_symlink(self):
+        return False if self._false else self._real.is_symlink()
+
+    def stat(self, *, follow_symlinks=True):
+        if self._stat_error is not None:
+            raise self._stat_error
+        if self._stat_result is not None:
+            return self._stat_result
+        return self._real.stat(follow_symlinks=follow_symlinks)
+
+
+class FakeListing:
+    """os.scandir's iterator for one folder, in name order, that can fail
+    after a number of entries and hand out FakeEntry stand-ins"""
+
+    def __init__(self, real, folder, calls, fail_after=None, stand_ins=None):
+        with real:
+            self.entries = sorted(real, key=lambda e: e.name)
+        self.folder, self.calls = folder, calls
+        self.fail_after, self.stand_ins = fail_after, stand_ins or {}
+        self.index = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        if ("closed", self.folder) not in self.calls:
+            self.calls.append(("closed", self.folder))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.fail_after and self.index >= self.fail_after[0]:
+            raise self.fail_after[1]
+        if self.index >= len(self.entries):
+            raise StopIteration
+        entry = self.entries[self.index]
+        self.index += 1
+        changes = self.stand_ins.get(entry.name)
+        return FakeEntry(entry, **changes) if changes is not None else entry
+
+
+@contextlib.contextmanager
+def scandir_faults(open_errors=None, fail_after=None, entries=None):
+    """os.scandir with faults for chosen folders, delegating everything else
+    (the guards, the hashing and the product all use it). open_errors
+    {folder: exception}; fail_after {folder: (n, OSError)}; entries {folder:
+    {name: FakeEntry keywords}}. Yields the calls it intercepted."""
+    real = os.scandir
+    open_errors, fail_after, entries = open_errors or {}, fail_after or {}, entries or {}
+    calls = []
+
+    def scandir(path=".", *args, **kwargs):
+        folder = Path(os.fsdecode(path)) if not isinstance(path, int) else None
+        if folder in open_errors:
+            calls.append(("open", folder))
+            raise open_errors[folder]
+        listing = real(path, *args, **kwargs)
+        if folder in fail_after or folder in entries:
+            calls.append(("listed", folder))
+            return FakeListing(listing, folder, calls, fail_after.get(folder), entries.get(folder))
+        return listing
+
+    with mock.patch.object(os, "scandir", scandir):
+        yield calls
+
+
+@contextlib.contextmanager
+def target_stat_fails(links, error, label="loop"):
+    """os.stat, following links, raises error for these existing links (their
+    own lstat is untouched). Yields the calls it intercepted, as (label, path)"""
+    real = os.stat
+    calls = []
+
+    def stat(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(os.fsdecode(path)) in links \
+                and kwargs.get("follow_symlinks", True):
+            calls.append((label, Path(os.fsdecode(path))))
+            raise error
+        return real(path, *args, **kwargs)
+
+    with mock.patch.object(os, "stat", stat):
+        yield calls
+
+
+def looping(*links):
+    """os.stat reports a symlink loop (ELOOP) for these existing links. A real
+    loop link cannot be used: the guard's Path.resolve() raises on it in 3.9,
+    so it could not even be removed afterwards"""
+    return target_stat_fails(links, OSError(errno.ELOOP, "Too many levels of symbolic links"))
+
+
+def denied():
+    return PermissionError(errno.EACCES, "Permission denied")
+
+
+def io_error():
+    return OSError(errno.EIO, "Input/output error")
+
+
+class DiscoveryTests(Base):
+    """T-134: every part of the search is accounted for, healthy siblings and
+    other paths are still verified, and nothing left unsearched passes"""
+
+    def setUp(self):
+        super().setUp()
+        self._tripwire_before = len(TRIPWIRE_OPENS)
+        self.addCleanup(self._no_special_file_opens)
+        patcher = mock.patch.object(verify, "ANSI_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _no_special_file_opens(self):
+        self.assertEqual(TRIPWIRE_OPENS[self._tripwire_before:], [],
+                         "the product tried to open a FIFO or device (the tripwire stopped it)")
+
+    def masters(self, root, *folders):
+        for folder in folders:
+            self.master(folder=root / folder)
+        self.hashed.clear()
+
+    @staticmethod
+    def rows(report):
+        with open(report, newline="", encoding="utf-8") as f:
+            return list(csv.reader(f))
+
+    def exit_message(self, *paths, report=None):
+        """main()'s sys.exit() argument (a message string or a status)"""
+        argv = ["verifyiso.py"] + [str(p) for p in paths] + (["--csv", str(report)] if report else [])
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                verify.main()
+        return caught.exception.code
+
+    def test_healthy_tree_reports_as_before(self):
+        root = self.dir / "collection"
+        self.masters(root, "a", "b/c", "b/d")
+        report = self.dir / "report.csv"
+        code, output = self.cli(root, report=report)
+        self.assertEqual(code, 0, output)
+        self.assertIn("Found 3 manifest(s) to examine\n", output)
+        for text in ("DISCOVERY_ERROR", "EXCLUDED", "Search incomplete", "Not searched",
+                     "Items needing attention"):
+            self.assertNotIn(text, output)
+        rows = self.rows(report)
+        self.assertEqual(rows[0], ["status", "iso", "manifest", "size_bytes", "run_id",
+                                   "md5_expected", "md5_actual", "sha256_expected", "sha256_actual",
+                                   "detail", "hash_seconds", "checked_at"])
+        self.assertEqual([(r[0], r[2]) for r in rows[1:]],
+                         [("PASS", str(root / f / "disc_manifest.json")) for f in ("a", "b/c", "b/d")])
+
+    def test_a_folder_named_like_a_manifest_is_still_searched(self):
+        odd = self.dir / "odd_manifest.json"
+        self.masters(self.dir, "odd_manifest.json")
+        code, output = self.cli(self.dir)
+        self.assertEqual(code, 1, output)  # the folder itself is an ERROR row, as before
+        self.assertIn(f"{odd}: ERROR", output)
+        self.assertEqual(self.hashed, [odd / "disc.iso"])
+
+    def test_a_folder_that_cannot_be_listed_fails_the_search_but_not_its_siblings(self):
+        for n, error in enumerate((denied(), io_error())):
+            with self.subTest(errno.errorcode[error.errno]):
+                root = self.dir / f"case{n}"
+                self.masters(root, "a", "b", "c")
+                report = self.dir / f"report{n}.csv"
+                with scandir_faults(open_errors={root / "b": error}) as calls:
+                    code, output = self.cli(root, report=report)
+                self.assertIn(("open", root / "b"), calls, "the fault never reached the search")
+                self.assertEqual(code, 1, output)
+                self.assertNotIn("Traceback", output)
+                self.assertEqual(sorted(self.hashed), [root / "a" / "disc.iso", root / "c" / "disc.iso"])
+                self.assertIn(f"DISCOVERY_ERROR: {root / 'b'}: could not list folder: [Errno {error.errno}]",
+                              output)
+                self.assertIn("Search incomplete", output)
+                self.assertIn(f"  {root / 'b'}: DISCOVERY_ERROR — could not list folder", output)
+                rows = self.rows(report)[1:]
+                self.assertEqual([r[0] for r in rows], ["PASS", "PASS", "DISCOVERY_ERROR"])
+                self.assertTrue(rows[-1][9].startswith(f"{root / 'b'}: could not list folder"), rows[-1])
+                self.assertEqual((rows[-1][1], rows[-1][2], rows[-1][3], rows[-1][10]), ("", "", "0", "0.0"))
+
+    def test_every_bundle_passing_does_not_hide_an_incomplete_search(self):
+        # The audit's K1 shape: a readable and a denied subtree, both healthy
+        root = self.dir / "collection"
+        self.masters(root, "readable", "denied_subtree")
+        with scandir_faults(open_errors={root / "denied_subtree": denied()}) as calls:
+            code, output = self.cli(root)
+        self.assertIn(("open", root / "denied_subtree"), calls, "the fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertIn("PASS: 1", output)
+        self.assertIn("Search incomplete: 1 DISCOVERY_ERROR item(s)", output)
+
+    def test_a_listing_that_stops_partway_keeps_what_it_read(self):
+        root = self.dir / "collection"
+        self.masters(root, "a", "b", "c")
+        with scandir_faults(fail_after={root: (1, io_error())}) as calls:
+            code, output = self.cli(root)
+        self.assertIn(("listed", root), calls, "the fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [root / "a" / "disc.iso"])  # read before the failure
+        self.assertIn(f"DISCOVERY_ERROR: {root}: listing stopped partway: [Errno 5]", output)
+        self.assertIn(("closed", root), calls, "the listing was not closed")
+
+    def test_entries_that_cannot_be_inspected_or_disappear_keep_their_siblings(self):
+        cases = (("inspect", denied(), "could not inspect entry: [Errno 13]"),
+                 ("vanished", FileNotFoundError(errno.ENOENT, "No such file or directory"),
+                  "entry disappeared during the search"))
+        for label, error, text in cases:
+            with self.subTest(label):
+                root = self.dir / label
+                self.masters(root, "a", "b", "c")
+                fault = {root: {"a": dict(stat_error=error, predicates_false=True)}}
+                with scandir_faults(entries=fault) as calls:
+                    code, output = self.cli(root)
+                self.assertIn(("listed", root), calls, "the fault never reached the search")
+                self.assertEqual(code, 1, output)
+                self.assertEqual(sorted(self.hashed), [root / "b" / "disc.iso", root / "c" / "disc.iso"])
+                self.assertIn(f"DISCOVERY_ERROR: {root / 'a'}: {text}", output)
+
+    def test_a_folder_that_disappears_is_reported(self):
+        root = self.dir / "collection"
+        self.masters(root, "a", "b")
+        gone = FileNotFoundError(errno.ENOENT, "No such file or directory")
+        with scandir_faults(open_errors={root / "b": gone}) as calls:
+            code, output = self.cli(root)
+        self.assertIn(("open", root / "b"), calls, "the fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [root / "a" / "disc.iso"])
+        self.assertIn(f"DISCOVERY_ERROR: {root / 'b'}: folder disappeared during the search", output)
+
+    def test_one_bad_given_path_does_not_stop_the_others(self):
+        good, unlistable, unstatable = (self.dir / n for n in ("good", "unlistable", "unstatable"))
+        for folder in (good, unlistable, unstatable):
+            self.masters(folder, "a")
+        real_stat = os.stat
+        stat_calls = []
+
+        def stat_fault(path, *args, **kwargs):
+            if not isinstance(path, int) and Path(os.fsdecode(path)) == unstatable:
+                stat_calls.append(unstatable)
+                raise io_error()
+            return real_stat(path, *args, **kwargs)
+
+        report = self.dir / "report.csv"
+        with scandir_faults(open_errors={unlistable: denied()}) as calls, \
+                mock.patch.object(os, "stat", stat_fault):
+            code, output = self.cli(good, unlistable, unstatable, report=report)
+        self.assertIn(("open", unlistable), calls, "the fault never reached the search")
+        self.assertTrue(stat_calls, "the stat fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [good / "a" / "disc.iso"])
+        self.assertIn(f"DISCOVERY_ERROR: {unlistable}: could not list folder: [Errno 13]", output)
+        self.assertIn(f"DISCOVERY_ERROR: {unstatable}: could not check path: [Errno 5]", output)
+        self.assertEqual(sorted(r[0] for r in self.rows(report)[1:]),
+                         ["DISCOVERY_ERROR", "DISCOVERY_ERROR", "PASS"])
+
+    def test_overlapping_and_repeated_paths_check_each_manifest_once(self):
+        c = self.dir / "c"
+        self.masters(c, "a", "sub")
+        for label, paths in (("parent then child", (c, c / "sub")), ("child then parent", (c / "sub", c)),
+                             ("same path twice", (c, c))):
+            with self.subTest(label):
+                self.hashed.clear()
+                code, output = self.cli(*paths)
+                self.assertEqual(code, 0, output)
+                self.assertEqual(sorted(self.hashed), [c / "a" / "disc.iso", c / "sub" / "disc.iso"])
+
+    def test_a_given_manifest_link_keeps_its_own_folder(self):
+        x, y = self.dir / "x", self.dir / "y"
+        self.masters(y, ".")
+        x.mkdir()
+        (x / "disc.iso").write_bytes((y / "disc.iso").read_bytes())
+        os.symlink(y / "disc_manifest.json", x / "disc_manifest.json")
+        code, output = self.cli(x / "disc_manifest.json", y)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(sorted(self.hashed), [x / "disc.iso", y / "disc.iso"])
+
+    def test_symlinked_folders_inside_a_search_are_listed_not_followed(self):
+        outside, r = self.dir / "outside", self.dir / "r"
+        self.masters(outside, "batch")
+        self.masters(r, "own")
+        link = r / "linked"
+        os.symlink(outside / "batch", link)
+        report = self.dir / "uncovered.csv"
+        code, output = self.cli(r, report=report)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [r / "own" / "disc.iso"])
+        self.assertIn(f"EXCLUDED: {link}: symlinked folder not followed -> {outside / 'batch'}", output)
+        self.assertEqual([row[0] for row in self.rows(report)[1:]], ["PASS", "EXCLUDED"])
+        # Its target given as well: searched once there, and the link hides nothing
+        self.hashed.clear()
+        report = self.dir / "covered.csv"
+        code, output = self.cli(r, outside / "batch", report=report)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(sorted(self.hashed), [outside / "batch" / "disc.iso", r / "own" / "disc.iso"])
+        self.assertIn(f"Not searched (symlink, expected): {link}: symlinked folder not followed", output)
+        self.assertIn(f"(its target was searched as {outside / 'batch'})", output)
+        self.assertEqual([row[0] for row in self.rows(report)[1:]], ["PASS", "PASS"])
+
+    def test_coverage_is_never_a_name_prefix(self):
+        r, r_old = self.dir / "r", self.dir / "r-old"
+        self.masters(r_old, "batch")
+        self.masters(r, "own")
+        os.symlink(r_old / "batch", r / "linked")
+        code, output = self.cli(r)
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"EXCLUDED: {r / 'linked'}", output)
+
+    def test_dangling_links_fail_the_search_and_loops_do_not(self):
+        r = self.dir / "dangling"
+        self.masters(r, "own")
+        os.symlink(self.dir / "unmounted" / "disk", r / "gone")
+        code, output = self.cli(r)
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"EXCLUDED: {r / 'gone'}: symlink target missing -> {self.dir / 'unmounted' / 'disk'}",
+                      output)
+        loopy = self.dir / "loopy"
+        self.masters(loopy, "own")
+        os.symlink(loopy / "elsewhere", loopy / "loop")
+        report = self.dir / "loop.csv"
+        self.hashed.clear()
+        with looping(loopy / "loop") as calls:
+            code, output = self.cli(loopy, report=report)
+        self.assertIn(("loop", loopy / "loop"), calls, "the fault never reached the search")
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"Not searched (symlink, expected): {loopy / 'loop'}: symlink loop", output)
+        self.assertEqual([row[0] for row in self.rows(report)[1:]], ["PASS"])
+
+    def test_a_link_to_an_ancestor_is_covered(self):
+        r = self.dir / "r"
+        self.masters(r, "own")
+        os.symlink(r, r / "own" / "up")
+        code, output = self.cli(r)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.hashed, [r / "own" / "disc.iso"])
+        self.assertIn(f"(its target was searched as {r})", output)
+
+    def test_symlinks_given_as_paths_are_followed(self):
+        target = self.dir / "target"
+        self.masters(target, ".")
+        folder_link = self.dir / "folder-link"
+        os.symlink(target, folder_link)
+        code, output = self.cli(folder_link)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.hashed, [folder_link / "disc.iso"])
+        os.symlink(target / "disc_manifest.json", target / "alias_manifest.json")
+        self.hashed.clear()
+        code, output = self.cli(target / "alias_manifest.json")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.hashed, [target / "disc.iso"])
+
+    def test_given_paths_that_are_not_manifests_are_reported(self):
+        good = self.dir / "good"
+        self.masters(good, ".")
+        fifo = self.dir / "pipe"
+        os.mkfifo(fifo)
+        code, output = self.cli(good, good / "disc.iso", fifo)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [good / "disc.iso"])
+        self.assertIn(f"DISCOVERY_ERROR: {good / 'disc.iso'}: not a manifest file (*_manifest.json)", output)
+        self.assertIn(f"DISCOVERY_ERROR: {fifo}: not a file or folder", output)
+        self.hashed.clear()
+        code, output = self.cli(good / "disc_manifest.json")
+        self.assertEqual(code, 0, output)
+
+    def test_special_files_named_like_manifests_are_never_opened(self):
+        r = self.dir / "r"
+        self.masters(r, "own")
+        os.mkfifo(r / "pipe_manifest.json")
+        os.symlink(r / "pipe_manifest.json", r / "link_manifest.json")
+        code, output = self.cli(r)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [r / "own" / "disc.iso"])
+        for name in ("pipe_manifest.json", "link_manifest.json"):
+            self.assertIn(f"{r / name}: ERROR — not a regular file", output)
+
+    def test_a_manifest_link_whose_target_cannot_be_inspected_is_never_read(self):
+        r = self.dir / "r"
+        self.masters(r, "own")
+        alias = r / "alias_manifest.json"
+        os.symlink(r / "own" / "disc_manifest.json", alias)
+        (r / "disc.iso").write_bytes((r / "own" / "disc.iso").read_bytes())  # the alias's own ISO
+        code, output = self.cli(r)  # control: a readable manifest link verifies
+        self.assertEqual(code, 0, output)
+        self.assertEqual(sorted(self.hashed), [r / "disc.iso", r / "own" / "disc.iso"])
+        self.hashed.clear()
+        reads = []
+        real_read = Path.read_bytes
+
+        def read_bytes(path):
+            reads.append(Path(path))
+            return real_read(path)
+
+        report = self.dir / "report.csv"
+        with target_stat_fails({alias}, io_error(), "target") as calls, \
+                mock.patch.object(Path, "read_bytes", read_bytes):
+            code, output = self.cli(r, report=report)
+        self.assertIn(("target", alias), calls, "the fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertNotIn(alias, reads, "the unclassified manifest link was read")
+        self.assertEqual(self.hashed, [r / "own" / "disc.iso"])  # the healthy sibling is still verified
+        self.assertIn(f"{alias}: ERROR — could not inspect the symlink's target: [Errno 5]", output)
+        rows = {row[2]: row for row in self.rows(report)[1:]}
+        self.assertEqual(rows[str(alias)][0], "ERROR")
+        self.assertIn("[Errno 5] Input/output error", rows[str(alias)][9])
+        self.assertEqual(rows[str(r / "own" / "disc_manifest.json")][0], "PASS")
+        # Control: an ordinary link with the same fault is a DISCOVERY_ERROR, as before
+        folder_link = r / "folder-link"
+        os.symlink(r / "own", folder_link)
+        alias.unlink()
+        with target_stat_fails({folder_link}, io_error(), "target") as calls:
+            code, output = self.cli(r)
+        self.assertIn(("target", folder_link), calls, "the fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"DISCOVERY_ERROR: {folder_link}: could not inspect symlink target", output)
+
+    def test_a_manifest_link_to_a_fifo_whose_target_cannot_be_inspected_is_never_opened(self):
+        r = self.dir / "r"
+        self.masters(r, "own")
+        os.mkfifo(r / "pipe")
+        link = r / "link_manifest.json"
+        os.symlink(r / "pipe", link)
+        with target_stat_fails({link}, io_error(), "target") as calls:
+            code, output = self.cli(r)
+        self.assertIn(("target", link), calls, "the fault never reached the search")
+        self.assertEqual(TRIPWIRE_OPENS[self._tripwire_before:], [],
+                         "the product tried to open a FIFO (the tripwire stopped it)")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [r / "own" / "disc.iso"])
+        self.assertIn(f"{link}: ERROR — could not inspect the symlink's target: [Errno 5]", output)
+
+    def test_system_and_recovery_folders_are_not_exempt(self):
+        volume = self.dir / "volume"
+        self.masters(volume, "JPC_AV/a", ".TemporaryItems/kept")
+        names = (".Spotlight-V100", ".Trashes", "lost+found", "#recycle", "$RECYCLE.BIN")
+        for name in names:
+            (volume / name).mkdir()
+        real_ismount = os.path.ismount
+
+        def ismount(path):  # this folder stands in for a volume root
+            return Path(os.fsdecode(path)) == volume or real_ismount(path)
+
+        with scandir_faults(open_errors={volume / n: denied() for n in names}) as calls, \
+                mock.patch.object(os.path, "ismount", ismount):
+            code, output = self.cli(volume)
+        for name in names:
+            self.assertIn(("open", volume / name), calls, "the fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(sorted(self.hashed), [volume / ".TemporaryItems" / "kept" / "disc.iso",
+                                               volume / "JPC_AV" / "a" / "disc.iso"])
+        for name in names:
+            self.assertIn(f"DISCOVERY_ERROR: {volume / name}: could not list folder: [Errno 13]", output)
+
+    def test_empty_searches(self):
+        clean = self.dir / "clean"
+        clean.mkdir()
+        (clean / "notes.txt").write_text("not a manifest")
+        report = self.dir / "clean.csv"
+        nothing = "No manifests (*_manifest.json) found under the given paths."
+        self.assertEqual(self.exit_message(clean, report=report), nothing)
+        self.assertFalse(os.path.lexists(report))
+        loopy = self.dir / "loopy"
+        loopy.mkdir()
+        os.symlink(loopy / "elsewhere", loopy / "loop")
+        with looping(loopy / "loop") as calls:
+            self.assertEqual(self.exit_message(loopy, report=report), nothing)
+        self.assertIn(("loop", loopy / "loop"), calls, "the fault never reached the search")
+        self.assertFalse(os.path.lexists(report))
+        partial = self.dir / "partial"
+        (partial / "locked").mkdir(parents=True)
+        with scandir_faults(open_errors={partial / "locked": denied()}) as calls:
+            code, output = self.cli(partial, report=report)
+        self.assertIn(("open", partial / "locked"), calls, "the fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertIn("No manifests found in the parts of the given paths that could be searched.", output)
+        self.assertEqual([row[0] for row in self.rows(report)[1:]], ["DISCOVERY_ERROR"])
+
+    def test_ctrl_c_during_the_search_stops_it(self):
+        root = self.dir / "collection"
+        self.masters(root, "a", "b")
+        report = self.dir / "report.csv"
+        with scandir_faults(open_errors={root / "b": KeyboardInterrupt()}) as calls:
+            code, output = self.cli(root, report=report)
+        self.assertIn(("open", root / "b"), calls, "the fault never reached the search")
+        self.assertEqual(code, 130, output)
+        self.assertEqual(self.hashed, [])
+        self.assertFalse(os.path.lexists(report))
+
+    def test_a_folder_loop_is_reported_not_followed(self):
+        root = self.dir / "collection"
+        self.masters(root, "a", "b/c")
+        loop = {root / "b": {"c": dict(stat_result=os.stat(root))}}  # c claims to be root itself
+        with scandir_faults(entries=loop) as calls:
+            code, output = self.cli(root)
+        self.assertIn(("listed", root / "b"), calls, "the fault never reached the search")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [root / "a" / "disc.iso"])
+        self.assertIn(f"DISCOVERY_ERROR: {root / 'b' / 'c'}: folder loop: the same folder as {root}", output)
+
+    def test_a_real_unreadable_folder(self):
+        root = self.dir / "collection"
+        self.masters(root, "a", "b")
+        locked = root / "b"
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        try:
+            os.listdir(locked)
+        except PermissionError:
+            pass
+        else:
+            self.fail("the folder stayed listable (running as root?), so this check cannot run")
+        code, output = self.cli(root)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [root / "a" / "disc.iso"])
+        self.assertIn(f"DISCOVERY_ERROR: {locked}: could not list folder: [Errno 13]", output)
+
+    def test_library_calls(self):
+        healthy = self.dir / "healthy"
+        self.masters(healthy, "a")
+        os.symlink(healthy / "a", healthy / "a-again")  # covered within the same search
+        self.assertEqual(verify.find_preservation_manifests([healthy]),
+                         [healthy / "a" / "disc_manifest.json"])
+        broken = self.dir / "broken"
+        self.masters(broken, "a", "b")
+        with scandir_faults(open_errors={broken / "b": denied()}) as calls:
+            with self.assertRaises(verify.DiscoveryIncomplete):
+                verify.find_preservation_manifests([broken])
+            issues = []
+            self.assertEqual(verify.find_preservation_manifests([broken], issues),
+                             [broken / "a" / "disc_manifest.json"])
+        self.assertIn(("open", broken / "b"), calls, "the fault never reached the search")
+        self.assertEqual([(i.status, i.path) for i in issues], [("DISCOVERY_ERROR", broken / "b")])
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import plistlib
+import signal
 import stat
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
@@ -150,6 +151,10 @@ class TitleOutput:
     retained_path: Optional[Path] = None
     retained_as: Optional[str] = None
     retention_error: Optional[str] = None
+    # A check of where the output is failed with an error other than "no
+    # such file": its current location is unknown (not absent); see
+    # retention_error for the reason and the candidate paths
+    location_unverified: bool = False
 
 @dataclass
 class ConversionResult:
@@ -178,6 +183,12 @@ class ConversionResult:
     unverified: bool = False
     unverified_reason: Optional[str] = None
     promotion_error: Optional[str] = None  # promotion stopped partway (run failed)
+    # A killed ffmpeg could not be confirmed stopped: this ISO's remaining
+    # titlesets and the rest of a batch are not run, and its mount is left
+    # attached. Not a user interruption. encoder_cleanup holds the recovery
+    # details (pid, source ISO, possible output, mount points, devices, reason)
+    cleanup_incomplete: bool = False
+    encoder_cleanup: Optional[Dict[str, Any]] = None
 
     @property
     def canonical_files_changed(self) -> List[Path]:
@@ -352,6 +363,9 @@ class ISOMount:
         # Detach failures recorded here so the caller can surface them into the
         # conversion record (the context manager has no access to it directly).
         self.detach_errors: List[str] = []
+        # Set (to the reason) when an encoder reading this image could not be
+        # confirmed stopped: the image is then left attached, never detached
+        self.keep_attached: Optional[str] = None
 
     def __enter__(self) -> Optional[Path]:
         """Mount the ISO and return the most relevant mount point"""
@@ -408,7 +422,16 @@ class ISOMount:
 
         Detach failures are recorded in self.detach_errors so the caller can
         surface them: a leaked attach holds a /dev/diskN that can block later
-        mounts across a batch."""
+        mounts across a batch.
+
+        With keep_attached set, nothing is detached (no forced detach, no
+        device fallback, no leak sweep): an encoder that may still be reading
+        this image keeps its source, and the operator resolves it."""
+        if self.keep_attached:
+            log(colorize("red", f"Warning: leaving {self.iso_path.name} attached at "
+                                f"{', '.join(str(p) for p in self.mount_points) or 'no mount point'}"
+                                f" ({', '.join(self.devices) or 'no device'}): {self.keep_attached}"))
+            return
         detached_any = False
         for mount_point in self.mount_points:
             if not mount_point.exists():
@@ -864,6 +887,11 @@ DURATION_TOLERANCE_FLOOR = 1.0
 # Names tried when keeping a non-canonical output before giving up
 RETENTION_ATTEMPTS = 5
 
+# Seconds a killed ffmpeg gets to be confirmed exited (wait() returning)
+# before it is reported as possibly still running. A bound on that wait,
+# not on every operation of the shutdown.
+ENCODER_STOP_TIMEOUT = 10
+
 def duration_check(expected: Optional[float], no_expectation_reason: Optional[str],
                    output_seconds: Optional[float], video_streams: Optional[int]
                    ) -> Tuple[str, str, Optional[float]]:
@@ -937,6 +965,74 @@ def get_video_info(target) -> Dict[str, Any]:
     except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
         return {}
 
+### === ENCODER LIFETIME ===
+
+class DeferredInterrupt:
+    """Hold Ctrl-C (SIGINT) for one short section: starting ffmpeg (until
+    its handle is assigned) or stopping it after a failure. A Ctrl-C that
+    arrives meanwhile only sets .received; the caller acts on it afterwards.
+    The previous handler is always restored. Off the main thread (where
+    handlers cannot be set) the section simply runs unprotected. A copy of
+    makeiso.py's helper: the scripts are standalone."""
+
+    def __init__(self):
+        self.received = False
+        self._previous = None
+        self._installed = False
+
+    def _hold(self, signum, frame):
+        self.received = True
+
+    def __enter__(self) -> "DeferredInterrupt":
+        try:
+            self._previous = signal.signal(signal.SIGINT, self._hold)
+            self._installed = True
+        except ValueError:
+            pass
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        if self._installed:
+            signal.signal(signal.SIGINT, self._previous)
+        return False
+
+
+class EncoderNotStopped(Exception):
+    """A killed ffmpeg could not be confirmed stopped: nothing more may run"""
+
+
+def stop_encoder(process) -> Optional[str]:
+    """Kill an ffmpeg this run started and wait (bounded) for it to exit.
+
+    Returns None once it has exited and been reaped - wait() returning is
+    the only proof - else why it may still be running. Never raises an
+    Exception."""
+    problems = []
+    try:
+        process.kill()               # SIGKILL; a no-op once it has exited
+    except Exception as e:
+        problems.append(f"kill failed: {e}")
+    try:
+        process.wait(timeout=ENCODER_STOP_TIMEOUT)
+        return None
+    except subprocess.TimeoutExpired:
+        problems.append(f"still running {ENCODER_STOP_TIMEOUT} s after it was killed")
+    except Exception as e:
+        problems.append(f"could not wait for it to exit: {e}")
+    return "; ".join(problems)
+
+
+def inspect_path(path: Path) -> Tuple[Optional[os.stat_result], Optional[str]]:
+    """(lstat result, None) when path exists, (None, None) when it does not
+    (FileNotFoundError), or (None, reason) when the check itself failed - an
+    unknown location, never taken as absence."""
+    try:
+        return os.lstat(path), None
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return None, str(e)
+
 ### === MAIN CONVERTER CLASS ===
 
 class ISOToMP4Converter:
@@ -947,6 +1043,7 @@ class ISOToMP4Converter:
         self.start_time: Optional[datetime.datetime] = None
         self.run: Optional[RunContext] = None
         self._token_suffix: Optional[str] = None
+        self._mount: Optional[ISOMount] = None  # this run's own source mount
 
     def _run_token(self, kind: str = "failed") -> str:
         """One timestamp-and-random suffix per run names every non-canonical
@@ -1074,6 +1171,7 @@ class ISOToMP4Converter:
         self.run.mark("mount")
 
         mount = ISOMount(self.config.iso_path)
+        self._mount = mount
         with mount as mount_point:
             if not mount_point:
                 result = ConversionResult(
@@ -1288,6 +1386,8 @@ class ISOToMP4Converter:
             # ISO, but remaining titlesets are still attempted so the record
             # is complete. Ctrl-C stops here: the interrupted title is
             # recorded as failed and remaining titlesets stay "not_attempted".
+            # So does an ffmpeg that could not be confirmed stopped
+            # (cleanup_incomplete): nothing more may run beside it.
             try:
                 # Source stream inventory (first content VOB is representative)
                 source_counts = probe_stream_counts(plan.content_vobs[0]) or {}
@@ -1310,6 +1410,10 @@ class ISOToMP4Converter:
                 result.interrupted = True
                 result.conversion_time += title.encode_time
                 log(colorize("red", "Remaining titleset(s) not attempted."))
+                break
+            except EncoderNotStopped as e:
+                result.conversion_time += title.encode_time
+                log(colorize("red", f"Remaining titleset(s) not attempted: {e}."))
                 break
             except Exception as e:
                 # e.g. a VOB that cannot be read while preparing: fail this
@@ -1336,7 +1440,12 @@ class ISOToMP4Converter:
 
         for t in result.titles:
             if t.retention_error:
-                where = f"it is at {t.retained_path}" if t.retained_path else "it was not found"
+                if t.location_unverified:
+                    where = "its current location could not be verified"
+                    if t.retained_path:
+                        where += f" (last known at {t.retained_path})"
+                else:
+                    where = f"it is at {t.retained_path}" if t.retained_path else "it was not found"
                 result.warnings.append(f"{t.output_path.name}: output could not be kept under "
                                        f"its {'.partial' if t.status == 'failed' else 'review'} "
                                        f"name ({t.retention_error}); {where}")
@@ -1345,6 +1454,10 @@ class ISOToMP4Converter:
         errors = [f"{t.output_path.name}: {t.error}" for t in result.titles if t.status == "failed"]
         if result.promotion_error:
             errors.append(result.promotion_error)
+        if result.cleanup_incomplete:
+            details = result.encoder_cleanup or {}
+            errors.append(f"encoder cleanup incomplete: ffmpeg (pid {details.get('pid')}) could "
+                          f"not be confirmed stopped; the batch stops and the source stays attached")
         if result.interrupted and not any("Interrupted" in e for e in errors):
             errors.append("Interrupted by operator (Ctrl-C)")
         if errors:
@@ -1462,12 +1575,44 @@ class ISOToMP4Converter:
         file is never replaced; a taken name gets another random suffix. If
         the move fails, only this attempt's own empty reservation is removed
         and the output stays where it is; the record names its real location.
-        Sets title.retained_path / retained_as / retention_error."""
-        title.retained_path, title.retained_as, title.retention_error = None, None, None
-        if not os.path.lexists(path):
+        The new location is recorded in the same try as the rename, so a
+        Ctrl-C seen once the rename call has returned (the rename may already
+        have happened) is reconciled before it propagates: the record then
+        names where the output is, decided by device and inode (never by name
+        alone). Once both fields name the new location they stand; no fresh
+        check is allowed to undo them. A repeat call keeps what an earlier
+        call established: an output it moved, a location it could not verify
+        (adding any new check problem to the candidates already recorded),
+        or its finding that neither name holds the output. Only "no such
+        file" counts as absence: any other error while checking leaves what
+        is known in place and records that the location could not be
+        verified. Sets title.retained_path / retained_as / retention_error /
+        location_unverified."""
+        source, problem = inspect_path(path)
+        if problem:
+            note = f"could not check {path}: {problem}"
+            if title.retained_as in ("partial", "review_copy"):
+                # An earlier call moved it: where it is stays established
+                log(colorize("yellow", f"Warning: {title.output_path.name}: {note} "
+                                       f"(already kept as {title.retained_path.name})"))
+                return
+            # Never drop earlier findings (candidate locations): add this one
+            title.retention_error = f"{title.retention_error}; then {note}" if title.retention_error else note
+            title.location_unverified = True
+            log(colorize("yellow", f"Warning: {title.output_path.name}: {note}; "
+                                   f"its current location could not be verified"))
+            return
+        if source is None:
+            # Gone: keep what an earlier call established (a move, a location
+            # it could not verify, or its finding that neither name holds the
+            # output); otherwise nothing was kept
+            if title.retained_as not in ("partial", "review_copy") and not title.location_unverified:
+                title.retained_path, title.retained_as = None, None
             return
         # Truthful even if interrupted below: until moved, it is still here
         title.retained_path, title.retained_as = path, "encoding_temp"
+        title.retention_error, title.location_unverified = None, False
+        kept_as = "partial" if kind == "failed" else "review_copy"
         extension = ".mp4.partial" if kind == "failed" else ".mp4.unverified"
         base = f"{title.output_path.stem}_{self._run_token(kind)}"
         error = f"no free name found after {RETENTION_ATTEMPTS} attempts"
@@ -1487,22 +1632,139 @@ class ISOToMP4Converter:
                 os.close(fd)
             try:
                 os.replace(path, target)
-            except BaseException as e:
+                title.retained_path, title.retained_as = target, kept_as
+            except OSError as e:
                 leftover = self._remove_reservation(target, reserved)
-                if not isinstance(e, OSError):
-                    raise
                 error = f"could not move it to {name}: {e}{leftover}"
                 break
-            title.retained_path = target
-            title.retained_as = "partial" if kind == "failed" else "review_copy"
+            except BaseException:
+                if (title.retained_path, title.retained_as) != (target, kept_as):
+                    # Interrupted, possibly after the rename committed but before
+                    # both fields recorded it: find where the output really is
+                    where, problems = self._located_after_move(path, target, source)
+                    if where == "target":
+                        title.retained_path, title.retained_as = target, kept_as
+                    elif where == "path":
+                        title.retained_path, title.retained_as = path, "encoding_temp"
+                    else:
+                        if path not in problems:      # the temp name is known not to hold it
+                            title.retained_path, title.retained_as = None, None
+                        if problems:
+                            title.retention_error = (
+                                f"location could not be verified after an interrupted move to "
+                                f"{target} (candidates {path}, {target}): "
+                                + "; ".join(f"{p}: {e}" for p, e in problems.items()))
+                            title.location_unverified = True
+                        else:
+                            title.retention_error = (f"after an interrupted move, neither {path} "
+                                                     f"nor {target} holds this output")
+                    self._remove_reservation(target, reserved)
+                raise
             log(colorize("yellow", f"{title.output_path.name}: kept as {target.name}"
                                    + ("" if kind == "failed" else " (review copy, not a deliverable)")))
             return
         title.retention_error = error
-        if not os.path.lexists(path):
+        current, problem = inspect_path(path)
+        if problem:
+            title.retention_error += f"; could not check {path} afterwards: {problem}"
+            title.location_unverified = True
+        elif current is None:
             title.retained_path, title.retained_as = None, None
         log(colorize("yellow", f"Warning: {title.output_path.name}: {error}; "
                                f"the output stays at {path}"))
+
+    @staticmethod
+    def _located_after_move(path: Path, target: Path,
+                            source: os.stat_result) -> Tuple[Optional[str], Dict[Path, str]]:
+        """After an interrupted rename: ("target" | "path", {}) for the name
+        that now holds the output (same device and inode as before the move),
+        else (None, {name: error}) for the names whose check failed - unknown,
+        not absent; an empty dict means neither holds it."""
+        problems: Dict[Path, str] = {}
+        for label, p in (("target", target), ("path", path)):
+            current, problem = inspect_path(p)
+            if problem:
+                problems[p] = problem
+            elif current is not None and \
+                    (current.st_dev, current.st_ino) == (source.st_dev, source.st_ino):
+                return label, {}
+        return None, problems
+
+    def _stop_failed_encode(self, title: TitleOutput, temp_path: Path, process,
+                            result: ConversionResult) -> bool:
+        """For a titleset already recorded as failed: stop its ffmpeg if this
+        run started one, and only then keep its output (whose existence is
+        checked only after the stop, so output ffmpeg created late is found).
+        Ctrl-C is held during the bounded stop, and, when ffmpeg could not be
+        confirmed stopped, until the run is marked cleanup_incomplete, the
+        mount is told to stay attached and the recovery details are
+        recorded; a held Ctrl-C is raised afterwards. Returns False when
+        ffmpeg could not be confirmed stopped."""
+        problem, held = None, DeferredInterrupt()
+        if process is not None:
+            with held:
+                problem = stop_encoder(process)
+                if problem is not None:
+                    self._record_unstopped_encoder(temp_path, process, result, problem)
+        try:
+            if problem is None:
+                self._retain_attempt(title, temp_path, "failed")
+            else:
+                self._encoder_not_stopped(title, temp_path, result)
+        except Exception as e:
+            # Never replaces the title's recorded cause
+            note = f"{title.output_path.name}: could not finish recording the stopped encode: {e}"
+            result.warnings.append(note)
+            log(colorize("red", f"Warning: {note}"))
+        if held.received:
+            if "Interrupted by operator" not in (title.error or ""):
+                title.error = (f"{title.error}; then Interrupted by operator (Ctrl-C) while "
+                               f"ffmpeg was being stopped")
+            raise KeyboardInterrupt
+        return problem is None
+
+    def _record_unstopped_encoder(self, temp_path: Path, process, result: ConversionResult,
+                                  problem: str):
+        """Called with Ctrl-C held, the moment a killed ffmpeg is not confirmed
+        exited: the run stops (cleanup_incomplete, not a user interruption),
+        this run's own source mount is told to stay attached, and the
+        recovery details (pid, source ISO, possible output, mount points,
+        devices, reason) are recorded. Attribute work only, no file checks."""
+        result.cleanup_incomplete = True
+        pid = getattr(process, "pid", None)
+        mount = self._mount
+        if mount is not None:
+            mount.keep_attached = f"ffmpeg (pid {pid}) could not be confirmed stopped ({problem})"
+        result.encoder_cleanup = {
+            "pid": pid,
+            "source_iso": str(self.config.iso_path),
+            "possible_output": str(temp_path),
+            "mount_points": [str(p) for p in getattr(mount, "mount_points", None) or []],
+            "devices": [str(d) for d in getattr(mount, "devices", None) or []],
+            "reason": problem,
+        }
+
+    def _encoder_not_stopped(self, title: TitleOutput, temp_path: Path, result: ConversionResult):
+        """After _record_unstopped_encoder: nothing the possibly running
+        ffmpeg may still be writing is moved or renamed; the title's record
+        says where its output is, and the recovery details are shown and go
+        into the warnings."""
+        details = result.encoder_cleanup or {}
+        pid = details.get("pid")
+        current, check_problem = inspect_path(temp_path)
+        if check_problem:
+            title.retention_error = f"could not check {temp_path}: {check_problem}"
+            title.location_unverified = True
+        elif current is not None:
+            title.retained_path, title.retained_as = temp_path, "encoding_temp"
+        warning = (f"{title.output_path.name}: ffmpeg (pid {pid}) could not be confirmed "
+                   f"stopped ({details.get('reason')}); it may still be running and writing "
+                   f"{temp_path}. {self.config.iso_path.name} stays attached at "
+                   f"{', '.join(details.get('mount_points') or []) or 'no mount point'} "
+                   f"({', '.join(details.get('devices') or []) or 'no device'}); resolve that "
+                   f"process and mount before retrying or detaching")
+        log(colorize("red", f"Warning: {warning}"))
+        result.warnings.append(warning)
 
     @staticmethod
     def _remove_reservation(target: Path, reserved: os.stat_result) -> str:
@@ -1541,7 +1803,9 @@ class ISOToMP4Converter:
             else:
                 log(colorize("yellow", f"{name}: not attempted"))
             if t.retention_error:
-                log(colorize("yellow", f"  could not be kept under its review name: {t.retention_error}"))
+                what = ("its location could not be verified" if t.location_unverified
+                        else "could not be kept under its review name")
+                log(colorize("yellow", f"  {what}: {t.retention_error}"))
         if result.titles and not all(t.status == "completed" for t in result.titles):
             if result.canonical_files_changed:
                 log(colorize("red", "Final MP4s changed by this run: "
@@ -1591,18 +1855,28 @@ class ISOToMP4Converter:
         ]
         log(colorize("cyan", "Command:") + " " + colorize("yellow", " ".join(ffmpeg_cmd)))
 
+        process = None                   # None = no ffmpeg acquired by this run
+        launch_hold = DeferredInterrupt()
         encode_start = time.time()
         try:
             # Run ffmpeg with progress output. stdout is discarded rather than
             # piped: we only read stderr below, and an unread stdout pipe could
             # fill its OS buffer and deadlock the encode if ffmpeg ever writes to
-            # it (no reader would drain it).
-            process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
+            # it (no reader would drain it). Ctrl-C is held only until the
+            # handle is assigned, then acted on, so a started ffmpeg is always
+            # stopped by the handler below. Undecodable stderr bytes are
+            # replaced rather than raising (cleanup does not depend on this).
+            with launch_hold:
+                process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    encoding="utf-8",
+                    errors="replace"
+                )
+            if launch_hold.received:
+                raise KeyboardInterrupt
 
             # Parse ffmpeg stderr for progress (ffmpeg outputs progress to stderr)
             log("")  # Blank line before progress display
@@ -1645,19 +1919,26 @@ class ISOToMP4Converter:
                 return
 
         except KeyboardInterrupt:
-            log(colorize("red", "\nConversion interrupted by user."))
-            process.kill()
-            process.wait()
+            # The cause is recorded first, so the record stays truthful
+            # whatever happens while ffmpeg is being stopped
             title.encode_time = time.time() - encode_start
             title.status = "failed"
             title.error = "Interrupted by operator (Ctrl-C)"
-            self._retain_attempt(title, temp_path, "failed")
+            log(colorize("red", "\nConversion interrupted by user."))
+            self._stop_failed_encode(title, temp_path, process, result)
             raise
         except Exception as e:
             title.encode_time = time.time() - encode_start
             title.status = "failed"
-            title.error = str(e)
-            self._retain_attempt(title, temp_path, "failed")
+            title.error = str(e) if process is not None else f"could not start ffmpeg: {e}"
+            if launch_hold.received:     # Ctrl-C held while the launch itself failed
+                title.error += "; Interrupted by operator (Ctrl-C) during the launch"
+            stopped = self._stop_failed_encode(title, temp_path, process, result)
+            if launch_hold.received:
+                raise KeyboardInterrupt
+            if not stopped:
+                raise EncoderNotStopped(f"ffmpeg for {title.output_path.name} could not be "
+                                        f"confirmed stopped")
             return
 
         # Post-encode checks share the encode's failure handling: any error
@@ -1841,6 +2122,20 @@ class ISOToMP4Converter:
                 f.write(f"Warning:          {warning}\n")
             f.write("\n")
 
+            if result.cleanup_incomplete and result.encoder_cleanup:
+                cleanup = result.encoder_cleanup
+                f.write("ENCODER CLEANUP INCOMPLETE\n")
+                f.write("-" * 20 + "\n")
+                f.write("ffmpeg could not be confirmed stopped. The batch stopped and the source\n")
+                f.write("stays attached; resolve the process and the mount before retrying or\n")
+                f.write("detaching. The output below may still be changing.\n")
+                f.write(f"PID:              {cleanup.get('pid')}\n")
+                f.write(f"Source ISO:       {cleanup.get('source_iso')}\n")
+                f.write(f"Possible output:  {cleanup.get('possible_output')}\n")
+                f.write(f"Mount points:     {', '.join(cleanup.get('mount_points') or []) or 'none'}\n")
+                f.write(f"Devices:          {', '.join(cleanup.get('devices') or []) or 'none'}\n")
+                f.write(f"Reason:           {cleanup.get('reason')}\n\n")
+
             if self.run and self.run.step_times:
                 f.write("OPERATION TIMELINE\n")
                 f.write("-" * 20 + "\n")
@@ -1914,7 +2209,8 @@ class ISOToMP4Converter:
                                 "encoding_temp": "left at its temporary name"}.get(t.retained_as, "")
                         f.write(f"  Kept as:  {t.retained_path} ({kind})\n")
                     if t.retention_error:
-                        f.write(f"  Not moved: {t.retention_error}\n")
+                        label = "Location: " if t.location_unverified else "Not moved:"
+                        f.write(f"  {label} {t.retention_error}\n")
                     if t.hold_reason:
                         f.write(f"  Held:     {t.hold_reason}\n")
                     if t.error:
@@ -1995,6 +2291,7 @@ class ISOToMP4Converter:
                     "retained_path": str(t.retained_path) if t.retained_path else None,
                     "retained_as": t.retained_as,
                     "retention_error": t.retention_error,
+                    "location_unverified": t.location_unverified,
                     "hold_reason": t.hold_reason,
                     "partial_renamed_to": (str(t.retained_path)
                                            if t.retained_as == "partial" else None),
@@ -2213,7 +2510,11 @@ class ISOToMP4Converter:
                 "error_message": result.error_message,
                 "unverified_reason": result.unverified_reason,
                 "promotion_error": result.promotion_error,
-                "canonical_files_changed": [str(p) for p in result.canonical_files_changed]
+                "canonical_files_changed": [str(p) for p in result.canonical_files_changed],
+                # ffmpeg not confirmed stopped: recovery details (pid, source
+                # ISO, possible output, mount points, devices, reason)
+                "cleanup_incomplete": result.cleanup_incomplete,
+                "encoder_cleanup": result.encoder_cleanup
             },
 
             "output_files": {
@@ -2425,7 +2726,12 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
         if result.interrupted:
             log(colorize("red", "Batch interrupted by operator — stopping."))
             break
-    
+        if result.cleanup_incomplete:
+            log(colorize("red", "Batch stopped: an ffmpeg could not be confirmed stopped and its "
+                                "source stays attached (see the warning above); no further ISO "
+                                "is started."))
+            break
+
     # Summary
     log_divider("Batch Summary")
     log(colorize("cyan", f"Total processed: {results['processed']}"))
@@ -2515,6 +2821,17 @@ def print_help():
   Exit status: 0 converted, skipped or successful dry run; 1 any failure,
   unverified result or abort, or arguments without -i or --batch; 2 an
   option or value rejected by the argument parser.
+
+{colorize('yellow', 'IF FFMPEG CANNOT BE CONFIRMED STOPPED:')}
+  After a failure or Ctrl-C, ffmpeg is killed and given up to 10 seconds to
+  exit. Only once it has exited is its output kept as a .partial (neither
+  complete nor playable). If its exit cannot be confirmed, the run fails,
+  the batch stops (no further ISO is started), the output keeps its
+  temporary name and the ISO is left attached. The warning and the run's
+  log and manifest give the process ID, the possible output path, and the
+  mount points and devices. Until you have dealt with that process and
+  mount, they and the output may still be active: resolve them before
+  retrying the ISO or detaching it.
 
 {colorize('yellow', 'DISC TYPES HANDLED:')}
   • {colorize('green', 'DVD-Video (VIDEO_TS):')} Converted to MP4

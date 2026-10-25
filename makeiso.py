@@ -19,6 +19,7 @@ import json
 import logging
 import fcntl
 import signal
+import stat
 import pwd
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -27,6 +28,33 @@ from uuid import uuid4
 from xml.sax.saxutils import escape as xml_escape
 
 ### === DATA STRUCTURES ===
+
+# The artifact roles, in ArtifactSet.publish_pairs order
+ARTIFACT_ROLES = ("iso", "tree", "isolyzer", "log", "manifest")
+
+def inspect_path(path: Path) -> Tuple[Optional[os.stat_result], Optional[str]]:
+    """(lstat result, None) when path exists, (None, None) when it does not
+    (FileNotFoundError), or (None, reason) when the check itself failed - an
+    unknown location, never taken as absence."""
+    try:
+        return os.lstat(path), None
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return None, str(e)
+
+def regular_file_size(path: Path) -> Tuple[Optional[int], Optional[str]]:
+    """(size, None) for a regular file at path, (None, None) when nothing is
+    there (FileNotFoundError), or (None, reason) when it could not be checked
+    or is not a regular file: unavailable, never absent."""
+    here, problem = inspect_path(path)
+    if problem:
+        return None, problem
+    if here is None:
+        return None, None
+    if not stat.S_ISREG(here.st_mode):
+        return None, "not a regular file"
+    return here.st_size, None
 
 @dataclass(frozen=True)
 class ArtifactSet:
@@ -41,10 +69,6 @@ class ArtifactSet:
     def archive_order(self) -> List[Path]:
         return [self.iso, self.log, self.manifest, self.tree, self.isolyzer]
 
-    @property
-    def sidecars(self) -> List[Path]:
-        return [self.tree, self.isolyzer, self.log, self.manifest]
-
     def publish_pairs(self, canonical: "ArtifactSet") -> List[Tuple[Path, Path]]:
         return [
             (self.iso, canonical.iso),
@@ -53,9 +77,6 @@ class ArtifactSet:
             (self.log, canonical.log),
             (self.manifest, canonical.manifest),
         ]
-
-    def sidecar_pairs(self, target: "ArtifactSet") -> List[Tuple[Path, Path]]:
-        return list(zip(self.sidecars, target.sidecars))
 
 
 @dataclass
@@ -165,7 +186,12 @@ class BackupResult:
     eject_interrupted: bool = False    # Ctrl-C arrived during the eject
     unmount_interrupted: bool = False  # Ctrl-C arrived during the unmount
     warnings: List[str] = field(default_factory=list)  # non-fatal problems (run still valid)
-    
+    # Where this run's own tree/isolyzer/log/manifest actually are, by role,
+    # once a move (publication, move-back, failure marking) - successful or
+    # not - has decided it; otherwise the config-derived name applies.
+    # iso_path plays the same part for the ISO.
+    artifact_paths: Dict[str, Path] = field(default_factory=dict)
+
     @property
     def checksum_match(self) -> Optional[bool]:
         """Whether checksums match.
@@ -219,10 +245,28 @@ class IsoCreationResult:
     warnings: List[str] = field(default_factory=list)  # degraded-but-not-fatal conditions
 
 @dataclass(frozen=True)
+class RecordMetadata:
+    """What one pass of record writing found about this run's ISO and
+    isolyzer output, checked once and shared by the log and the manifest:
+    the ISO's size (None when absent or unknown) and why either file could
+    not be checked (None when it could)."""
+    iso_size: Optional[int]
+    iso_problem: Optional[str]
+    isolyzer_present: bool
+    isolyzer_problem: Optional[str]
+
+    @classmethod
+    def check(cls, current: "ArtifactSet") -> "RecordMetadata":
+        iso_size, iso_problem = regular_file_size(current.iso)
+        isolyzer, isolyzer_problem = inspect_path(current.isolyzer)
+        return cls(iso_size, iso_problem, isolyzer is not None, isolyzer_problem)
+
+@dataclass(frozen=True)
 class RecordView:
-    """Artifact names to write inside records, plus the path to stat."""
+    """Artifact names to write inside records (files), and where this run's
+    own files actually are now (current), to stat and read."""
     files: ArtifactSet
-    iso_stat_path: Path
+    current: ArtifactSet
 
     @classmethod
     def from_run(cls, config: BackupConfig, result: BackupResult,
@@ -232,19 +276,15 @@ class RecordView:
             and result.creation_path
             and result.creation_path != config.canonical_output_path
         )
-        if staged_success:
-            files = config.canonical_artifacts
-        else:
-            files = ArtifactSet(
-                iso=result.iso_path,
-                tree=config.tree_path,
-                isolyzer=config.isolyzer_path,
-                log=log_path or config.log_path,
-                manifest=config.manifest_path,
-            )
-        iso_stat_path = (result.creation_path if result.creation_path
-                         and result.creation_path.exists() else result.iso_path)
-        return cls(files, iso_stat_path)
+        current = ArtifactSet(
+            iso=result.iso_path,
+            tree=result.artifact_paths.get("tree", config.tree_path),
+            isolyzer=result.artifact_paths.get("isolyzer", config.isolyzer_path),
+            log=log_path or config.log_path,
+            manifest=config.manifest_path,
+        )
+        files = config.canonical_artifacts if staged_success else current
+        return cls(files, current)
 
 @dataclass
 class BackupPreparation:
@@ -396,13 +436,19 @@ def fmt_diskutil_size(bytes_val: int, total_bytes: int = None) -> str:
 def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupResult,
                         start_time: datetime.datetime, disk_info: Dict[str, Any],
                         iso_analysis: Dict[str, Any] = None, run: RunContext = None,
-                        opener=None):
+                        opener=None, metadata: Optional[RecordMetadata] = None):
     """Create a properly formatted log file (opener, when given, creates it:
-    a dry run's exclusive creation)"""
+    a dry run's exclusive creation). metadata: the run's ISO/isolyzer check
+    shared with the manifest (checked here when not given)."""
 
     end_time = datetime.datetime.now()
     total_duration = (end_time - start_time).total_seconds()
     record = RecordView.from_run(config, result, log_path)
+    if metadata is None:
+        metadata = RecordMetadata.check(record.current)
+    # An ISO that could not be checked: its size is unavailable, not absent
+    iso_unavailable = (f"unavailable (could not check {record.current.iso.name}: "
+                       f"{metadata.iso_problem})" if metadata.iso_problem else None)
 
     def step_time(step: str, fallback: datetime.datetime) -> str:
         """Real captured timestamp for a step, or the fallback if it never ran"""
@@ -458,9 +504,10 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write(f"Tree File:        {record.files.tree.name}\n")
         f.write(f"Isolyzer File:    {record.files.isolyzer.name}\n")
         f.write(f"Manifest File:    {record.files.manifest.name}\n")
-        if record.iso_stat_path.exists():
-            iso_size = record.iso_stat_path.stat().st_size
-            f.write(f"ISO File Size:    {iso_size / (1024 * 1024):.0f} MB\n")
+        if metadata.iso_size is not None:
+            f.write(f"ISO File Size:    {metadata.iso_size / (1024 * 1024):.0f} MB\n")
+        elif iso_unavailable:
+            f.write(f"ISO File Size:    {iso_unavailable}\n")
         f.write("\n")
         
         # Rest of the log formatting remains the same...
@@ -525,11 +572,13 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
             f.write(f"Algorithms:     {algorithms}\n")
             f.write(f"Duration:       {format_duration(result.verification_time)}\n\n")
         
-        # ISO Structure Analysis
-        if config.isolyzer_path.exists():
+        # ISO Structure Analysis: omitted only when its output is confirmed absent
+        if metadata.isolyzer_present or metadata.isolyzer_problem:
             f.write(f"[{step_time('isolyzer', create_end)}] ISO Structure Analysis\n")
             f.write(f"  Tool:    isolyzer\n")
-            f.write(f"  Output:  {record.files.isolyzer.name}\n")
+            f.write(f"  Output:  {record.files.isolyzer.name}"
+                    + (f" (could not check it: {metadata.isolyzer_problem})"
+                       if metadata.isolyzer_problem else "") + "\n")
             
             if iso_analysis and 'error' not in iso_analysis:
                 f.write("  Results:\n")
@@ -599,10 +648,16 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
             fmt_field("Drive Model",        disk_info.get('MediaName', disk_info.get('IORegistryEntryName')))
             fmt_field("File System",        disk_info.get('FilesystemName', disk_info.get('FilesystemType')))
             fmt_field("Connection",         disk_info.get('BusProtocol'))
-            # Physical Size = actual ISO/disc size; TotalSize in plist returns volume size on optical media
-            physical_size = record.iso_stat_path.stat().st_size if record.iso_stat_path.exists() else disk_info.get('TotalSize')
+            # Physical Size = actual ISO/disc size; TotalSize in plist returns volume size on optical media.
+            # An ISO that could not be checked has no size here: never TotalSize, no percentage
+            if iso_unavailable:
+                physical_size = None
+                fmt_field("Physical Size",  iso_unavailable)
+            else:
+                physical_size = (metadata.iso_size if metadata.iso_size is not None
+                                 else disk_info.get('TotalSize'))
+                fmt_field("Physical Size",  fmt_diskutil_size(physical_size))
             volume_size = disk_info.get('TotalSize')
-            fmt_field("Physical Size",      fmt_diskutil_size(physical_size))
             fmt_field("Volume Capacity",    fmt_diskutil_size(volume_size))
             fmt_field("Used Space",         fmt_diskutil_size(volume_size, physical_size))
             fmt_field("Read-Only Status",   'Yes' if disk_info.get('Writable') is False else 'No')
@@ -874,21 +929,41 @@ class OpticalDiscBackup:
             raise
         return archived
 
-    def _move_published_attempts_back(self, published: List[Tuple[Path, Path]]) -> bool:
+    def _set_location(self, result: BackupResult, role: str, path: Path):
+        """Record where this run's own artifact for role actually is now"""
+        if role == "iso":
+            result.iso_path = path
+        else:
+            result.artifact_paths[role] = path
+
+    def _move_published_attempts_back(self, result: BackupResult,
+                                      published: List[Tuple[str, Path, Path]]) -> bool:
         """Move any already-published attempt artifacts back out of canonical
         slots so prior canonical artifacts can be restored. Returns False if
-        any of this run's files is still at a canonical name."""
+        any of this run's files is (or may be) still at a canonical name;
+        result keeps naming each file where it actually is."""
         cleared = True
-        for attempt, canonical in reversed(published):
-            if not os.path.lexists(canonical):
+        for role, attempt, canonical in reversed(published):
+            here, problem = inspect_path(canonical)
+            if problem:
+                # Unknown, not absent: it may still be this run's file
+                self._rollback_problem(f"could not check {canonical.name} ({problem}); this "
+                                       f"run's copy may still be at the canonical name")
+                cleared = False
                 continue
-            if os.path.lexists(attempt):
+            if here is None:
+                self._set_location(result, role, attempt)
+                continue
+            occupant, problem = inspect_path(attempt)
+            if occupant is not None or problem:
+                reason = "is occupied" if occupant is not None else f"could not be checked ({problem})"
                 self._rollback_problem(f"could not move {canonical.name} back: "
-                                       f"{attempt.name} is occupied")
+                                       f"{attempt.name} {reason}")
                 cleared = False
                 continue
             try:
                 canonical.rename(attempt)
+                self._set_location(result, role, attempt)
                 log(colorize("yellow", f"Moved failed publish back to attempt path: {attempt.name}"))
             except OSError as e:
                 self._rollback_problem(f"could not move {canonical.name} back to "
@@ -914,7 +989,7 @@ class OpticalDiscBackup:
         filesystem allows (best effort, see _restore_archived_artifacts) and
         the attempt falls through the normal failed-run record path."""
         archived: List[Tuple[Path, Path]] = []
-        published: List[Tuple[Path, Path]] = []
+        published: List[Tuple[str, Path, Path]] = []
         publish_order = attempt.publish_pairs(self.config.canonical_artifacts)
         self._held_interrupt = DeferredInterrupt()
         with self._held_interrupt:
@@ -922,17 +997,18 @@ class OpticalDiscBackup:
                 self._check_publish_symlinks(self._standard_artifacts())
                 self._check_publish_symlinks([src for src, _ in publish_order if src.exists()])
                 archived = self._archive_existing_artifacts()
-                for src, dst in publish_order:
+                for role, (src, dst) in zip(ARTIFACT_ROLES, publish_order):
                     if not src.exists():
                         continue
                     self._check_publish_symlinks([src, dst])
                     if os.path.lexists(dst):
                         raise OSError(f"{dst.name} appeared during publish; not replacing it")
                     src.replace(dst)
-                    published.append((src, dst))
+                    published.append((role, src, dst))
+                    self._set_location(result, role, dst)
                     log(colorize("green", f"Published verified artifact: {dst.name}"))
             except OSError:
-                cleared = self._move_published_attempts_back(published)
+                cleared = self._move_published_attempts_back(result, published)
                 self._restore_archived_artifacts(archived, clear=cleared)
                 raise
             self.config.attempt_token = None
@@ -942,35 +1018,80 @@ class OpticalDiscBackup:
     def _mark_failed_attempt(self, result: BackupResult, attempt: ArtifactSet):
         """Move this run's attempt artifacts to failure-marked names.
 
-        Only attempt paths are touched here; canonical artifacts from a prior
-        successful run are never relabelled as failed evidence for this run."""
-        fail_token = f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
-        self.config.failure_token = fail_token
+        Only this run's files at their attempt paths are touched: one that a
+        failed rollback left at a canonical name stays there (and is recorded
+        there), and canonical artifacts from a prior successful run are never
+        relabelled as failed evidence for this run. Safe to call again: the
+        failure token is chosen once, and a repeat call resumes an
+        interrupted marking from what is on disk. A file that cannot be
+        renamed, or whose location cannot be checked, is recorded where it
+        last was, with a warning."""
+        if self.config.failure_token is None:
+            self.config.failure_token = (f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}"
+                                         f"-{uuid4().hex[:6]}")
         self.config.attempt_token = None
-        if attempt.iso.exists():
-            marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
-            marked_path = self.config.output_dir / f"{self.config.filename}_{fail_token}{marker}"
+        marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
+        failed = self.config.artifacts  # tree, isolyzer, log and manifest now carry the failure token
+        targets = {
+            "iso": self.config.output_dir / f"{self.config.filename}_{self.config.failure_token}{marker}",
+            "tree": failed.tree, "isolyzer": failed.isolyzer,
+            "log": failed.log, "manifest": failed.manifest,
+        }
+        for role in ARTIFACT_ROLES:
+            src, dst = getattr(attempt, role), targets[role]
+            here = result.iso_path if role == "iso" else result.artifact_paths.get(role, src)
+            if here != src:
+                continue  # recorded elsewhere (a canonical name, or already marked)
+            current, problem = inspect_path(src)
+            if current is None and not problem:
+                current, problem = inspect_path(dst)
+                if current is not None:
+                    self._set_location(result, role, dst)  # renamed by an earlier, interrupted call
+                if current is not None or not problem:
+                    continue  # or never created: it keeps its planned name in the records
+            if problem:
+                self._set_location(result, role, src)
+                note = (f"could not verify where this run's {role} is ({problem}); "
+                        f"it was last at {src.name} and may now be at {dst.name}")
+                result.warnings.append(note)
+                log(colorize("yellow", f"Warning: {note}"))
+                continue
             try:
-                attempt.iso.rename(marked_path)
-                result.iso_path = marked_path
-                log(colorize("yellow", f"ISO renamed to: {marked_path.name}"))
+                src.rename(dst)
             except OSError as e:
-                log(colorize("yellow", f"Could not rename partial ISO to {marked_path.name}: {e} "
-                                      f"(leaving it in place; run still recorded as failed)"))
-        for src, dst in attempt.sidecar_pairs(self.config.artifacts):
-            if src.exists():
-                try:
-                    src.rename(dst)
-                    log(colorize("yellow", f"{src.name} renamed to: {dst.name}"))
-                except OSError as e:
-                    log(colorize("yellow", f"Could not rename {src.name} to {dst.name}: {e}"))
+                self._set_location(result, role, src)
+                note = f"could not rename {src.name} to {dst.name} ({e}); it is still at {src.name}"
+                if role in ("log", "manifest"):
+                    note += " (this run's staged success record: it does not describe a successful run)"
+                result.warnings.append(note)
+                log(colorize("yellow", f"Warning: {note}"))
+                continue
+            self._set_location(result, role, dst)
+            log(colorize("yellow", f"ISO renamed to: {dst.name}" if role == "iso"
+                         else f"{src.name} renamed to: {dst.name}"))
 
     def _write_run_records(self, result: BackupResult, start_time: datetime.datetime,
                            disk_info: Dict[str, Any], iso_analysis: Dict[str, Any]):
+        current = RecordView.from_run(self.config, result).current
+        metadata = RecordMetadata.check(current)
+        unknown = [(path, problem) for path, problem in ((current.iso, metadata.iso_problem),
+                                                         (current.isolyzer, metadata.isolyzer_problem))
+                   if problem]
+        if unknown and result.success and not self.config.dry_run:
+            # Staged success records never describe a file they could not
+            # check: the run takes the failure path before publication
+            raise OSError("could not check " + "; ".join(f"{path.name} ({problem})"
+                                                         for path, problem in unknown))
+        for path, problem in unknown:
+            # Failure records still get written, saying what is unknown and why
+            if not any(problem in w and path.name in w for w in result.warnings):
+                result.warnings.append(f"could not check {path.name} while writing the records "
+                                       f"({problem}): its presence and size are unknown")
         opener = self._create_dry_run_file if self.config.dry_run else None
         create_formatted_log(self.config.log_path, self.config, result,
-                             start_time, disk_info, iso_analysis, self.run, opener=opener)
-        self._create_manifest(result, disk_info, iso_analysis)
+                             start_time, disk_info, iso_analysis, self.run, opener=opener,
+                             metadata=metadata)
+        self._create_manifest(result, disk_info, iso_analysis, metadata=metadata)
 
     def _write_failure_records_best_effort(self, result: BackupResult,
                                            start_time: datetime.datetime,
@@ -985,29 +1106,63 @@ class OpticalDiscBackup:
             log(colorize("red", "Interrupted by operator (Ctrl-C) while writing failure records; "
                                 "they may be incomplete"))
 
-    def _discard_staged_records(self, attempt: ArtifactSet):
-        """Delete this run's staged attempt log/manifest. They were written
-        for a success that then did not happen, so they must never survive
-        (renamed as failure records) claiming success."""
-        for path in (attempt.log, attempt.manifest):
+    def _discard_staged_records(self, result: BackupResult, attempt: ArtifactSet):
+        """Delete this run's staged log/manifest. They were written for a
+        success that then did not happen, so they must never survive
+        (renamed as failure records) claiming success. One that a failed
+        rollback left at a canonical name is this run's own too (publication
+        only ever moves into an empty slot) and is removed there. If one
+        cannot be removed, or checked, the failure records say so."""
+        canonical = self.config.canonical_artifacts
+        for role in ("log", "manifest"):
+            # Only its attempt name or the canonical name a failed rollback
+            # left it at; a failed-* name holds failure records
+            recorded = result.artifact_paths.get(role)
+            at_canonical = recorded == getattr(canonical, role)
+            path = recorded if at_canonical else getattr(attempt, role)
+            where = (" (left at the canonical name by the failed rollback)"
+                     if at_canonical else "")
+            current, problem = inspect_path(path)
+            if problem:
+                note = (f"could not check {path.name}{where} ({problem}); if present, it is "
+                        f"this run's staged success {role} and does not describe a successful run")
+                result.warnings.append(note)
+                log(colorize("yellow", f"Warning: {note}"))
+                continue
+            if current is None:
+                if recorded == path:
+                    del result.artifact_paths[role]
+                continue
+            if not stat.S_ISREG(current.st_mode):
+                continue
             try:
-                if path.is_file() and not path.is_symlink():
-                    path.unlink()
+                path.unlink()
             except OSError as e:
-                log(colorize("yellow", f"Warning: could not remove staged record {path.name}: {e}"))
+                note = (f"could not remove {path.name}{where} ({e}): it is this run's staged "
+                        f"success {role} and does not describe a successful run")
+                result.warnings.append(note)
+                log(colorize("yellow", f"Warning: {note}"))
+                continue
+            if recorded == path:
+                del result.artifact_paths[role]
+            if at_canonical:
+                note = f"removed {path.name}: this run's staged success {role}{where}"
+                result.warnings.append(note)
+                log(colorize("yellow", f"Warning: {note}"))
 
     def _fail_staged_success(self, result: BackupResult, attempt: ArtifactSet,
                              start_time: datetime.datetime, disk_info: Dict[str, Any],
                              iso_analysis: Dict[str, Any]):
         """A verified run that could not then be recorded or published:
         drop its staged success records first, then mark the attempt failed
-        and write failure records (best effort). If those cannot be written,
-        no record is left claiming success."""
+        and write failure records (best effort). A staged record that cannot
+        be removed is contradicted in the failure records; if those cannot
+        be written either, only the console says so."""
         # Removing the staged records and renaming the attempt are a few
         # local unlinks/renames: held like publication, so Ctrl-C cannot stop them halfway
         held = DeferredInterrupt()
         with held:
-            self._discard_staged_records(attempt)
+            self._discard_staged_records(result, attempt)
             self._mark_failed_attempt(result, attempt)
         if held.received:
             self.interrupted = True
@@ -1195,7 +1350,15 @@ class OpticalDiscBackup:
         # names, so they are obvious in the output directory and a retry can
         # never overwrite the evidence of a previous attempt.
         if not result.success and not self.config.dry_run:
-            self._mark_failed_attempt(result, attempt)
+            # A few local renames: held like _fail_staged_success, so Ctrl-C
+            # cannot leave the failed attempt's files half-renamed
+            held = DeferredInterrupt()
+            with held:
+                self._mark_failed_attempt(result, attempt)
+            if held.received:
+                self.interrupted = True
+                log(colorize("yellow", "Ctrl-C was held until this failed attempt's files had "
+                                       "their failed-* names; the failure is recorded as usual"))
 
         # Write the log and manifest before publishing a successful ISO. This
         # makes the record bundle part of the same promotion step as the master,
@@ -1259,23 +1422,44 @@ class OpticalDiscBackup:
                              "(any file it could not put back is listed in the warnings)"))
 
     def _fix_ownership(self, result: BackupResult, created_output_dir: bool):
+        """Hand this run's files to SUDO_USER. Runs after the records are
+        final, so it is best effort throughout: a file that cannot be
+        checked is skipped with a warning, the others are still handed
+        over, and no error here changes the run's result or exit status."""
         if self.config.dry_run:
             return  # a dry run's files changed owner as it created them; its new folder keeps its owner
         sudo_user = os.environ.get("SUDO_USER")
         if not sudo_user:
             return
-        artifacts = [result.iso_path] + self.config.artifacts.sidecars
-        if created_output_dir:
-            artifacts.insert(0, self.config.output_dir)
-        # The archive folder this run created, but not the archived files:
-        # they keep whatever ownership their own run gave them
-        if (self._archive_dir is not None and self._archive_dir.is_dir()
-                and not self._archive_dir.is_symlink()):
-            artifacts.append(self._archive_dir)
-        existing = [str(p) for p in artifacts if p.exists()]
         try:
+            # This run's files where they actually are (see RecordView.current),
+            # plus any staged record a failed rollback left elsewhere
+            current = RecordView.from_run(self.config, result).current
+            artifacts = list(dict.fromkeys([*current.archive_order, *result.artifact_paths.values()]))
+            if created_output_dir:
+                artifacts.insert(0, self.config.output_dir)
+            # The archive folder this run created, but not the archived files:
+            # they keep whatever ownership their own run gave them
+            if self._archive_dir is not None:
+                folder, problem = inspect_path(self._archive_dir)
+                if problem:
+                    log(colorize("yellow", f"Warning: could not check {self._archive_dir} ({problem}); "
+                                           f"its owner was not changed"))
+                elif folder is not None and stat.S_ISDIR(folder.st_mode):
+                    artifacts.append(self._archive_dir)
+            existing = []
+            for artifact in artifacts:
+                try:
+                    os.stat(artifact)  # follows a link, as chown does
+                except FileNotFoundError:
+                    continue
+                except OSError as e:
+                    log(colorize("yellow", f"Warning: could not check {artifact} ({e}); "
+                                           f"its owner was not changed"))
+                    continue
+                existing.append(str(artifact))
             subprocess.run(["chown", sudo_user] + existing, check=True)
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             log(colorize("yellow", f"Warning: Could not set ownership of output files: {e}"))
 
     def create_backup(self) -> BackupResult:
@@ -1311,9 +1495,8 @@ class OpticalDiscBackup:
             result.error_message = result.error_message or "Interrupted by operator (Ctrl-C)"
             held = DeferredInterrupt()
             with held:
-                self._discard_staged_records(prepared.attempt)
-                if self.config.attempt_token:
-                    self._mark_failed_attempt(result, prepared.attempt)
+                self._discard_staged_records(result, prepared.attempt)
+                self._mark_failed_attempt(result, prepared.attempt)  # resumes a cut-short marking
             self._write_failure_records_best_effort(result, start_time, prepared.disk_info,
                                                     phase.iso_analysis)
         try:
@@ -1580,6 +1763,9 @@ class OpticalDiscBackup:
         except subprocess.CalledProcessError as e:
             log(colorize("red", f"Failed to unmount:\n{e.stderr}"))
             return False
+        except OSError as e:
+            log(colorize("red", f"Failed to unmount: could not run diskutil: {e}"))
+            return False
     
     def _finalize_disk(self) -> Optional[bool]:
         """Eject the disc; True if ejected, False if the eject failed,
@@ -1599,8 +1785,12 @@ class OpticalDiscBackup:
             # Eject directly — diskutil eject works on an unmounted disk, and
             # the goal of finalization is physical release of the disc.
             log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil eject /dev/{self.config.disk_id}"))
-            eject_proc = subprocess.run(["diskutil", "eject", f"/dev/{self.config.disk_id}"],
-                                        capture_output=True, text=True)
+            try:
+                eject_proc = subprocess.run(["diskutil", "eject", f"/dev/{self.config.disk_id}"],
+                                            capture_output=True, text=True)
+            except OSError as e:
+                log(colorize("yellow", f"Warning: eject failed: could not run diskutil: {e}"))
+                return False
             if eject_proc.returncode != 0:
                 log(colorize("yellow", f"Warning: eject failed: {eject_proc.stderr.strip() or eject_proc.stdout.strip()}"))
                 return False
@@ -1787,18 +1977,22 @@ class OpticalDiscBackup:
         found = element.find(path, namespaces)
         return found.text.strip() if found is not None and found.text else ""
     
-    def _create_manifest(self, result: BackupResult, disk_info: Dict[str, Any], iso_analysis: Dict[str, Any]):
-        """Create comprehensive manifest file with improved organization"""
+    def _create_manifest(self, result: BackupResult, disk_info: Dict[str, Any], iso_analysis: Dict[str, Any],
+                         metadata: Optional[RecordMetadata] = None):
+        """Create comprehensive manifest file with improved organization
+        (metadata: the run's ISO/isolyzer check shared with the log)"""
         # Get current timestamp
         now = datetime.datetime.now()
         record = RecordView.from_run(self.config, result)
+        if metadata is None:
+            metadata = RecordMetadata.check(record.current)
         
         # Extract tree listing summary
-        tree_summary = self._extract_tree_summary()
+        tree_summary = self._extract_tree_summary(record.current.tree)
         
         # Calculate additional metrics
-        # Get ISO file size
-        iso_file_size = record.iso_stat_path.stat().st_size if record.iso_stat_path.exists() else None
+        # Get ISO file size (None when absent, or when it could not be checked)
+        iso_file_size = metadata.iso_size
         
         # Build comprehensive manifest
         manifest = {
@@ -1816,7 +2010,8 @@ class OpticalDiscBackup:
                 "overall_status": ("dry_run" if self.config.dry_run
                                    else (("success_with_warnings" if result.warnings else "success") if result.success
                                          else ("verification_failed" if result.checksum_match is False else "failed"))),
-                "iso_created": iso_file_size is not None,
+                # true/false: the ISO was/was not there; null: that could not be checked
+                "iso_created": None if metadata.iso_problem else iso_file_size is not None,
                 "verification_performed": result.md5_iso is not None,
                 "verification_passed": result.checksum_match if result.checksum_match is not None else "skipped",
                 "warnings": result.warnings,
@@ -1875,6 +2070,10 @@ class OpticalDiscBackup:
                     "method": "streamed copy with in-stream source hash calculation",
                     "publish_method": (("run-private attempt ISO promoted to canonical filename after verification"
                                         if result.success else
+                                        "run-private attempt ISO was published to the canonical filename, "
+                                        "then publication failed and it could not be moved back: it "
+                                        "remains at the canonical filename"
+                                        if result.iso_path == self.config.canonical_output_path else
                                         "run-private attempt ISO was not promoted because the run failed")
                                        if result.creation_path and result.creation_path != self.config.canonical_output_path
                                        else "written directly to canonical filename"),
@@ -2183,10 +2382,10 @@ class OpticalDiscBackup:
             log(colorize("red", f"Unexpected error during ISO analysis: {e}"))
             return {"error": str(e), "error_type": "parsing_failed"}
         
-    def _extract_tree_summary(self) -> Dict[str, Any]:
-        """Extract summary from tree listing"""
+    def _extract_tree_summary(self, tree_path: Path) -> Dict[str, Any]:
+        """Extract summary from the tree listing at tree_path"""
         try:
-            with open(self.config.tree_path, "r", encoding="utf-8") as f:
+            with open(tree_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
                 for line in reversed(lines):
                     stripped = line.strip()

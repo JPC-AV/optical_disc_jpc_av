@@ -20,13 +20,28 @@ is refused. No sudo needed.
 
 Usage:
   python3 verifyiso.py /path/to/collection [more/paths ...]
-  python3 verifyiso.py /Volumes/Archive --csv fixity_20261024.csv
+  python3 verifyiso.py /Volumes/Archive/JPC_AV --csv fixity_20261024.csv
 
 Exit codes:
-  0    every checked ISO matched its recorded hashes
-  1    at least one mismatch, missing ISO, unverifiable manifest or error;
-       or the --csv report was refused or could not be written
+  0    every checked ISO matched its recorded hashes, and every folder under
+       the given paths was searched (symlinks inside a search are never
+       followed: a symlinked folder counts only when its target was searched
+       through a given path; a symlink loop holds nothing)
+  1    at least one mismatch, missing ISO, unverifiable manifest or error; part
+       of a given path could not be searched (DISCOVERY_ERROR) or a symlinked
+       folder or dangling symlink was not searched (EXCLUDED); no manifests
+       were found; or the --csv report was refused or could not be written
   130  interrupted with Ctrl-C (an unfinished report is removed)
+
+Discovery: folders are listed one by one and every problem is reported, not
+skipped - a folder that cannot be listed, a listing that stops partway, an
+entry that cannot be inspected, a folder that disappears. Reachable folders
+and other paths are still searched, but the run then exits 1 even if every
+bundle found passed. No folder is skipped by name, so give the collection
+folder rather than a volume root (whose system folders a normal user often
+cannot list). A given path that is a symlink is followed. A given file must
+be a *_manifest.json; a FIFO, device or socket named like a manifest is never
+opened (ERROR).
 
 Manifests are classified by content, not by file name: a makeiso.py
 preservation record is checked; a makeiso-video.py access-copy record is
@@ -45,9 +60,11 @@ runs and dry runs with no ISO are SKIPPED.
 import argparse
 import csv
 import datetime
+import errno
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 from dataclasses import dataclass, field
@@ -99,16 +116,199 @@ APPLEDOUBLE_MAGIC = b"\x00\x05\x16\x07"
 HASH_LENGTHS = {"MD5": 32, "SHA-256": 64}
 
 
-def find_preservation_manifests(roots: List[Path]) -> List[Path]:
+MANIFEST_SUFFIX = "_manifest.json"
+# Discovery statuses: a part of the search that failed, and a symlink the
+# search did not follow. Neither is a manifest result.
+DISCOVERY_ERROR = "DISCOVERY_ERROR"
+EXCLUDED = "EXCLUDED"
+# A target that is not there: dangling, or a path component is a file
+TARGET_MISSING = (errno.ENOENT, errno.ENOTDIR)
+
+
+@dataclass
+class DiscoveryIssue:
+    path: Path                   # as reached from the given path (never resolved)
+    status: str                  # DISCOVERY_ERROR | EXCLUDED | ERROR (a candidate never opened)
+    detail: str
+    exempt: bool = False         # hides nothing: a symlink loop, or a symlinked folder searched elsewhere
+
+
+class DiscoveryIncomplete(Exception):
+    """find_preservation_manifests was called without an issues list and the
+    search was incomplete: the manifests it found are not the whole answer"""
+
+
+def _reason(e: OSError) -> str:
+    return f"[Errno {e.errno}] {e.strerror}" if e.errno and e.strerror else str(e)
+
+
+def _target(path) -> Tuple[Optional[os.stat_result], Optional[OSError]]:
+    """os.stat of what a symlink points to: (result, None), or (None, error)"""
+    try:
+        return os.stat(path), None
+    except OSError as e:
+        return None, e
+
+
+def find_preservation_manifests(roots: List[Path],
+                                issues: Optional[List[DiscoveryIssue]] = None) -> List[Path]:
     """Find every *_manifest.json under the roots. Which family a manifest
     belongs to is decided by its content in check_manifest, never by file
-    name, since a master's name can be anything."""
-    manifests = []
+    name, since a master's name can be anything.
+
+    Folders are listed one at a time with os.scandir, and anything that stops
+    the search from being complete is recorded in issues instead of being
+    skipped: a path or folder that cannot be checked or listed, a listing that
+    stops partway (the entries already read are still used), an entry that
+    cannot be inspected or disappears, a folder loop. Symlinks inside a search
+    are never followed; one to a folder, or a dangling one, is EXCLUDED, and
+    counts as searched only if its target was listed through a given path. A
+    given symlink is followed. A candidate that is a FIFO, device or socket
+    (or a link to one), or a link whose target cannot be checked, is returned
+    but recorded as ERROR, never to be opened.
+    Each manifest is returned once, however many given paths reach it.
+
+    Without an issues list, the first issue that leaves the search incomplete
+    raises DiscoveryIncomplete instead of being dropped."""
+    found_issues: List[DiscoveryIssue] = []
+    noted = set()
+    manifests: List[Path] = []
+    seen = set()       # real path of each manifest's own folder + its name
+    listed = {}        # real path of each folder listed completely -> path as reached
+    folder_links = []  # (issue, real path of the target): decided after every path
+
+    def note(path, key, status, detail, exempt=False):
+        if (key, status, detail) not in noted:
+            noted.add((key, status, detail))
+            issue = DiscoveryIssue(Path(path), status, detail, exempt)
+            found_issues.append(issue)
+            return issue
+        return None
+
+    def candidate(path: Path, key: str, mode: int, found: List[Tuple[Path, str]]):
+        """A manifest-named entry; mode is its own (not followed) st_mode"""
+        if stat.S_ISLNK(mode):
+            st, error = _target(path)
+            if error is not None:
+                # Unclassified, so never opened: it could be a FIFO or device
+                note(path, key, "ERROR", f"could not inspect the symlink's target: {_reason(error)}; "
+                                         f"not opened")
+                found.append((path, key))
+                return
+            mode = st.st_mode
+        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+            note(path, key, "ERROR", "not a regular file (FIFO, device or socket); not opened")
+        found.append((path, key))
+
     for root in roots:
-        if root.is_file() and root.name.endswith("_manifest.json"):
-            manifests.append(root)
+        found: List[Tuple[Path, str]] = []
+        root_key = os.path.realpath(root)
+        try:
+            root_st = os.stat(root)
+        except FileNotFoundError:
+            note(root, root_key, DISCOVERY_ERROR, "path disappeared before it could be searched")
             continue
-        manifests.extend(sorted(root.rglob("*_manifest.json")))
+        except OSError as e:
+            note(root, root_key, DISCOVERY_ERROR, f"could not check path: {_reason(e)}")
+            continue
+        if stat.S_ISREG(root_st.st_mode):
+            if root.name.endswith(MANIFEST_SUFFIX):
+                found.append((root, os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(root))),
+                                                 root.name)))
+            else:
+                note(root, root_key, DISCOVERY_ERROR, "not a manifest file (*_manifest.json); nothing "
+                                                      "was checked for it - give its folder or its manifest")
+        elif not stat.S_ISDIR(root_st.st_mode):
+            note(root, root_key, DISCOVERY_ERROR, "not a file or folder; nothing was checked for it")
+        else:
+            stack = [(root, root_key, ((root_st.st_dev, root_st.st_ino),), (root,))]
+            while stack:
+                folder, key, chain, chain_paths = stack.pop()
+                try:
+                    listing = os.scandir(folder)
+                except FileNotFoundError:
+                    note(folder, key, DISCOVERY_ERROR, "folder disappeared during the search")
+                    continue
+                except OSError as e:
+                    note(folder, key, DISCOVERY_ERROR, f"could not list folder: {_reason(e)}")
+                    continue
+                entries, complete = [], True
+                with listing:
+                    while True:
+                        try:
+                            entry = next(listing)
+                        except StopIteration:
+                            break
+                        except OSError as e:
+                            note(folder, key, DISCOVERY_ERROR, f"listing stopped partway: {_reason(e)}")
+                            complete = False
+                            break
+                        entries.append(entry)  # used even if the listing fails later
+                if complete:
+                    listed.setdefault(key, folder)
+                for entry in entries:
+                    path, child_key = folder / entry.name, os.path.join(key, entry.name)
+                    is_candidate = entry.name.endswith(MANIFEST_SUFFIX)
+                    try:
+                        if not is_candidate and entry.is_file(follow_symlinks=False):
+                            continue  # an ordinary file: nothing to find in it
+                    except OSError:
+                        pass  # the stat below says what it is, or why it cannot be inspected
+                    try:
+                        mode_st = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        note(path, child_key, DISCOVERY_ERROR, "entry disappeared during the search")
+                        continue
+                    except OSError as e:
+                        note(path, child_key, DISCOVERY_ERROR, f"could not inspect entry: {_reason(e)}")
+                        continue
+                    mode = mode_st.st_mode
+                    if is_candidate:
+                        candidate(path, child_key, mode, found)
+                    if stat.S_ISDIR(mode):  # every real folder, whatever its name
+                        identity = (mode_st.st_dev, mode_st.st_ino)
+                        if identity in chain:
+                            note(path, child_key, DISCOVERY_ERROR, f"folder loop: the same folder as "
+                                                                   f"{chain_paths[chain.index(identity)]}")
+                        else:
+                            stack.append((path, child_key, chain + (identity,), chain_paths + (path,)))
+                    elif stat.S_ISLNK(mode) and not is_candidate:  # a manifest-named link is a candidate
+                        try:
+                            text = os.readlink(path)
+                        except OSError:
+                            text = "?"
+                        st, error = _target(path)
+                        if error is not None and error.errno == errno.ELOOP:
+                            note(path, child_key, EXCLUDED, f"symlink loop -> {text}; not followed",
+                                 exempt=True)
+                        elif error is not None and error.errno in TARGET_MISSING:
+                            note(path, child_key, EXCLUDED, f"symlink target missing -> {text}; "
+                                                            f"not followed")
+                        elif error is not None:
+                            note(path, child_key, DISCOVERY_ERROR,
+                                 f"could not inspect symlink target -> {text}: {_reason(error)}")
+                        elif stat.S_ISDIR(st.st_mode):
+                            issue = note(path, child_key, EXCLUDED, f"symlinked folder not followed -> {text}")
+                            if issue is not None:
+                                folder_links.append((issue, os.path.realpath(path)))
+        for path, key in sorted(found):
+            if key not in seen:
+                seen.add(key)
+                manifests.append(path)
+
+    # A symlinked folder counts as searched only once every given path has been
+    # walked, and only if its target folder was itself listed completely
+    for issue, target in folder_links:
+        if target in listed:
+            issue.exempt = True
+            issue.detail += f" (its target was searched as {listed[target]})"
+    if issues is None:
+        incomplete = [i for i in found_issues if not i.exempt]
+        if incomplete:
+            first = incomplete[0]
+            raise DiscoveryIncomplete(f"{first.path}: {first.status}: {first.detail}")
+    else:
+        issues.extend(found_issues)
     return manifests
 
 
@@ -349,7 +549,10 @@ def _report_still_ours(path: Path, identity: Tuple[int, int]) -> bool:
     return (st.st_dev, st.st_ino) == identity
 
 
-def write_csv(results: List[CheckResult], out):
+def write_csv(results: List[CheckResult], out, discovery: Optional[List[DiscoveryIssue]] = None):
+    """One row per manifest checked, then one per discovery item that left
+    the search incomplete (its path leads the detail; no manifest, ISO or
+    hashes; numeric columns stay numeric)"""
     writer = csv.writer(out)
     writer.writerow(["status", "iso", "manifest", "size_bytes", "run_id",
                      "md5_expected", "md5_actual",
@@ -362,10 +565,19 @@ def write_csv(results: List[CheckResult], out):
                          r.md5_expected or "", r.md5_actual or "",
                          r.sha256_expected or "", r.sha256_actual or "",
                          r.detail or "", f"{r.seconds:.1f}", checked_at])
+    for issue in discovery or []:
+        writer.writerow([issue.status, "", "", 0, "", "", "", "", "",
+                         f"{issue.path}: {issue.detail}", "0.0", checked_at])
 
 
 STATUS_COLOR = {"PASS": "green", "FAIL": "red", "MISSING_ISO": "red",
-                "UNVERIFIABLE": "red", "ERROR": "red", "SKIPPED": "yellow"}
+                "UNVERIFIABLE": "red", "ERROR": "red", "SKIPPED": "yellow",
+                DISCOVERY_ERROR: "red", EXCLUDED: "red"}
+
+
+def _shown(path) -> str:
+    """A path for the console, with control characters escaped"""
+    return "".join(c if c.isprintable() or c == " " else repr(c)[1:-1] for c in str(path))
 
 
 def main():
@@ -373,17 +585,23 @@ def main():
         description="Verify ISO preservation masters against their manifest hashes "
                     "(never changes an existing file)")
     parser.add_argument("paths", nargs="+", type=Path,
-                        help="Collection directories (searched recursively) or manifest files")
+                        help="Collection folders (searched recursively; symlinks inside them are "
+                             "listed, not followed) or manifest files. Give the collection folder "
+                             "rather than a volume root")
     parser.add_argument("--csv", type=Path, metavar="PATH",
-                        help="Write a CSV report of every check to a NEW file; refused before "
-                             "anything is hashed if PATH already exists or is named like an "
-                             ".iso or _manifest.json file")
+                        help="Write a CSV report of every check, and of every part of the search "
+                             "that failed, to a NEW file; refused before anything is hashed if PATH "
+                             "already exists or is named like an .iso or _manifest.json file")
     args = parser.parse_args()
 
     roots = [p.expanduser() for p in args.paths]
     for root in roots:
-        if not root.exists():
-            sys.exit(f"Path not found: {root}")
+        try:
+            os.stat(root)
+        except OSError as e:
+            if e.errno in TARGET_MISSING + (errno.ELOOP,):
+                sys.exit(f"Path not found: {root}")
+            # anything else is recorded by the search itself
 
     report_path = args.csv.expanduser() if args.csv else None
     report_fd = None
@@ -397,23 +615,42 @@ def main():
             sys.exit(1)
 
     try:
-        manifests = find_preservation_manifests(roots)
-        if not manifests:
+        issues: List[DiscoveryIssue] = []
+        manifests = find_preservation_manifests(roots, issues)
+        never_open = {i.path: i.detail for i in issues if i.status == "ERROR"}
+        # Search items: those that left the search incomplete, and the
+        # symlinks that hide nothing (a loop, or a folder searched elsewhere)
+        incomplete = sorted((i for i in issues if i.status != "ERROR" and not i.exempt),
+                            key=lambda i: str(i.path))
+        expected = sorted((i for i in issues if i.status != "ERROR" and i.exempt),
+                          key=lambda i: str(i.path))
+        for issue in incomplete:
+            print(colorize(STATUS_COLOR[issue.status], f"  {issue.status}: {_shown(issue.path)}: {issue.detail}"))
+        for issue in expected:
+            print(colorize("yellow", f"  Not searched (symlink, expected): {_shown(issue.path)}: {issue.detail}"))
+        if not manifests and not incomplete:
             sys.exit("No manifests (*_manifest.json) found under the given paths.")
-
-        print(colorize("cyan", f"Found {len(manifests)} manifest(s) to examine\n"))
 
         results: List[CheckResult] = []
         started = time.time()
+        if manifests:
+            print(colorize("cyan", f"Found {len(manifests)} manifest(s) to examine"
+                                   + (f" (search incomplete: {len(incomplete)} item(s) not searched)"
+                                      if incomplete else "") + "\n"))
+        else:
+            print(colorize("red", "No manifests found in the parts of the given paths that could be searched."))
         for i, manifest_path in enumerate(manifests, 1):
             print(colorize("cyan", f"[{i}/{len(manifests)}] {manifest_path.parent.name}/{manifest_path.name}"))
             # One bad item must never stop the batch: anything unexpected
             # becomes an ERROR for this manifest and the next one is checked
-            try:
-                r = check_manifest(manifest_path)
-            except Exception as e:
-                r = CheckResult(manifest=manifest_path, status="ERROR",
-                                detail=f"could not check this manifest: {type(e).__name__}: {e}")
+            if manifest_path in never_open:
+                r = CheckResult(manifest=manifest_path, status="ERROR", detail=never_open[manifest_path])
+            else:
+                try:
+                    r = check_manifest(manifest_path)
+                except Exception as e:
+                    r = CheckResult(manifest=manifest_path, status="ERROR",
+                                    detail=f"could not check this manifest: {type(e).__name__}: {e}")
             results.append(r)
             line = f"  {r.status}: {r.detail or ''}"
             if r.status == "PASS" and r.seconds:
@@ -432,14 +669,21 @@ def main():
         for status in ("PASS", "FAIL", "MISSING_ISO", "UNVERIFIABLE", "ERROR", "SKIPPED"):
             if counts.get(status):
                 print(colorize(STATUS_COLOR[status], f"  {status}: {counts[status]}"))
+        if incomplete:
+            searched = {s: sum(1 for i in incomplete if i.status == s) for s in (DISCOVERY_ERROR, EXCLUDED)}
+            print(colorize("red", "Search incomplete: " + "; ".join(
+                f"{n} {s} item(s)" for s, n in searched.items() if n)
+                + " - what they hold was not found or checked"))
         # UNVERIFIABLE is a finding, not a benign skip: a master that should carry a
         # checkable hash but doesn't must not let the audit exit 0.
         bad = [r for r in results if r.status in ("FAIL", "MISSING_ISO", "UNVERIFIABLE", "ERROR")]
-        if bad:
+        if bad or incomplete:
             print()
             print(colorize("red", "Items needing attention:"))
             for r in bad:
                 print(colorize("red", f"  {r.iso or r.manifest}: {r.status} — {r.detail}"))
+            for issue in incomplete:
+                print(colorize("red", f"  {_shown(issue.path)}: {issue.status} — {issue.detail}"))
 
         if report_path:
             # Write only into the file this run reserved; if something else
@@ -452,7 +696,7 @@ def main():
                 # The descriptor stays ours (closefd=False) until the report is
                 # complete, so cleanup can still prove which file is ours
                 with os.fdopen(report_fd, "w", encoding="utf-8", newline="", closefd=False) as out:
-                    write_csv(results, out)
+                    write_csv(results, out, incomplete)
                 fd, report_fd = report_fd, None
                 os.close(fd)
             except Exception as e:
@@ -462,7 +706,7 @@ def main():
             report_written = True
             print(colorize("cyan", f"\nCSV report written to: {report_path}"))
 
-        sys.exit(1 if bad else 0)
+        sys.exit(1 if bad or incomplete or not results else 0)
     except KeyboardInterrupt:
         print(colorize("yellow", "\nInterrupted by operator (Ctrl-C)"
                                  + ("" if report_written else " — verification incomplete"

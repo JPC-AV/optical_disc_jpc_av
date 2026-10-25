@@ -480,7 +480,7 @@ If the folder already holds a bundle, you are asked before anything starts. Noth
 
 Each archived manifest still names its own ISO, so `verifyiso.py` checks every retained master against its own hashes. Inside archived records only the file names are current: their full paths (output directory, final destination) still name the canonical location, which now holds the new master. `makeiso-video.py --batch` skips these folders.
 
-The few renames that archive the old bundle and publish the new one run with Ctrl-C held, so Ctrl-C cannot stop them halfway. If a rename fails, they are rolled back as far as the filesystem allows. The rollback is best effort and never replaces a file. If this run's files cannot all be moved out of the canonical names, nothing is restored. If a restore fails partway, the files already restored are moved back into the archive folder. So after a single failing rename, a bundle that was archived whole stays complete in its archive folder, where each manifest still names its own ISO. If renames keep failing, files can be left split between canonical names and the archive folder. The failed run's records always list where each file actually is. A folder the rollback empties is removed.
+The few renames that archive the old bundle and publish the new one run with Ctrl-C held, so Ctrl-C cannot stop them halfway. If a rename fails, they are rolled back as far as the filesystem allows. The rollback is best effort and never replaces a file. If this run's files cannot all be moved out of the canonical names, nothing is restored. If a restore fails partway, the files already restored are moved back into the archive folder. So after a single failing rename, a bundle that was archived whole stays complete in its archive folder, where each manifest still names its own ISO. If renames keep failing, files can be left split between canonical names and the archive folder. The failed run's records name where each of this run's files actually is, including any the rollback had to leave at a canonical name, and their warnings say where the prior files are; where a file's location could not be checked, the warnings say so instead. A folder the rollback empties is removed.
 
 #### Dry Runs
 
@@ -503,11 +503,12 @@ JPC_AV_00001_failed-20260612T140322-3f9a2c_tree.txt       # tree listing for tha
 JPC_AV_00001_failed-20260612T140322-3f9a2c_isolyzer.xml   # structural analysis, if it ran
 ```
 
-Successful runs use the standard names above. A failed run does not leave behind a record claiming success, except where even its rollback could not move this run's files out of the canonical names (its records then say exactly which files are where).
+Successful runs use the standard names above. When a verified run then fails to record or publish, removal of its staged success log and manifest is attempted, at the canonical name if its rollback had to leave the log there. A staged record that cannot be removed is identified in the failed run's records, which say it does not describe a successful run. A file that cannot be given its `failed-*` name keeps its `attempt-*` name (or the canonical name a failed rollback left it at), and the records name it there, with a warning. If this run's ISO or isolyzer output cannot even be checked (an error other than "no such file"), a verified run fails rather than write success records about it, and failure records say what could not be checked and why (the ISO's size as unavailable) instead of claiming the file is absent.
 
 #### Interruptions (Ctrl-C) and Recovery
 
 - **During the tree listing, unmount, copy, verification or structural analysis:** the run is recorded as failed (`Interrupted by operator (Ctrl-C)`), with its files under `failed-*` names; a complete, hash-verified copy interrupted during the analysis is kept as `.iso.partial`.
+- **While a failed run's files are renamed to their `failed-*` names:** Ctrl-C is held until those renames finish; the failure and its exit code stand.
 - **During the disc eject:** recorded as the warning `disc eject interrupted by operator (Ctrl-C)` on any outcome. After a verified copy the master is kept and published as verified (`success_with_warnings`) and the run exits `130`; if the copy had failed, that failure and its exit code stand.
 - **While the run records are written:** recorded as a failed run; nothing is published.
 - **During the final renames:** Ctrl-C is held until they finish. If publication completes, the bundle and its records are final and accurate (they do not mention the Ctrl-C) and the run exits `130`. If a rename failed, the best-effort rollback runs first (see [Replacing an Existing Bundle](#replacing-an-existing-bundle)) and the run is recorded as failed.
@@ -736,7 +737,7 @@ Each titleset is encoded to a temporary file and checked before anything gets a 
 |---------|------|--------------|
 | **passed** | within the tolerance (or exactly on it) | the MP4 — promoted only if every titleset of the ISO passed |
 | **unverified** | the check could not be completed: the output's stream or duration probe failed, there is no usable expected duration, or the MP4 is longer than expected by more than the tolerance | a review copy, `*_unverified-<token>.mp4.unverified` |
-| **failed** | ffmpeg failed or was interrupted; the output is missing, empty, or confirmed by a successful probe to have no video; or it is shorter than expected by more than the tolerance | the attempt, `*_failed-<token>.mp4.partial` |
+| **failed** | ffmpeg failed or was interrupted; the output is missing, empty, or confirmed by a successful probe to have no video; or it is shorter than expected by more than the tolerance | the attempt, `*_failed-<token>.mp4.partial`, once ffmpeg has stopped (neither complete nor playable) |
 
 Without a usable expected duration the MP4 is never compared, so it is never reported as truncated on that basis; it is unverified.
 
@@ -768,6 +769,10 @@ JPC_AV_00001_failed-20260612T150000-3f9a2c_manifest.json                # manife
 A run that ends unverified names its log and manifest `…_unverified-<token>.log.txt` and `…_unverified-<token>_manifest.json`. Kept files never replace an existing file: each name is reserved first, and if it is taken another random suffix is added (`…-3f9a2c-7b01de.mp4.partial`).
 
 A hard kill (power loss, `kill -9`) may leave a `*.encoding-*.mp4` temp file behind, as can a filesystem failure that prevents moving it to its kept name (in that case the run's records name the leftover file and say what it holds). Temp files left by a hard kill are incomplete by definition.
+
+When ffmpeg fails or is interrupted (Ctrl-C), it is killed and given up to 10 seconds to exit. Only once its exit is confirmed have its output's bytes stopped changing, and only then is the output moved to its `.partial` name; a `.partial` is neither complete nor playable. If the exit cannot be confirmed, the run fails (exit `1`), the ISO's remaining titlesets are not attempted and a batch starts no further ISO, the output keeps its temporary name, and the ISO is left attached. The warning, the log and the manifest (`conversion_status.encoder_cleanup`) give the process ID, the possible output path, and the mount points and devices. That process, its output and the mount may still be active: resolve them before retrying the ISO or detaching it.
+
+A Ctrl-C that arrives just as an output is being moved to its `.partial` or review-copy name is handled: the record names where the output actually is. A second Ctrl-C pressed while that location is still being checked can leave the record naming the temporary name, or no kept file; the kept file still carries the run's token, so look for it beside the run's log and manifest.
 
 ### Menu VOBs Are Intentionally Excluded
 
@@ -861,14 +866,30 @@ Audits existing ISO preservation masters **without reloading any discs**: it re-
 Sudo-free, and it never changes an existing file. `--csv` creates one **new** report file: its path is reserved before anything is hashed, and an existing path (a file, folder, symlink or `/dev/stdout`) or a name ending in `.iso` or `_manifest.json` is refused with exit `1`. Give each report a new name, for example with the date.
 
 ```bash
-# Verify everything under a collection directory (searched recursively)
+# Verify everything under a collection folder (searched recursively)
 python3 verifyiso.py /Volumes/Archive/JPC_AV
 
 # Multiple locations, with a CSV report for record-keeping
-python3 verifyiso.py /Volumes/Archive /Volumes/Backup --csv "fixity_$(date +%Y%m%d_%H%M%S).csv"
+python3 verifyiso.py /Volumes/Archive/JPC_AV /Volumes/Backup/JPC_AV --csv "fixity_$(date +%Y%m%d_%H%M%S).csv"
 ```
 
-Every `*_manifest.json` found is examined, whatever it is called; what it is comes from its content. `makeiso.py` preservation records are checked; `makeiso-video.py` access-copy records and macOS AppleDouble (`._*`) metadata files are skipped. Masters kept in `*_overwritten-*` archive folders are checked like any other. Each manifest is reported as one of:
+**What is searched.** Every folder under each given path is listed, one at a time, and anything that keeps the search from being complete is reported rather than skipped:
+- a path or folder that cannot be checked or listed, including a macOS privacy denial ("Operation not permitted": give Terminal access to removable volumes);
+- a listing that stops partway (the entries already read are still used);
+- an entry that cannot be inspected;
+- a folder that disappears while the search runs.
+
+The rest of the search goes on, and the bundles it finds are verified, but the run then exits `1` even if every one of them passed. No folder is skipped because of its name. So give the collection folder, not a volume or share root: their system and recovery folders (`.Spotlight-V100`, `.Trashes`, `lost+found`, `#recycle` and the like) often cannot be listed by a normal user, and each one would be reported.
+
+Symlinks inside a search are never followed:
+- **a link to a folder, or a dangling link:** listed as `EXCLUDED` and fails the run, unless its target folder was itself searched through one of the given paths;
+- **a symlink loop:** listed, but holds nothing and does not fail the run;
+- **a symlink given as a path:** followed, so giving a link's target, or the link itself, is how to include a linked folder;
+- **Finder aliases:** ordinary files, not followed.
+
+A given file must be a `*_manifest.json`; anything else given is reported, not silently ignored. Give folders or manifests, not a shell glob that also matches loose files. A manifest reached through more than one given path is checked once.
+
+Every `*_manifest.json` found is examined, whatever it is called; what it is comes from its content. `makeiso.py` preservation records are checked; `makeiso-video.py` access-copy records and macOS AppleDouble (`._*`) metadata files are skipped. A FIFO, device or socket named like a manifest is never opened (`ERROR`). Masters kept in `*_overwritten-*` archive folders are checked like any other. Each manifest is reported as one of:
 
 | Status | Meaning |
 |--------|---------|
@@ -877,12 +898,19 @@ Every `*_manifest.json` found is examined, whatever it is called; what it is com
 | `MISSING_ISO` | Manifest exists but its ISO is gone |
 | `UNVERIFIABLE` | The record cannot be trusted to verify: missing or unrecognized run status, missing integrity record, missing MD5 source hash, a blank, non-text or malformed hash (including a declared SHA-256 with no SHA-256 hash), fields of the wrong type, an ISO name outside its folder, a dry-run record next to an existing ISO (a dry run replaced that master's own manifest), markers of both record families, or a manifest that is neither a `makeiso.py` nor a `makeiso-video.py` record |
 | `SKIPPED` | Nothing to check: an explicitly `failed` or `verification_failed` run, a dry-run record with no ISO beside it, a `makeiso-video.py` record, or an AppleDouble metadata file |
-| `ERROR` | Manifest unreadable, not valid UTF-8 or JSON, or not a JSON object; or the ISO could not be read. One bad item never stops the run |
+| `ERROR` | Manifest unreadable, not valid UTF-8 or JSON, or not a JSON object; the ISO could not be read; or a FIFO, device or socket named like a manifest, or a manifest-named symlink whose target cannot be checked (not opened). One bad item never stops the run |
+
+Parts of the search are reported separately, never as manifest results. They are listed before checking starts, again at the end, and as their own rows in the CSV report (path at the start of `detail`; no manifest, ISO or hashes):
+
+| Status | Meaning |
+|--------|---------|
+| `DISCOVERY_ERROR` | Part of a given path could not be searched (see above), or a given path is not a folder or `*_manifest.json` file |
+| `EXCLUDED` | A symlinked folder or dangling symlink that was not followed, and whose target was not searched through a given path |
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | Every checked ISO verified (skips are not failures) |
-| `1` | At least one `FAIL`, `MISSING_ISO`, `UNVERIFIABLE` or `ERROR` (listed at the end of the run); or the `--csv` report was refused or could not be written |
+| `0` | Every checked ISO verified (skips are not failures), and every folder under the given paths was searched; symlinks are not followed, so a symlinked folder counts only when its target was searched through a given path |
+| `1` | At least one `FAIL`, `MISSING_ISO`, `UNVERIFIABLE` or `ERROR`, `DISCOVERY_ERROR` or `EXCLUDED` (all listed at the end of the run); no manifests were found; or the `--csv` report was refused or could not be written |
 | `130` | Interrupted with Ctrl-C; an unfinished report is removed |
 
 Suitable for a scheduled fixity-audit job, provided each run gets a new report name.
@@ -1013,7 +1041,7 @@ Because the second hash comes from the bytes that actually landed on disk — no
 The JSON manifest (`*_manifest.json`) includes:
 
 - `backup_metadata` — Run ID, UUID, timestamps, operator
-- `backup_status` — Success/failure, verification results
+- `backup_status` — Success/failure, verification results, and `iso_created`: `true` or `false` when the ISO's presence was checked, `null` when it could not be checked (its size fields are then `null` too, and a warning gives the reason)
 - `source_disc` — Device info, media type, filesystem
 - `volume_information` — Size, mount point, block size
 - `output_files` — All generated file paths and sizes
