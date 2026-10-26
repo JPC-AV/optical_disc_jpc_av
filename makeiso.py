@@ -13,6 +13,7 @@ import time
 import plistlib
 import hashlib
 import re
+import shlex
 import platform
 import argparse
 import json
@@ -186,6 +187,8 @@ class BackupResult:
     eject_interrupted: bool = False    # Ctrl-C arrived during the eject
     unmount_interrupted: bool = False  # Ctrl-C arrived during the unmount
     warnings: List[str] = field(default_factory=list)  # non-fatal problems (run still valid)
+    flush_method: Optional[str] = None   # as IsoCreationResult: how the ISO was flushed
+    cache_bypass: Optional[bool] = None  # as IsoCreationResult: F_NOCACHE set for the re-read
     # Where this run's own tree/isolyzer/log/manifest actually are, by role,
     # once a move (publication, move-back, failure marking) - successful or
     # not - has decided it; otherwise the config-derived name applies.
@@ -243,6 +246,8 @@ class IsoCreationResult:
     sha256_iso: Optional[str]
     output_path: Path
     warnings: List[str] = field(default_factory=list)  # degraded-but-not-fatal conditions
+    flush_method: Optional[str] = None   # "F_FULLFSYNC", or "fsync" when that was unavailable
+    cache_bypass: Optional[bool] = None  # whether F_NOCACHE was set for the verification read
 
 @dataclass(frozen=True)
 class RecordMetadata:
@@ -374,6 +379,46 @@ def run_cmd(cmd: List[str], capture_output: bool = True, plist: bool = False) ->
     else:
         result = subprocess.run(cmd, capture_output=capture_output, text=True, check=True)
         return result.stdout
+
+# Commands as run, and as shown and recorded: shown with shlex.join or
+# shlex.quote, so a name with spaces, quotes, $, ` or ; stays one argument
+
+def tree_command(config: "BackupConfig") -> List[str]:
+    """The tree listing's argv"""
+    return ["tree", "-RapugD", "--si", "--du",
+            config.mount_point or f"/Volumes/{config.volume_name}"]
+
+def dd_command(disk_id: str) -> List[str]:
+    """dd's argv. dd only reads the raw device: makeiso.py reads dd's
+    output, writes the ISO from it and hashes it as it goes"""
+    return ["dd", f"if=/dev/r{disk_id}", "bs=4m"]
+
+def spot_check_command(iso: str, disk_id: str) -> str:
+    """An optional operator check that makeiso.py never runs: hash a fresh
+    raw-device read and compare it with the ISO at iso"""
+    return (f"iso=$(md5 -q {shlex.quote(iso)}); "
+            f"disc=$({shlex.join(dd_command(disk_id))} 2>/dev/null | md5 -q); "
+            f'[ "$iso" = "$disc" ] && echo MATCH || echo MISMATCH')
+
+def flush_wording(flush_method: Optional[str]) -> str:
+    """What was done to get the written ISO onto its media before verification"""
+    if flush_method == "F_FULLFSYNC":
+        return ("F_FULLFSYNC (asks the drive to write its cache to the media; a drive "
+                "or network volume may not honour it)")
+    if flush_method == "fsync":
+        return ("fsync only (F_FULLFSYNC unavailable: the drive's own write cache may "
+                "not have been flushed)")
+    return "not recorded"
+
+def reread_wording(cache_bypass: Optional[bool]) -> str:
+    """How the written ISO was re-read for verification"""
+    if cache_bypass:
+        return ("written ISO re-read with F_NOCACHE set (macOS is asked not to cache "
+                "the read; data the write left cached may still be served)")
+    if cache_bypass is False:
+        return ("written ISO re-read without F_NOCACHE (unavailable: the read may have "
+                "been served from the page cache)")
+    return "written ISO re-read"
 
 def calculate_disc_speed_multiplier(speed_mb_s: float, media_type: str) -> str:
     """Calculate disc speed as Xx multiplier based on media type.
@@ -517,8 +562,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         
         # Tree generation
         f.write(f"[{step_time('tree', start_time)}] Tree Listing Generation\n")
-        tree_target = config.mount_point or f"/Volumes/{config.volume_name}"
-        f.write(f"  Command: tree -RapugD --si --du {tree_target}\n")
+        f.write(f"  Command: {shlex.join(tree_command(config))}\n")
         f.write(f"  Output:  {record.files.tree.name}\n\n")
         
         # Disk unmount
@@ -529,7 +573,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         else:
             unmount_status = "Success" if result.unmount_ok else "FAILED"
         f.write(f"[{step_time('unmount', start_time)}] Disk Unmount\n")
-        f.write(f"  Command: diskutil unmountDisk /dev/{config.disk_id}\n")
+        f.write(f"  Command: {shlex.join(['diskutil', 'unmountDisk', f'/dev/{config.disk_id}'])}\n")
         f.write(f"  Status:  {unmount_status}\n\n")
         
         # ISO Creation and Verification (real captured times; approximation
@@ -544,7 +588,8 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
             f.write(f"  Status:  Not started ({result.error_message or 'aborted before copy'})\n\n")
         else:
             creation_path = result.creation_path or config.output_path
-            f.write(f"  Command: dd if=/dev/r{config.disk_id} of={creation_path} bs=4m\n")
+            f.write(f"  Command: {shlex.join(dd_command(config.disk_id))}\n")
+            f.write(f"  Output:  {creation_path} (written by makeiso.py from dd's output)\n")
             f.write(f"  Method:  Streamed copy with in-stream source (raw disk) hashing\n")
             if creation_path != config.canonical_output_path:
                 f.write(f"  Attempt: Run-private path; promoted to {config.canonical_output_path.name} only after successful verification\n")
@@ -561,7 +606,9 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         if result.md5_iso and result.md5_raw:
             f.write("VERIFICATION RESULTS\n")
             f.write("-" * 20 + "\n")
-            f.write(f"Method:         Written ISO re-read from disk, compared to streamed raw disk hashes\n")
+            f.write(f"Method:         {reread_wording(result.cache_bypass)}, "
+                    f"compared to streamed raw disk hashes\n")
+            f.write(f"Flush:          {flush_wording(result.flush_method)}\n")
             f.write(f"MD5 (ISO):          {result.md5_iso}\n")
             f.write(f"MD5 (Raw Disk):     {result.md5_raw}\n")
             if result.sha256_iso and result.sha256_raw:
@@ -614,7 +661,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         
         # Finalization
         f.write(f"[{step_time('finalize', create_end + datetime.timedelta(seconds=1))}] Finalization\n")
-        f.write(f"  Eject:   diskutil eject /dev/{config.disk_id}\n")
+        f.write(f"  Eject:   {shlex.join(['diskutil', 'eject', f'/dev/{config.disk_id}'])}\n")
         if config.dry_run:
             final_status = "Skipped (dry run)"
         elif result.finalized:
@@ -977,6 +1024,18 @@ class OpticalDiscBackup:
         if linked:
             raise OSError(f"Symlink appeared at publish path(s): {', '.join(linked)}")
 
+    @staticmethod
+    def _require_verified_iso(iso: Path):
+        """The verified ISO is what publication is for: when it is missing,
+        cannot be inspected or is no longer a regular file, publication fails"""
+        here, problem = inspect_path(iso)
+        if problem:
+            raise OSError(f"could not inspect the verified ISO {iso.name} ({problem})")
+        if here is None:
+            raise OSError(f"the verified ISO {iso.name} is missing")
+        if not stat.S_ISREG(here.st_mode):
+            raise OSError(f"the verified ISO {iso.name} is no longer a regular file")
+
     def _promote_successful_attempt(self, result: BackupResult, attempt: ArtifactSet):
         """Publish verified attempt artifacts at the canonical names.
 
@@ -996,9 +1055,15 @@ class OpticalDiscBackup:
             try:
                 self._check_publish_symlinks(self._standard_artifacts())
                 self._check_publish_symlinks([src for src, _ in publish_order if src.exists()])
+                # Checked before the prior bundle is archived, and again as the
+                # ISO is published (if it disappears in between, the rollback
+                # below restores the prior bundle as far as it can)
+                self._require_verified_iso(attempt.iso)
                 archived = self._archive_existing_artifacts()
                 for role, (src, dst) in zip(ARTIFACT_ROLES, publish_order):
-                    if not src.exists():
+                    if role == "iso":
+                        self._require_verified_iso(src)
+                    elif not src.exists():
                         continue
                     self._check_publish_symlinks([src, dst])
                     if os.path.lexists(dst):
@@ -1315,7 +1380,9 @@ class OpticalDiscBackup:
             unmount_ok=phase.unmount_ok,
             finalized=phase.finalized,
             eject_interrupted=self._eject_interrupted,
-            unmount_interrupted=self._unmount_interrupted
+            unmount_interrupted=self._unmount_interrupted,
+            flush_method=iso_result.flush_method if iso_result else None,
+            cache_bypass=iso_result.cache_bypass if iso_result else None
         )
         self._classify_result(result, phase.tree_ok, iso_result, phase.iso_analysis)
         return result
@@ -1544,11 +1611,10 @@ class OpticalDiscBackup:
         file not creatable, writable or closable, tree missing or failing)
         raises DryRunStopped instead."""
         log_divider("Generating Tree Listing")
-        target = self.config.mount_point or f"/Volumes/{self.config.volume_name}"
-        tree_cmd = ["tree", "-RapugD", "--si", "--du", target]
+        tree_cmd = tree_command(self.config)
         try:
             log(colorize("cyan", "Generating tree listing..."))
-            log(colorize("cyan", "Running command:") + " " + colorize("yellow", " ".join(tree_cmd)))
+            log(colorize("cyan", "Running command:") + " " + colorize("yellow", shlex.join(tree_cmd)))
             with (self._create_dry_run_file(self.config.tree_path, encoding="utf-8")
                   if self.config.dry_run else
                   open(self.config.tree_path, "w", encoding="utf-8")) as f:
@@ -1575,9 +1641,9 @@ class OpticalDiscBackup:
         log_divider("Creating ISO")
         log(colorize("cyan", "Creating ISO from:") + " " + colorize("yellow", self.config.disk_id))
 
-        raw_disk = f"r{self.config.disk_id}"
-        dd_command = f"dd if=/dev/{raw_disk} of={self.config.output_path} bs=4m"
-        log(colorize("cyan", "Running command:") + " " + colorize("yellow", dd_command))
+        dd_cmd = dd_command(self.config.disk_id)
+        log(colorize("cyan", "Running command:") + " " + colorize("yellow", shlex.join(dd_cmd)))
+        log(colorize("cyan", f"dd's output is written to {self.config.output_path} and hashed by makeiso.py"))
 
         raw_hasher = hashlib.md5()
         raw_sha_hasher = hashlib.sha256()
@@ -1594,8 +1660,7 @@ class OpticalDiscBackup:
         # A KeyboardInterrupt here propagates to create_backup(), which records
         # the interruption as a failed run and renames the partial ISO.
         with open(self.config.output_path, 'wb') as iso_file:
-            with subprocess.Popen(["dd", f"if=/dev/{raw_disk}", "bs=4m"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+            with subprocess.Popen(dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
                 while True:
                     chunk = proc.stdout.read(4 * 1024 * 1024)  # 4MB chunks
                     if not chunk:
@@ -1621,16 +1686,21 @@ class OpticalDiscBackup:
                     dd_output = stderr.strip() if isinstance(stderr, str) else stderr.decode().strip()
                     log(dd_output)
 
-            # Force data to physical media before the verification pass below;
-            # plain fsync on macOS stops at the drive cache, F_FULLFSYNC does not.
+            # Ask for the data to reach the media before the verification pass
+            # below: plain fsync on macOS may stop at the drive's cache, and
+            # F_FULLFSYNC asks the drive to flush it too (a drive or network
+            # volume may still not honour it, so neither is a guarantee)
             iso_file.flush()
             try:
                 fcntl.fcntl(iso_file.fileno(), fcntl.F_FULLFSYNC)
+                flush_method = "F_FULLFSYNC"
             except (OSError, AttributeError):
                 os.fsync(iso_file.fileno())
+                flush_method = "fsync"
                 warnings.append("F_FULLFSYNC unavailable; fell back to fsync, which on "
                                 "macOS may not flush the drive's own write cache before "
                                 "verification")
+                log(colorize("yellow", f"Warning: {warnings[-1]}"))
 
         # Completeness check: a bit-perfect *equal* copy is not enough — it must
         # also be *complete*. dd exits 0 on a short read (bad sector, flaky USB
@@ -1654,17 +1724,12 @@ class OpticalDiscBackup:
         log(colorize("cyan", "MD5 (Raw Disk):") + " " + colorize("yellow", raw_hash))
         log(colorize("cyan", "SHA-256 (Raw Disk):") + " " + colorize("yellow", raw_sha))
 
-        # Independent verification: re-read the written ISO from disk and hash it,
-        # so the comparison reflects the bytes that actually landed on disk.
+        # Verification: re-read the written ISO and hash it, independently of
+        # the hashes taken from the stream (the optional manual spot-check,
+        # a fresh raw-device read, is shown with the summary, naming the ISO
+        # where the run left it)
         log_divider("Verifying ISO")
-        log(colorize("cyan", "Verifying using:") + " " + colorize("yellow", f"md5 {self.config.output_path.name} (re-read from disk) vs streamed raw disk hash"))
-
-        # Optional operator check: this performs a fresh raw-device read, unlike
-        # the script's automated verification, which uses the streamed source hash.
-        manual_check = (f'[ "$(md5 -q {self.config.output_path.name})" = "$(dd if=/dev/{raw_disk} bs=4m 2>/dev/null | md5 -q)" ] '
-                        f'&& echo "MATCH" || echo "MISMATCH"')
-        log(colorize("cyan", "Optional manual spot-check (fresh raw-device read; not run automatically):")
-            + " " + colorize("yellow", manual_check))
+        log(colorize("cyan", "Verifying using:") + " " + colorize("yellow", f"a re-read of {self.config.output_path.name}, hashed and compared to the streamed raw disk hashes"))
 
         iso_hasher = hashlib.md5()
         iso_sha_hasher = hashlib.sha256()
@@ -1678,14 +1743,17 @@ class OpticalDiscBackup:
             print("\n" * 4, end="")
 
         with open(self.config.output_path, 'rb') as iso_file:
-            # Bypass the page cache so we hash what is on disk, not the
-            # copy of the data still sitting in memory from the write.
+            # Ask macOS not to cache this read, so it is not simply served
+            # from memory (data the write left cached may still be used)
             try:
                 fcntl.fcntl(iso_file.fileno(), fcntl.F_NOCACHE, 1)
+                cache_bypass = True
             except (OSError, AttributeError):
+                cache_bypass = False
                 warnings.append("F_NOCACHE unavailable; the verification read may have "
                                 "been served from the page cache rather than re-read from "
                                 "disk, weakening the independence of the verification pass")
+                log(colorize("yellow", f"Warning: {warnings[-1]}"))
             while True:
                 chunk = iso_file.read(4 * 1024 * 1024)  # 4MB chunks
                 if not chunk:
@@ -1707,9 +1775,11 @@ class OpticalDiscBackup:
         log(colorize("cyan", "SHA-256 (Raw Disk):") + " " + colorize("yellow", raw_sha))
 
         if iso_hash == raw_hash and iso_sha == raw_sha:
-            log(colorize("green", "Checksum match: ISO on disk is a true bit-for-bit copy."))
+            log(colorize("green", "Checksum match: the re-read ISO matches the stream read from the disc"
+                                  + ("." if cache_bypass and flush_method == "F_FULLFSYNC"
+                                     else " (see the warning above about how it was flushed or re-read).")))
         else:
-            log(colorize("red", "Checksum mismatch! ISO on disk does not match the source stream."))
+            log(colorize("red", "Checksum mismatch! The re-read ISO does not match the source stream."))
 
         return IsoCreationResult(
             creation_time=creation_time,
@@ -1720,6 +1790,8 @@ class OpticalDiscBackup:
             sha256_iso=iso_sha,
             output_path=self.config.output_path,
             warnings=warnings,
+            flush_method=flush_method,
+            cache_bypass=cache_bypass,
         )
     
     def _display_progress(self, title: str, current: int, total: int, start_time: float):
@@ -1753,7 +1825,7 @@ class OpticalDiscBackup:
         """Unmount disk safely"""
         log_divider("Unmounting Disk")
         log(colorize("cyan", f"Unmounting /dev/{self.config.disk_id}..."))
-        log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil unmountDisk /dev/{self.config.disk_id}"))
+        log(colorize("cyan", "Running command:") + " " + colorize("yellow", shlex.join(["diskutil", "unmountDisk", f"/dev/{self.config.disk_id}"])))
         
         try:
             subprocess.run(["diskutil", "unmountDisk", f"/dev/{self.config.disk_id}"], 
@@ -1784,7 +1856,7 @@ class OpticalDiscBackup:
         else:
             # Eject directly — diskutil eject works on an unmounted disk, and
             # the goal of finalization is physical release of the disc.
-            log(colorize("cyan", "Running command:") + " " + colorize("yellow", f"diskutil eject /dev/{self.config.disk_id}"))
+            log(colorize("cyan", "Running command:") + " " + colorize("yellow", shlex.join(["diskutil", "eject", f"/dev/{self.config.disk_id}"])))
             try:
                 eject_proc = subprocess.run(["diskutil", "eject", f"/dev/{self.config.disk_id}"],
                                             capture_output=True, text=True)
@@ -1809,6 +1881,13 @@ class OpticalDiscBackup:
                 log(colorize("cyan", "Time to verify:") + " " + colorize("yellow", f"{result.verification_time:.2f} seconds") +
                     f" ({format_duration(result.verification_time)})")
             log(colorize("cyan", "Average creation speed:") + " " + colorize("yellow", f"{speed:.2f} MB/s ({multiplier})"))
+            # Named where the run left its ISO (published, or kept under a
+            # failed-* name); nothing is shown when no ISO is there
+            if result.creation_path and regular_file_size(result.iso_path)[0] is not None:
+                log(colorize("cyan", f"Optional manual spot-check (not run by makeiso.py; it re-reads "
+                                     f"the whole disc, which must be back in the drive as "
+                                     f"{self.config.disk_id} - check with diskutil list):"))
+                log(colorize("yellow", spot_check_command(str(result.iso_path), self.config.disk_id)))
         else:
             log(colorize("cyan", "Dry run:") + " " + colorize("yellow", "No timing summary available."))
     
@@ -2054,20 +2133,21 @@ class OpticalDiscBackup:
             
             "operations_performed": {
                 "tree_listing": {
-                    "command": f"tree -RapugD --si --du {self.config.mount_point or '/Volumes/' + self.config.volume_name}",
+                    "command": shlex.join(tree_command(self.config)),
                     "output_file": record.files.tree.name,
                     "summary": tree_summary
                 },
                 "disk_unmount": {
-                    "command": f"diskutil unmountDisk /dev/{self.config.disk_id}",
+                    "command": shlex.join(["diskutil", "unmountDisk", f"/dev/{self.config.disk_id}"]),
                     "status": ("interrupted" if result.unmount_interrupted else
                                ("skipped" if self.config.dry_run else "not_attempted")
                                if result.unmount_ok is None else ("success" if result.unmount_ok else "failed"))
                 },
                 "iso_creation": {
-                    "command": (f"dd if=/dev/r{self.config.disk_id} of={result.creation_path or self.config.output_path} bs=4m"
+                    "command": (shlex.join(dd_command(self.config.disk_id))
                                 if self.config.dry_run or result.creation_path else None),
-                    "method": "streamed copy with in-stream source hash calculation",
+                    "method": ("streamed copy with in-stream source hash calculation: makeiso.py "
+                               "reads dd's output, writes the ISO from it and hashes it"),
                     "publish_method": (("run-private attempt ISO promoted to canonical filename after verification"
                                         if result.success else
                                         "run-private attempt ISO was published to the canonical filename, "
@@ -2081,15 +2161,19 @@ class OpticalDiscBackup:
                     "performed": bool(result.creation_path) and not self.config.dry_run
                 },
                 "verification": {
-                    "method": "md5 + sha-256 hash comparison (written ISO re-read from disk vs raw device stream)",
+                    "method": "md5 + sha-256 hash comparison (written ISO re-read vs raw device stream)",
                     "algorithms": ["MD5", "SHA-256"],
                     "performed": result.md5_iso is not None,
                     "note": "The script does not perform a second raw-device read during verification; it compares the source hash captured during the copy stream to a re-read of the written ISO.",
-                    "optional_manual_spot_check": (f'[ "$(md5 -q {record.files.iso.name})" = "$(dd if=/dev/r{self.config.disk_id} bs=4m 2>/dev/null | md5 -q)" ] '
-                                                   f'&& echo "MATCH" || echo "MISMATCH"')
+                    "optional_manual_spot_check": spot_check_command(f"./{record.files.iso.name}",
+                                                                     self.config.disk_id),
+                    "optional_manual_spot_check_note": ("Not run by makeiso.py. Run it in the folder "
+                                                        "that holds the ISO, with the disc back in the "
+                                                        "drive under the same disk identifier (check "
+                                                        "with diskutil list); it re-reads the whole disc.")
                 },
                 "finalization": {
-                    "eject_command": f"diskutil eject /dev/{self.config.disk_id}",
+                    "eject_command": shlex.join(["diskutil", "eject", f"/dev/{self.config.disk_id}"]),
                     "status": ("interrupted" if result.eject_interrupted else
                                "skipped" if self.config.dry_run or result.unmount_ok is not True
                                else ("completed" if result.finalized else "failed"))
@@ -2107,7 +2191,7 @@ class OpticalDiscBackup:
                 "verification": {
                     "duration_seconds": result.verification_time,
                     "duration_formatted": format_duration(result.verification_time),
-                    "note": "Written ISO re-read from disk and hashed after creation"
+                    "note": "Written ISO re-read and hashed after creation"
                 },
                 "total_operation": {
                     "duration_seconds": result.total_time,
@@ -2123,9 +2207,13 @@ class OpticalDiscBackup:
                 "sha256_iso_hash": result.sha256_iso,
                 "sha256_source_hash": result.sha256_raw,
                 "hashes_match": result.checksum_match,
-                "verification_method": "Source hashed in-stream during creation; written ISO re-read from disk (cache bypassed) and hashed",
+                "verification_method": f"Source hashed in-stream during creation; {reread_wording(result.cache_bypass)} and hashed",
+                # What was applied, as recorded by the copy: null when not recorded
+                "flush_before_verification": result.flush_method,
+                "verification_read_cache_bypass": result.cache_bypass,
+                "flush_note": flush_wording(result.flush_method),
                 "integrity_status": "verified" if result.checksum_match else ("failed" if result.checksum_match is False else "not_performed"),
-                "notes": "ISO verified as bit-perfect copy" if result.checksum_match else None
+                "notes": "Re-read ISO matches the source stream (MD5 and SHA-256)" if result.checksum_match else None
             },
             
             "structural_analysis": {
@@ -2302,7 +2390,7 @@ class OpticalDiscBackup:
             # Simplify the command to just call isolyzer with the file path
             # since isolyzer outputs XML by default
             cmd = ["isolyzer", str(iso_path)]
-            log(colorize("cyan", "Running command:") + " " + colorize("yellow", " ".join(cmd)))
+            log(colorize("cyan", "Running command:") + " " + colorize("yellow", shlex.join(cmd)))
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             
             # Save raw XML output to file if successful

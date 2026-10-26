@@ -16,7 +16,14 @@ too when present.
 It never changes an existing file. --csv creates one NEW report file: the
 path is reserved before anything is hashed, and an existing path (file,
 directory, symlink, /dev/stdout) or a name ending in .iso or _manifest.json
-is refused. No sudo needed.
+is refused. The reservation is never read as a manifest or hashed as a
+master: a manifest naming the report as its ISO, directly or through a
+symlink, is an ERROR and the report is then not kept; so is one for which
+that could not be checked (an inspection error other than "no such file"
+on the manifest or its ISO name). The report is announced only while its
+path still names the file this run wrote; these checks guard one
+operator's run, and a change to the path after the last check is not
+detected. No sudo needed.
 
 Usage:
   python3 verifyiso.py /path/to/collection [more/paths ...]
@@ -97,6 +104,9 @@ class CheckResult:
     detail: Optional[str] = None
     seconds: float = 0.0
     failed_algorithms: List[str] = field(default_factory=list)
+    # The manifest or its ISO name is this run's --csv report ("proven"), or
+    # could not be shown to be separate from it ("uncertain")
+    report_alias: Optional[str] = None
 
 
 # Top-level keys only makeiso.py preservation manifests carry (any one marks
@@ -350,9 +360,43 @@ def hash_file(path: Path, progress_label: str = "") -> tuple:
     return md5.hexdigest(), sha256.hexdigest()
 
 
-def check_manifest(manifest_path: Path) -> CheckResult:
-    """Verify one ISO against its manifest"""
+def _report_alias(path: Path, report: Optional[Tuple[Path, Tuple[int, int]]]
+                  ) -> Tuple[Optional[str], Optional[str]]:
+    """Whether path is the --csv report this run reserved. ("proven", None):
+    the same path, or the same file reached through a symlink or another
+    spelling. ("uncertain", reason): what path leads to could not be
+    inspected, so it is not shown to be separate. (None, None): shown to be
+    another file, or nothing is there (no such file, or a path component is
+    a file), so it cannot be the report."""
+    if report is None:
+        return None, None
+    report_path, identity = report
+    if os.path.abspath(path) == os.path.abspath(report_path):
+        return "proven", None
+    st, error = _target(path)
+    if error is not None:
+        if error.errno in TARGET_MISSING:
+            return None, None
+        return "uncertain", _reason(error)
+    if (st.st_dev, st.st_ino) == identity:
+        return "proven", None
+    return None, None
+
+
+def check_manifest(manifest_path: Path,
+                   report: Optional[Tuple[Path, Tuple[int, int]]] = None) -> CheckResult:
+    """Verify one ISO against its manifest. report is the --csv report this
+    run reserved, (path, identity): it is never read as a manifest or hashed
+    as a master (an empty reservation could match a record of an empty file)"""
     result = CheckResult(manifest=manifest_path, status="ERROR")
+    alias, reason = _report_alias(manifest_path, report)
+    if alias:
+        result.report_alias = alias
+        result.detail = ("this is the --csv report this run is writing, not a manifest; not read"
+                         if alias == "proven" else
+                         f"could not check whether this is the --csv report this run is "
+                         f"writing ({reason}); not read")
+        return result
     try:
         raw = manifest_path.read_bytes()
     except OSError as e:
@@ -437,6 +481,14 @@ def check_manifest(manifest_path: Path) -> CheckResult:
     if iso_name != Path(iso_name).name or os.path.isabs(iso_name) or iso_name == "..":
         return unverifiable(f"manifest ISO filename is not a plain sibling name: {iso_name!r}")
     result.iso = manifest_path.parent / iso_name
+    alias, reason = _report_alias(result.iso, report)
+    if alias:
+        result.report_alias = alias
+        result.detail = (f"the ISO name {iso_name} is the --csv report this run is writing, "
+                         f"not a master; not checked" if alias == "proven" else
+                         f"could not check whether the ISO name {iso_name} is the --csv report "
+                         f"this run is writing ({reason}); not checked")
+        return result
 
     if dry_run:
         # A dry run makes no master, so its record is a legitimate skip — but
@@ -533,20 +585,37 @@ def reserve_report(path: Path) -> Tuple[int, Tuple[int, int]]:
         raise ReportError(f"cannot create --csv report {path}: {e.strerror or e}") from None
     try:
         st = os.fstat(fd)
+    except OSError as e:
+        # Without the new file's identity nothing shows that the path still
+        # names it, so the path is left alone, never unlinked
+        os.close(fd)
+        raise ReportError(f"cannot confirm that --csv {path} is the file this run created "
+                          f"({e.strerror or e}); nothing was written, and whatever is at "
+                          f"that path was left in place (remove it yourself only if it is "
+                          f"an empty leftover)") from None
     except BaseException:
         os.close(fd)
-        os.unlink(path)
         raise
     return fd, (st.st_dev, st.st_ino)
 
 
-def _report_still_ours(path: Path, identity: Tuple[int, int]) -> bool:
-    """True while the report path still names the file this run created"""
+def _report_lost(path: Path, identity: Tuple[int, int]) -> Optional[str]:
+    """None while the report path still names the file this run created;
+    otherwise how that is known not to hold, or why it could not be checked"""
     try:
         st = os.lstat(path)
-    except OSError:
-        return False
-    return (st.st_dev, st.st_ino) == identity
+    except FileNotFoundError:
+        return "was removed"
+    except OSError as e:
+        return f"could not be checked ({_reason(e)})"
+    if (st.st_dev, st.st_ino) != identity:
+        return "was replaced by another file"
+    return None
+
+
+def _report_still_ours(path: Path, identity: Tuple[int, int]) -> bool:
+    """True while the report path still names the file this run created"""
+    return _report_lost(path, identity) is None
 
 
 def write_csv(results: List[CheckResult], out, discovery: Optional[List[DiscoveryIssue]] = None):
@@ -591,7 +660,9 @@ def main():
     parser.add_argument("--csv", type=Path, metavar="PATH",
                         help="Write a CSV report of every check, and of every part of the search "
                              "that failed, to a NEW file; refused before anything is hashed if PATH "
-                             "already exists or is named like an .iso or _manifest.json file")
+                             "already exists or is named like an .iso or _manifest.json file, "
+                             "and not kept if a manifest names it as its ISO (or that cannot "
+                             "be ruled out)")
     args = parser.parse_args()
 
     roots = [p.expanduser() for p in args.paths]
@@ -613,6 +684,7 @@ def main():
         except ReportError as e:
             print(colorize("red", str(e)))
             sys.exit(1)
+    report = (report_path, report_identity) if report_path else None
 
     try:
         issues: List[DiscoveryIssue] = []
@@ -645,9 +717,18 @@ def main():
             # becomes an ERROR for this manifest and the next one is checked
             if manifest_path in never_open:
                 r = CheckResult(manifest=manifest_path, status="ERROR", detail=never_open[manifest_path])
+                # Still never opened, but checked (metadata only) against the
+                # report: a link to it, or one still not shown to be separate,
+                # keeps the report from being kept
+                r.report_alias, reason = _report_alias(manifest_path, report)
+                if r.report_alias == "proven":
+                    r.detail += "; it is the --csv report this run is writing"
+                elif r.report_alias == "uncertain":
+                    r.detail += (f"; could not check whether it is the --csv report this run "
+                                 f"is writing ({reason})")
             else:
                 try:
-                    r = check_manifest(manifest_path)
+                    r = check_manifest(manifest_path, report)
                 except Exception as e:
                     r = CheckResult(manifest=manifest_path, status="ERROR",
                                     detail=f"could not check this manifest: {type(e).__name__}: {e}")
@@ -686,17 +767,47 @@ def main():
                 print(colorize("red", f"  {_shown(issue.path)}: {issue.status} — {issue.detail}"))
 
         if report_path:
+            aliased = [r for r in results if r.report_alias == "proven"]
+            uncertain = [r for r in results if r.report_alias == "uncertain"]
+            if aliased or uncertain:
+                # Kept, the report could sit where a manifest expects its master
+                # (or itself): a proven alias, or one that could not be ruled out
+                reasons = []
+                if aliased:
+                    reasons.append(f"{len(aliased)} manifest(s) name it as their ISO or as "
+                                   f"themselves (first: {aliased[0].manifest})")
+                if uncertain:
+                    reasons.append(f"for {len(uncertain)} manifest(s) it could not be checked "
+                                   f"whether they or their ISO are the report (first: "
+                                   f"{uncertain[0].manifest})")
+                print(colorize("red", f"\nNot keeping CSV report {report_path}: "
+                                      + "; ".join(reasons) + "; choose a --csv path that no "
+                                      "manifest names, and resolve any inspection error above"))
+                sys.exit(1)
             # Write only into the file this run reserved; if something else
             # has taken its place, leave that alone and report the failure
-            if not _report_still_ours(report_path, report_identity):
-                print(colorize("red", f"\nCould not write CSV report: {report_path} was replaced "
-                                      f"by another file during the run (left untouched)"))
+            lost = _report_lost(report_path, report_identity)
+            if lost:
+                print(colorize("red", f"\nCould not write CSV report: {report_path} {lost} "
+                                      f"during the run; nothing was written to it and nothing "
+                                      f"there was removed"))
                 sys.exit(1)
             try:
                 # The descriptor stays ours (closefd=False) until the report is
                 # complete, so cleanup can still prove which file is ours
                 with os.fdopen(report_fd, "w", encoding="utf-8", newline="", closefd=False) as out:
                     write_csv(results, out, incomplete)
+                # Checked again before the descriptor is closed (so the file's
+                # identity cannot be reused): a report the path no longer names
+                # is never announced. A change after this check is not detected:
+                # it guards one operator's run, not a hostile concurrent writer.
+                lost = _report_lost(report_path, report_identity)
+                if lost:
+                    print(colorize("red", f"\nCould not save CSV report: {report_path} {lost} "
+                                          f"while the report was being written; nothing there "
+                                          f"was removed, and it cannot be shown to hold this "
+                                          f"run's report"))
+                    sys.exit(1)
                 fd, report_fd = report_fd, None
                 os.close(fd)
             except Exception as e:

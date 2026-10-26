@@ -2514,10 +2514,114 @@ class BuildReviewRegressions(Scenario):
                                      operator="T071", dry_run=True)
         result = mv.ISOToMP4Converter(config).convert()
         self.assertTrue(result.skipped)
-        manifest = json.loads((disc.out / f"{STEM}_skip_manifest.json").read_text())
+        manifest, _ = self.tokened_manifest(disc, "dryrun")
         record = manifest["titlesets"]["outputs"][0]
         self.assertEqual((record["status"], record["mapped_video_streams"],
                           record["mapped_audio_streams"]), ("planned", None, None))
+
+
+class SkipRecordTests(Scenario):
+    """T-135: a skip or dry run keeps its log and manifest under its own
+    token, created new and naming each other; it never writes over an
+    earlier conversion's records or an earlier skip's, and a later success
+    names skip records left under the old fixed names as earlier ones.
+    Control: a plain success names none"""
+
+    TOKEN = "20261024T120000-abcdef"
+
+    def seed(self, disc, names):
+        disc.out.mkdir(parents=True, exist_ok=True)
+        seeded = {}
+        for name in names:
+            path = disc.out / name
+            path.write_bytes(b"EARLIER RECORD " + name.encode())
+            seeded[path] = path.read_bytes()
+        return seeded
+
+    def legacy(self, disc):
+        """Skip and dry-run records under the old fixed names"""
+        return self.seed(disc, [f"{disc.stem}_skip_manifest.json", f"{disc.stem}.mp4.dryrun.log.txt"])
+
+    def dry_run(self, disc):
+        config = mv.ConversionConfig(iso_path=disc.iso, output_dir=disc.out,
+                                     operator="T071", dry_run=True)
+        return mv.ISOToMP4Converter(config).convert()
+
+    def assert_own_records(self, disc, kind, status):
+        manifest, log_text = self.tokened_manifest(disc, kind)
+        (log_path,), (manifest_path,) = self.records(disc, kind)
+        self.assertEqual(manifest["conversion_status"]["overall_status"], status)
+        self.assertEqual((manifest["output_files"]["log_file"], manifest["output_files"]["manifest_file"]),
+                         (str(log_path), str(manifest_path)))
+        self.assertIn(f"Manifest:         {manifest_path.name} (this attempt only", log_text)
+        return manifest, log_text
+
+    def test_a_skip_never_writes_over_an_earlier_conversions_records(self):
+        disc = self.make_disc({})  # VIDEO_TS with no VOBs: skipped
+        seeded = self.seed_canonical(disc)
+        self.answers.clear()  # a skip asks nothing
+        result = self.convert(disc)
+        self.assertTrue(result.success and result.skipped, result.error_message)
+        self.assert_unchanged(seeded)
+        self.assert_own_records(disc, "skipped", "skipped")
+        self.assertEqual(self.glob(disc, "*_skip_manifest.json") + self.glob(disc, "*dryrun*"), [])
+
+    def test_a_dry_run_never_writes_over_earlier_records(self):
+        disc = self.make_disc({1: [4]})
+        seeded = {**self.seed_canonical(disc), **self.legacy(disc)}
+        result = self.dry_run(disc)
+        self.assertTrue(result.success and result.skipped, result.error_message)
+        self.assert_unchanged(seeded)
+        self.assert_own_records(disc, "dryrun", "dry_run")
+
+    def test_repeated_skips_and_dry_runs_keep_every_record(self):
+        disc = self.make_disc({})
+        for run in (self.convert, self.convert, self.dry_run):
+            kept = {p: p.read_bytes() for p in self.glob(disc, "*")}
+            result = run(disc)
+            self.assertTrue(result.success and result.skipped, result.error_message)
+            self.assert_unchanged(kept)
+        self.assertEqual([len(found) for found in self.records(disc, "skipped")], [2, 2])
+        self.assertEqual([len(found) for found in self.records(disc, "dryrun")], [1, 1])
+
+    def test_a_taken_record_name_is_never_written_over(self):
+        for taken in ("_manifest.json", ".log.txt"):
+            with self.subTest(taken):
+                disc = self.make_disc({}, stem=f"JPC_AV_0000{2 if taken == '.log.txt' else 3}")
+                path = disc.out / f"{disc.stem}_skipped-{self.TOKEN}{taken}"
+                seeded = self.seed(disc, [path.name])
+                with mock.patch.object(mv.ISOToMP4Converter, "_run_token",
+                                       lambda obj, kind="failed": f"{kind}-{self.TOKEN}"):
+                    result = self.convert(disc)
+                self.assert_unchanged(seeded)
+                self.assertFalse(result.success or result.skipped)
+                self.assertIn("Run records could not be written", result.error_message)
+
+    def test_a_later_success_names_earlier_skip_records(self):
+        disc = self.make_disc({1: [4]})
+        legacy = self.legacy(disc)
+        self.vob_durations(1, 600.0)
+        self.output(disc, 1, 600.0)
+        result = self.convert(disc)
+        self.assertTrue(result.success and not result.skipped, result.error_message)
+        self.assert_unchanged(legacy)
+        manifest = json.loads((disc.out / f"{disc.stem}_access_manifest.json").read_text())
+        self.assertEqual(manifest["output_files"]["earlier_skip_records"], [str(p) for p in legacy])
+        self.assertEqual(manifest["conversion_status"]["overall_status"], "success")
+        log_text = (disc.out / f"{disc.stem}.mp4.log.txt").read_text()
+        for path in legacy:
+            self.assertIn(f"Earlier record:   {path} (from an earlier skipped or dry run; "
+                          f"it does not describe this conversion)", log_text)
+
+    def test_control_a_plain_success_names_no_earlier_records(self):
+        disc = self.make_disc({1: [4]})
+        self.vob_durations(1, 600.0)
+        self.output(disc, 1, 600.0)
+        result = self.convert(disc)
+        self.assertTrue(result.success and not result.skipped, result.error_message)
+        manifest = json.loads((disc.out / f"{disc.stem}_access_manifest.json").read_text())
+        self.assertEqual(manifest["output_files"].get("earlier_skip_records", []), [])
+        self.assertNotIn("Earlier record:", (disc.out / f"{disc.stem}.mp4.log.txt").read_text())
 
 
 class SourceMountTests(unittest.TestCase):

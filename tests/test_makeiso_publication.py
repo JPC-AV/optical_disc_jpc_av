@@ -33,6 +33,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -66,16 +67,19 @@ def hashes(data: bytes):
 @contextlib.contextmanager
 def synthetic_drive(payload: bytes, mismatch=False, finalize=None, tree=None, unmount=None,
                     create_fails=False, real_tree=False, confirm=None, sudo_user=None,
-                    native_disk=False, copy=None):
+                    native_disk=False, copy=None, real_copy=False,
+                    mount_point="/Volumes/SYNTHETIC"):
     """Replace makeiso's native boundaries with synthetic ones. real_tree keeps
     makeiso's own tree-listing method (the caller then fakes subprocess.run
     for the tree command); confirm replaces the overwrite prompt; sudo_user
     sets SUDO_USER inside the drive; native_disk keeps makeiso's own unmount
     and eject (the caller fakes subprocess.run for diskutil); copy(self) runs
-    as the copy starts."""
+    as the copy starts; real_copy keeps makeiso's own copy and verification
+    (the caller then fakes subprocess.Popen for dd, see FakeDd); mount_point
+    is the volume's reported mount point."""
     def disk_info(self):
         return {"TotalSize": len(payload), "OpticalMediaType": "DVD-ROM",
-                "MountPoint": "/Volumes/SYNTHETIC"}
+                "MountPoint": mount_point}
 
     def tree_listing(self):
         if tree:
@@ -111,6 +115,8 @@ def synthetic_drive(payload: bytes, mismatch=False, finalize=None, tree=None, un
             if attr == "_generate_tree_listing" and real_tree:
                 continue
             if attr in ("_unmount_disk", "_finalize_disk") and native_disk:
+                continue
+            if attr == "_create_and_verify_iso" and real_copy:
                 continue
             stack.enter_context(mock.patch.object(imaging.OpticalDiscBackup, attr, value))
         stack.enter_context(mock.patch.object(imaging.os, "geteuid", lambda: 0))
@@ -1820,6 +1826,322 @@ class InterruptTests(Base):
         self.assertNotIn("Skipped (dry run)", log_text)
         self.assertNotIn("eject error", log_text)
         self.assertIn("Status:  Not started", log_text)
+
+
+# --- the verified ISO at publication (T-136) ----------------------------------
+
+class VerifiedIsoTests(Base):
+    """Publication requires the verified ISO. Missing, or not inspectable,
+    before the prior bundle is archived: nothing is archived or published.
+    Gone after archiving: the rollback restores the prior bundle. Either
+    way the run fails, its records say the ISO is not there (or could not be
+    checked), and the prior master still verifies"""
+
+    subfolder = ReceiptTests.subfolder
+
+    def run_hooked(self, folder, method, before=None, after=None):
+        """makeiso's main() with before(obj)/after(obj) around method"""
+        real = getattr(imaging.OpticalDiscBackup, method)
+        fired = []
+
+        def hooked(obj, *args, **kwargs):
+            if before:
+                before(obj)
+                fired.append("before")
+            value = real(obj, *args, **kwargs)
+            if after:
+                after(obj)
+                fired.append("after")
+            return value
+
+        tools, lines = FakeTools(), []
+        with mock.patch.object(imaging.OpticalDiscBackup, method, hooked), \
+                mock.patch.object(imaging.subprocess, "run", tools.run), \
+                mock.patch.object(imaging, "log", lines.append):
+            code = run_main(folder, NEW)
+        self.assertTrue(fired, f"the fault around {method} never fired")
+        return code, [str(line) for line in lines]
+
+    def assert_not_published(self, folder, old, code, lines, reason):
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(canonical(folder), old, "the prior bundle changed")
+        self.assertEqual(archives(folder), [], "an archive folder was left")
+        for pattern in ("*_attempt-*_manifest.json", "*_failed-*_manifest.json"):
+            self.assertEqual(manifests_claiming_success(folder, pattern), [])
+        record = json.loads(one(folder, f"{NAME}_failed-*_manifest.json").read_text())
+        status = record["backup_status"]
+        self.assertEqual(status["overall_status"], "failed")
+        self.assertIn(reason, status["errors"])
+        self.assertFalse(any("Published verified artifact" in line for line in lines), lines)
+        self.assertFalse(any("spot-check" in line for line in lines), "a spot-check names no ISO")
+        code, output = verify_cli(folder)
+        self.assertEqual(code, 0, output)  # the prior master passes, the failed record is skipped
+        self.assertIn("  PASS: 1\n", output)
+        self.assertNotIn("MISSING_ISO", output)
+        return record
+
+    def test_a_missing_verified_iso_fails_before_anything_is_archived(self):
+        folder = self.subfolder("missing")
+        old = canonical(folder)
+        code, lines = self.run_hooked(folder, "_promote_successful_attempt",
+                                      before=lambda obj: obj.config.output_path.unlink())
+        record = self.assert_not_published(folder, old, code, lines, "is missing")
+        files = record["output_files"]
+        self.assertIs(record["backup_status"]["iso_created"], False)
+        self.assertIsNone(files["iso_file_size_bytes"])
+        self.assertFalse(os.path.lexists(folder / files["iso_filename"]))
+
+    def test_an_uninspectable_verified_iso_fails_before_anything_is_archived(self):
+        # Path.exists raises EIO on 3.9-3.13 and returns False on 3.14: the
+        # outcome must be the same failure either way
+        folder = self.subfolder("unreadable")
+        old = canonical(folder)
+        armed = set()
+        with unreadable(armed):
+            code, lines = self.run_hooked(folder, "_promote_successful_attempt",
+                                          before=lambda obj: armed.add(Path(obj.config.output_path)))
+        record = self.assert_not_published(folder, old, code, lines, "Input/output error")
+        files = record["output_files"]
+        self.assertIsNone(record["backup_status"]["iso_created"])
+        iso = folder / files["iso_filename"]
+        self.assertIn("_attempt-", iso.name)  # it could not be checked, so it was not renamed
+        self.assertEqual(iso.read_bytes(), NEW)
+
+    def test_an_iso_gone_after_archiving_restores_the_prior_bundle(self):
+        folder = self.subfolder("late")
+        old = canonical(folder)
+        code, lines = self.run_hooked(folder, "_archive_existing_artifacts",
+                                      after=lambda obj: obj.config.output_path.unlink())
+        self.assertTrue(any("Existing artifact archived to" in line for line in lines), lines)
+        self.assertTrue(any("Restored prior artifact" in line for line in lines), lines)
+        record = self.assert_not_published(folder, old, code, lines, "is missing")
+        self.assertIs(record["backup_status"]["iso_created"], False)
+        self.assertEqual(record["backup_status"]["warnings"], [], "the rollback reported a problem")
+
+    def test_control_a_verified_iso_present_at_publication_is_published(self):
+        folder = self.subfolder("healthy")
+        tools = FakeTools()
+        with mock.patch.object(imaging.subprocess, "run", tools.run):
+            self.assertEqual(run_main(folder, NEW), 0)
+        self.assertEqual(canonical(folder)[ISO], NEW)
+        self.assertEqual((one(folder, f"{NAME}_overwritten-*") / ISO).read_bytes(), OLD)
+        self.assertEqual(verify_cli(folder)[0], 0)
+
+
+# --- operator commands and verification wording (T-140, T-141) ----------------
+
+HOSTILE = "disc a'b\"c $HOME `id`; touch x"     # the filename check lets all of this through
+HOSTILE_MOUNT = "/Volumes/VOL $(id) `id`; 'q\" x"
+HOSTILE_DIR = "out $(x) `y`; z 'q\""
+
+
+def shell_words(command: str) -> list:
+    """The words and operators a POSIX shell would read in command, found by
+    parsing it only (shlex; nothing is executed)"""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
+def spot_check_words(iso: str) -> list:
+    """The words of makeiso's optional spot-check for the ISO at iso"""
+    return ["iso=$", "(", "md5", "-q", iso, ");",
+            "disc=$", "(", "dd", "if=/dev/rdisk9", "bs=4m", "2", ">", "/dev/null", "|", "md5", "-q", ");",
+            "[", "$iso", "=", "$disc", "]", "&&", "echo", "MATCH", "||", "echo", "MISMATCH"]
+
+
+def spot_check_line(lines) -> str:
+    """The spot-check command shown with the summary"""
+    labels = [i for i, line in enumerate(lines) if line.startswith("Optional manual spot-check")]
+    assert len(labels) == 1, lines
+    return lines[labels[0] + 1]
+
+
+class FakeDd:
+    """subprocess.Popen for makeiso's own copy: records each argv and streams
+    payload as dd's output; nothing is executed"""
+
+    def __init__(self, payload: bytes):
+        self.payload, self.argv = payload, []
+
+    def __call__(self, argv, stdout=None, stderr=None):
+        self.argv.append([str(a) for a in argv])
+        return self.Process(self.payload)
+
+    class Process:
+        def __init__(self, payload):
+            self.stdout, self.returncode = io.BytesIO(payload), None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def communicate(self):
+            self.returncode = 0
+            return b"", b"0+1 records in\n0+1 records out\n"
+
+
+@contextlib.contextmanager
+def fcntl_controls(unavailable=()):
+    """fcntl.fcntl with F_FULLFSYNC and/or F_NOCACHE failing as unsupported;
+    every other call, and a control that is available, reaches the real
+    fcntl. Yields the controls makeiso requested, in order."""
+    real, requested = imaging.fcntl.fcntl, []
+
+    def call(fd, cmd, *args):
+        for name in ("F_FULLFSYNC", "F_NOCACHE"):
+            if cmd == getattr(imaging.fcntl, name):
+                requested.append(name)
+                if name in unavailable:
+                    raise OSError(errno.ENOTSUP, f"synthetic: {name} is not supported here")
+        return real(fd, cmd, *args)
+
+    with mock.patch.object(imaging.fcntl, "fcntl", call):
+        yield requested
+
+
+def image(folder: Path, name=NAME, mount_point="/Volumes/SYNTHETIC", unavailable=(),
+          real_copy=True, **drive):
+    """One run with makeiso's own tree listing and (unless real_copy is
+    False) its own copy and verification: tree, dd and the fcntl controls
+    are faked. Returns (result, tree argv list, dd argv list, console lines,
+    fcntl controls requested)"""
+    tools, dd, lines = FakeTools(), FakeDd(NEW), []
+    cfg = imaging.BackupConfig("disk9", "SYNTHETIC", name, "review", folder)
+    with synthetic_drive(NEW, real_tree=True, real_copy=real_copy, mount_point=mount_point, **drive), \
+            mock.patch.object(imaging.subprocess, "run", tools.run), \
+            mock.patch.object(imaging.subprocess, "Popen", dd), \
+            mock.patch.object(imaging, "ANSI_ENABLED", False), \
+            mock.patch.object(imaging, "log", lines.append), \
+            fcntl_controls(unavailable) as requested:
+        result = imaging.OpticalDiscBackup(cfg).create_backup()
+    return result, tools.trees, dd.argv, [str(line) for line in lines], requested
+
+
+class CommandTests(Base):
+    """T-141: every command shown or recorded parses back (shlex, never a
+    shell) to the argv that ran, whatever the names hold; the dd record
+    says what dd itself did; the spot-check names the ISO where the run
+    left it. Control: plain names keep their plain commands"""
+
+    def test_hostile_names_stay_one_argument_in_every_command(self):
+        folder = self.dir / HOSTILE_DIR
+        result, trees, dds, lines, _ = image(folder, HOSTILE, HOSTILE_MOUNT)
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(len(trees), 1)
+        self.assertEqual(len(dds), 1)
+        self.assertEqual(trees[0][-1], HOSTILE_MOUNT)
+        record = json.loads((folder / f"{HOSTILE}_manifest.json").read_text())
+        log_text = (folder / f"{HOSTILE}.iso.log.txt").read_text()
+        steps = record["operations_performed"]
+        for label, shown, argv in (
+                ("tree", steps["tree_listing"]["command"], trees[0]),
+                ("dd", steps["iso_creation"]["command"], dds[0]),
+                ("unmount", steps["disk_unmount"]["command"], ["diskutil", "unmountDisk", "/dev/disk9"]),
+                ("eject", steps["finalization"]["eject_command"], ["diskutil", "eject", "/dev/disk9"])):
+            with self.subTest(label):
+                self.assertEqual(shell_words(shown), argv)
+                self.assertTrue(f"  Command: {shown}\n" in log_text or f"  Eject:   {shown}\n" in log_text,
+                                f"the log records another {label} command")
+        for argv in (trees[0], dds[0]):
+            shown = [line for line in lines if line.startswith(f"Running command: {argv[0]} ")]
+            self.assertEqual(len(shown), 1, lines)
+            self.assertEqual(shell_words(shown[0][len("Running command: "):]), argv)
+        # dd only reads the disc: makeiso.py wrote the ISO, at its attempt name
+        self.assertNotIn("of=", steps["iso_creation"]["command"])
+        self.assertIn(f"  Output:  {result.creation_path} (written by makeiso.py", log_text)
+        self.assertIn(f"dd's output is written to {result.creation_path} and hashed by makeiso.py", lines)
+        self.assertIn("_attempt-", result.creation_path.name)
+        # The spot-check names the published ISO; the record's names it in its folder
+        self.assertEqual(shell_words(spot_check_line(lines)), spot_check_words(str(folder / f"{HOSTILE}.iso")))
+        self.assertEqual(shell_words(steps["verification"]["optional_manual_spot_check"]),
+                         spot_check_words(f"./{HOSTILE}.iso"))
+        self.assertIn("Not run by makeiso.py", steps["verification"]["optional_manual_spot_check_note"])
+
+    def test_the_spot_check_names_a_failed_runs_kept_iso(self):
+        folder = self.dir / HOSTILE_DIR
+        result, _, _, lines, _ = image(folder, HOSTILE, real_copy=False, mismatch=True)
+        self.assertFalse(result.success)
+        kept = one(folder, "*_failed-*.iso.mismatch")
+        self.assertEqual(result.iso_path, kept)
+        self.assertEqual(shell_words(spot_check_line(lines)), spot_check_words(str(kept)))
+        record = json.loads(one(folder, "*_failed-*_manifest.json").read_text())
+        self.assertEqual(shell_words(record["operations_performed"]["verification"]["optional_manual_spot_check"]),
+                         spot_check_words(f"./{kept.name}"))
+
+    def test_control_plain_names_keep_their_plain_commands(self):
+        folder = self.dir / "plain"
+        result, trees, _, _, _ = image(folder)
+        self.assertTrue(result.success, result.error_message)
+        steps = json.loads((folder / f"{NAME}_manifest.json").read_text())["operations_performed"]
+        self.assertEqual(trees, [["tree", "-RapugD", "--si", "--du", "/Volumes/SYNTHETIC"]])
+        self.assertEqual((steps["tree_listing"]["command"], steps["disk_unmount"]["command"],
+                          steps["finalization"]["eject_command"]),
+                         ("tree -RapugD --si --du /Volumes/SYNTHETIC",
+                          "diskutil unmountDisk /dev/disk9", "diskutil eject /dev/disk9"))
+
+
+class VerificationWordingTests(Base):
+    """T-140: the console, log and manifest say which flush and re-read were
+    actually applied; a fallback keeps its warning and success_with_warnings.
+    makeiso's own copy and verification run, with dd and fcntl faked"""
+
+    FALLBACK_WARNINGS = {"F_FULLFSYNC": "F_FULLFSYNC unavailable; fell back to fsync",
+                         "F_NOCACHE": "F_NOCACHE unavailable; the verification read may have"}
+
+    def run_copy(self, unavailable=()):
+        folder = self.dir / ("-".join(unavailable) or "healthy")
+        result, _, _, lines, requested = image(folder, unavailable=unavailable)
+        self.assertEqual(requested, ["F_FULLFSYNC", "F_NOCACHE"], "a control was never requested")
+        record = json.loads((folder / f"{NAME}_manifest.json").read_text())
+        return result, record, (folder / LOGNAME).read_text(), lines, folder
+
+    def test_control_a_healthy_copy_verifies_without_warnings(self):
+        result, record, _, _, folder = self.run_copy()
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(record["backup_status"]["overall_status"], "success")
+        self.assertEqual(record["backup_status"]["warnings"], [])
+        self.assertIs(record["integrity_verification"]["hashes_match"], True)
+        self.assertEqual((folder / ISO).read_bytes(), NEW)
+
+    def test_control_fallbacks_keep_their_warnings_and_outcome(self):
+        for control, warning in self.FALLBACK_WARNINGS.items():
+            with self.subTest(control):
+                result, record, _, _, folder = self.run_copy((control,))
+                self.assertTrue(result.success, result.error_message)
+                status = record["backup_status"]
+                self.assertEqual(status["overall_status"], "success_with_warnings")
+                self.assertEqual(len([w for w in status["warnings"] if w.startswith(warning)]), 1,
+                                 status["warnings"])
+                self.assertEqual((folder / ISO).read_bytes(), NEW)
+
+    def test_records_say_which_controls_were_applied(self):
+        cases = {(): ("F_FULLFSYNC", True), ("F_FULLFSYNC",): ("fsync", True),
+                 ("F_NOCACHE",): ("F_FULLFSYNC", False)}
+        for unavailable, (flush, bypass) in cases.items():
+            with self.subTest(unavailable=unavailable):
+                result, record, log_text, lines, _ = self.run_copy(unavailable)
+                integrity = record["integrity_verification"]
+                self.assertEqual((integrity["flush_before_verification"],
+                                  integrity["verification_read_cache_bypass"]), (flush, bypass))
+                reread = "re-read with F_NOCACHE set" if bypass else "re-read without F_NOCACHE"
+                self.assertIn(reread, integrity["verification_method"])
+                self.assertIn(f"Method:         written ISO {reread}", log_text)
+                self.assertIn("Flush:          " + ("F_FULLFSYNC (asks" if flush == "F_FULLFSYNC"
+                                                    else "fsync only (F_FULLFSYNC unavailable"), log_text)
+                self.assertEqual(integrity["flush_note"].split(" ")[0], flush)
+                shown = [line for line in lines if line.startswith("Warning: ")]
+                for control, warning in self.FALLBACK_WARNINGS.items():
+                    self.assertEqual(sum(warning in line for line in shown),
+                                     1 if control in unavailable else 0, shown)
+                match = [line for line in lines if line.startswith("Checksum match:")]
+                self.assertEqual(len(match), 1, lines)
+                self.assertEqual(match[0].endswith("the stream read from the disc."), not unavailable)
+                for text in (json.dumps(record), log_text, "\n".join(lines)):
+                    for claim in ("cache bypassed", "bit-for-bit", "bit-perfect", "physical"):
+                        self.assertNotIn(claim, text)
 
 
 if __name__ == "__main__":

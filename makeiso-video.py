@@ -57,16 +57,19 @@ class ConversionConfig:
         return self.output_dir / f"{self.iso_name}.mp4.log.txt"
     
     @property
-    def dry_run_log_path(self) -> Path:
-        return self.output_dir / f"{self.iso_name}.mp4.dryrun.log.txt"
-    
-    @property
     def manifest_path(self) -> Path:
         return self.output_dir / f"{self.iso_name}_access_manifest.json"
 
+    # Fixed names that earlier versions gave every skip and dry-run record,
+    # each run writing over the last. Never written now: a success record
+    # names any it finds, so they are not taken for its outcome
     @property
-    def skip_manifest_path(self) -> Path:
+    def legacy_skip_manifest_path(self) -> Path:
         return self.output_dir / f"{self.iso_name}_skip_manifest.json"
+
+    @property
+    def legacy_dry_run_log_path(self) -> Path:
+        return self.output_dir / f"{self.iso_name}.mp4.dryrun.log.txt"
 
 @dataclass
 class DiscContentAnalysis:
@@ -1047,9 +1050,10 @@ class ISOToMP4Converter:
 
     def _run_token(self, kind: str = "failed") -> str:
         """One timestamp-and-random suffix per run names every non-canonical
-        artifact — partials, review copies, failure/unverified records — with
-        a kind prefix (failed | unverified | aborted), so one attempt's
-        evidence groups together and retries never overwrite it"""
+        artifact — partials, review copies, failure/unverified/skip/dry-run
+        records — with a kind prefix (failed | unverified | aborted | skipped
+        | dryrun), so one attempt's evidence groups together and retries
+        never overwrite it"""
         if self._token_suffix is None:
             self._token_suffix = (f"{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}"
                                   f"-{uuid4().hex[:6]}")
@@ -1079,18 +1083,22 @@ class ISOToMP4Converter:
                     self._create_log_file(result)
                     self._create_manifest(result)
                 elif result.skipped and not result.error_message:
-                    self._create_skip_manifest(result)
-                    self._create_log_file(result, dry_run=self.config.dry_run)
+                    # A skip or dry run describes only this attempt: its log
+                    # and manifest go under its own token, created new, so
+                    # they never write over another run's records
+                    token = self._run_token("dryrun" if self.config.dry_run else "skipped")
+                    self._create_skip_manifest(result, token)
+                    self._create_log_file(result, dry_run=self.config.dry_run, token=token)
                 elif result.error_message:
                     token = self._run_token("aborted" if result.aborted else "failed")
                     self._create_error_manifest(result, token)
-                    self._create_log_file(result, is_error=True, failure_token=token)
+                    self._create_log_file(result, is_error=True, token=token)
                 elif result.unverified:
                     # Nothing was promoted: records go under the run's token,
                     # leaving any existing canonical log and manifest untouched
                     token = self._run_token("unverified")
                     self._create_error_manifest(result, token)
-                    self._create_log_file(result, is_error=True, failure_token=token)
+                    self._create_log_file(result, is_error=True, token=token)
             except Exception as record_error:
                 log(colorize("red", f"Could not write run records: {record_error}"))
                 if result.success or result.unverified:
@@ -1148,11 +1156,11 @@ class ISOToMP4Converter:
         log(colorize("cyan", f"Using ffmpeg version: {ffmpeg_version}"))
 
         # Symlink guard, phase 1: statically-known record/output paths.
-        # (Per-title MP4 paths are guarded after titleset planning; failure
-        # records use unpredictable tokened names and need no guard.)
+        # (Per-title MP4 paths are guarded after titleset planning; failure,
+        # skip and dry-run records use unpredictable tokened names and need
+        # no guard.)
         static_paths = [self.config.mp4_path, self.config.log_path,
-                        self.config.dry_run_log_path, self.config.manifest_path,
-                        self.config.skip_manifest_path]
+                        self.config.manifest_path]
         symlink_error = self._check_symlinks(static_paths)
         if symlink_error:
             return ConversionResult(
@@ -2052,26 +2060,45 @@ class ISOToMP4Converter:
             log(colorize("yellow", f"Warning: {warning}"))
         log(colorize("green", "Conversion completed successfully!"))
     
+    def _token_records(self, token: str) -> Tuple[Path, Path]:
+        """(log, manifest) paths for records kept under a run token"""
+        stem = f"{self.config.iso_name}_{token}"
+        return (self.config.output_dir / f"{stem}.log.txt",
+                self.config.output_dir / f"{stem}_manifest.json")
+
+    def _earlier_skip_records(self) -> List[str]:
+        """Skip and dry-run records left under the old fixed names (see
+        ConversionConfig), for success records to name; one that cannot be
+        checked is named with the reason"""
+        found = []
+        for path in (self.config.legacy_skip_manifest_path, self.config.legacy_dry_run_log_path):
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                found.append(f"{path} (could not be checked: {e.strerror or e})")
+                continue
+            found.append(str(path))
+        return found
+
     def _create_log_file(self, result: ConversionResult, dry_run: bool = False,
-                         is_error: bool = False, failure_token: Optional[str] = None):
+                         is_error: bool = False, token: Optional[str] = None):
         """Create formatted log file.
 
-        Failure/aborted/unverified logs are written under the run's token so
-        such a retry never overwrites the log a prior success manifest
-        references (nor an earlier failure's log)."""
-        if dry_run:
-            log_path = self.config.dry_run_log_path
-        elif failure_token:
-            log_path = self.config.output_dir / f"{self.config.iso_name}_{failure_token}.log.txt"
-        else:
-            log_path = self.config.log_path
+        Failure/aborted/unverified, skip and dry-run logs are written under
+        the run's token so such a run never overwrites the log a prior
+        success manifest references (nor an earlier failure's or skip's
+        log). A skip or dry-run log is created new, never over a file."""
+        log_path = self._token_records(token)[0] if token else self.config.log_path
+        skip_record = bool(token) and result.skipped and not is_error
     
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
     
         end_time = datetime.datetime.now()
         total_duration = (end_time - self.start_time).total_seconds()
         
-        with open(log_path, "w") as f:
+        with open(log_path, "x" if skip_record else "w") as f:
             f.write("=" * 70 + "\n")
             if dry_run:
                 f.write("ISO TO MP4 ACCESS COPY CONVERSION LOG (DRY RUN)\n")
@@ -2107,6 +2134,14 @@ class ISOToMP4Converter:
             f.write(f"Status:           {status}\n")
             if result.skip_reason:
                 f.write(f"Skip Reason:      {result.skip_reason}\n")
+            if skip_record:
+                f.write(f"Manifest:         {self._token_records(token)[1].name} "
+                        f"(this attempt only; any final MP4, log and manifest are "
+                        f"from another run)\n")
+            elif not token and not dry_run:
+                for earlier in self._earlier_skip_records():
+                    f.write(f"Earlier record:   {earlier} (from an earlier skipped or dry "
+                            f"run; it does not describe this conversion)\n")
             if result.error_message:
                 f.write(f"Error:            {result.error_message}\n")
             if result.unverified_reason:
@@ -2413,7 +2448,10 @@ class ISOToMP4Converter:
             "output_files": {
                 "mp4_file": str(result.mp4_path) if result.mp4_path else None,
                 "log_file": str(self.config.log_path),
-                "manifest_file": str(self.config.manifest_path)
+                "manifest_file": str(self.config.manifest_path),
+                # Left by an earlier skipped or dry run under the old fixed
+                # names; they do not describe this conversion
+                "earlier_skip_records": self._earlier_skip_records()
             },
             
             "archival_notes": {
@@ -2433,9 +2471,11 @@ class ISOToMP4Converter:
         
         log(colorize("cyan", f"Manifest saved to: {self.config.manifest_path}"))
     
-    def _create_skip_manifest(self, result: ConversionResult):
-        """Create manifest for skipped files (and dry runs)"""
+    def _create_skip_manifest(self, result: ConversionResult, token: str):
+        """Create manifest for skipped files (and dry runs), under the run's
+        token and created new, never over a file"""
         now = datetime.datetime.now()
+        log_path, manifest_path = self._token_records(token)
 
         manifest = {
             "conversion_metadata": {
@@ -2470,6 +2510,13 @@ class ISOToMP4Converter:
 
             "titlesets": self._titlesets_section(result),
 
+            "output_files": {
+                "log_file": str(log_path),
+                "manifest_file": str(manifest_path),
+                "scope": ("this attempt only; any final MP4, log and access manifest "
+                          "beside it are from another run")
+            },
+
             "archival_notes": {
                 "note": result.skip_reason if result.skip_reason else "Skipped",
                 "project": "Johnson Publishing Company Archive (JPCA)"
@@ -2477,10 +2524,10 @@ class ISOToMP4Converter:
         }
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.config.skip_manifest_path, "w") as f:
+        with open(manifest_path, "x") as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
 
-        log(colorize("cyan", f"Skip manifest saved to: {self.config.skip_manifest_path}"))
+        log(colorize("cyan", f"{'Dry-run' if self.config.dry_run else 'Skip'} manifest saved to: {manifest_path}"))
     
     def _create_error_manifest(self, result: ConversionResult, failure_token: str):
         """Create manifest for failed, operator-aborted or unverified conversions.

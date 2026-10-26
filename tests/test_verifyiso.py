@@ -291,6 +291,327 @@ class CsvReportTests(Base):
         self.assertEqual(report.read_text(), "SOMEONE ELSE'S FILE")
 
 
+class ReportAliasTests(Base):
+    """T-137: the --csv reservation is never hashed as a master or read as a
+    manifest, through the same path or another spelling of it (a symlink on
+    either side); such a manifest is an ERROR and the report is not kept,
+    so it cannot be left where a manifest expects its master. Controls: the
+    same records with the report elsewhere"""
+
+    def empty_master_record(self, folder, iso_name="master.payload"):
+        """A hand-made record for a missing master of zero bytes: the empty
+        reservation would match its hashes"""
+        folder.mkdir(parents=True, exist_ok=True)
+        manifest = folder / "disc_manifest.json"
+        manifest.write_text(json.dumps(record(iso_name, b"")))
+        return manifest
+
+    def assert_alias_refused(self, folder, report, manifest, output, code, expect):
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [], "the reservation was hashed")
+        self.assertNotIn("PASS", output)
+        self.assertIn(expect, output)
+        self.assertIn("Not keeping CSV report", output)
+        self.assertNotIn("CSV report written to", output)
+        self.assertFalse(os.path.lexists(report), "the report was kept")
+
+    def test_a_report_named_as_a_missing_master_is_never_passed(self):
+        folder = self.dir / "alias"
+        manifest = self.empty_master_record(folder)
+        before = manifest.read_bytes()
+        report = folder / "master.payload"
+        code, output = self.cli(folder, report=report)
+        self.assert_alias_refused(folder, report, manifest, output, code,
+                                  "ERROR: the ISO name master.payload is the --csv report")
+        self.assertEqual(manifest.read_bytes(), before)
+
+    def test_a_report_reached_through_a_symlinked_folder_is_never_passed(self):
+        folder = self.dir / "alias"
+        self.empty_master_record(folder)
+        linked = self.dir / "linked"
+        os.symlink(folder, linked)
+        report = linked / "master.payload"
+        code, output = self.cli(folder, report=report)
+        self.assert_alias_refused(folder, report, None, output, code,
+                                  "ERROR: the ISO name master.payload is the --csv report")
+        self.assertTrue(linked.is_symlink())
+
+    def test_a_master_symlink_to_the_report_is_never_passed(self):
+        folder = self.dir / "alias"
+        self.empty_master_record(folder, "disc.iso")
+        report = self.dir / "report.csv"
+        os.symlink(report, folder / "disc.iso")  # dangling until the report is reserved
+        code, output = self.cli(folder, report=report)
+        self.assert_alias_refused(folder, report, None, output, code,
+                                  "ERROR: the ISO name disc.iso is the --csv report")
+        self.assertEqual(os.readlink(folder / "disc.iso"), str(report))
+
+    def test_a_manifest_symlink_to_the_report_is_never_read(self):
+        folder = self.dir / "alias"
+        folder.mkdir()
+        report = self.dir / "report.csv"
+        os.symlink(report, folder / "disc_manifest.json")
+        reads = []
+        real_read = Path.read_bytes
+
+        def read_bytes(path):
+            reads.append(Path(path))
+            return real_read(path)
+
+        with mock.patch.object(Path, "read_bytes", read_bytes):
+            code, output = self.cli(folder, report=report)
+        self.assert_alias_refused(folder, report, None, output, code,
+                                  "ERROR: this is the --csv report this run is writing")
+        self.assertNotIn(folder / "disc_manifest.json", reads)
+
+    def test_control_the_same_records_with_the_report_elsewhere(self):
+        folder = self.dir / "alias"
+        self.empty_master_record(folder)
+        report = self.dir / "elsewhere.csv"
+        code, output = self.cli(folder, report=report)
+        self.assertEqual(code, 1, output)
+        self.assertIn("MISSING_ISO", output)
+        self.assertIn("CSV report written to", output)
+        rows = list(csv.reader(report.open(encoding="utf-8")))
+        self.assertEqual([r[0] for r in rows[1:]], ["MISSING_ISO"])
+        # and a healthy master next to a report in its own folder still passes
+        self.master(folder=self.dir / "healthy")
+        report2 = self.dir / "healthy" / "fixity.csv"
+        code, output = self.cli(self.dir / "healthy", report=report2)
+        self.assertEqual(code, 0, output)
+        self.assertEqual([r[0] for r in list(csv.reader(report2.open(encoding="utf-8")))[1:]], ["PASS"])
+
+
+class ReportAliasInspectionTests(Base):
+    """T-137 repair: when it cannot be inspected whether a manifest, or the
+    ISO it names, is the --csv reservation (an error other than "no such
+    file"), that input is an ERROR naming the path and the error, it is not
+    read or hashed, healthy siblings are still checked, and the report is not
+    kept. Each fault fires once, armed when check_manifest starts on that
+    manifest, so discovery is untouched. Controls: absence that is
+    established keeps its outcome and the report; no --csv, no change"""
+
+    @contextlib.contextmanager
+    def inspection_fails(self, manifest, target, error):
+        """os.stat (following links) raises error once for target, from the
+        moment check_manifest starts on manifest; yields the paths it fired for"""
+        real_stat, real_check = os.stat, verify.check_manifest
+        armed, fired = [], []
+
+        def stat(path, *args, **kwargs):
+            if armed and not fired and not isinstance(path, int) \
+                    and Path(os.fsdecode(path)) == target and kwargs.get("follow_symlinks", True):
+                fired.append(Path(os.fsdecode(path)))
+                raise error
+            return real_stat(path, *args, **kwargs)
+
+        def check(path, *args, **kwargs):
+            if Path(path) == manifest:
+                armed.append(True)
+            return real_check(path, *args, **kwargs)
+
+        with mock.patch.object(os, "stat", stat), mock.patch.object(verify, "check_manifest", check):
+            yield fired
+
+    def alias_layout(self, role, label):
+        """A folder whose manifest (role "manifest") or ISO name (role
+        "master", with a record of an empty file) is a symlink to the report
+        path, plus a healthy sibling bundle. Returns (root, manifest, link, report)"""
+        root = self.dir / label
+        folder = root / "alias"
+        folder.mkdir(parents=True)
+        report = root / "report.csv"
+        manifest = folder / "disc_manifest.json"
+        if role == "master":
+            manifest.write_text(json.dumps(record("disc.iso", b"")))
+            link = folder / "disc.iso"
+        else:
+            link = manifest
+        os.symlink(report, link)
+        self.master(folder=root / "sibling")
+        return root, manifest, link, report
+
+    def run_alias(self, role, error, label):
+        root, manifest, link, report = self.alias_layout(role, label)
+        reads = []
+        real_read = Path.read_bytes
+
+        def read_bytes(path):
+            reads.append(Path(path))
+            return real_read(path)
+
+        with self.inspection_fails(manifest, link, error) as fired, \
+                mock.patch.object(Path, "read_bytes", read_bytes):
+            code, output = self.cli(root, report=report)
+        self.assertEqual(fired, [link], "the fault never fired")
+        return root, manifest, link, report, code, output, reads
+
+    def assert_uncertain(self, root, link, report, code, output, errno_text):
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [root / "sibling" / "disc.iso"],
+                         "only the healthy sibling may be hashed")
+        self.assertEqual(output.count("PASS: verified"), 1, output)  # the sibling
+        self.assertIn(errno_text, output)
+        self.assertIn("for 1 manifest(s) it could not be checked whether they or their ISO "
+                      "are the report", output)
+        self.assertNotIn("name it as their ISO or as themselves", output)  # not a proven alias
+        self.assertNotIn("CSV report written to", output)
+        self.assertFalse(os.path.lexists(report), "a report that may be an input was kept")
+        self.assertTrue(link.is_symlink())
+
+    def test_a_master_link_to_the_report_whose_inspection_fails_is_never_hashed(self):
+        root, manifest, link, report, code, output, _ = self.run_alias("master", io_error(), "eio")
+        self.assert_uncertain(root, link, report, code, output, "[Errno 5] Input/output error")
+        self.assertIn(f"{link}: ERROR — could not check whether the ISO name disc.iso is the "
+                      f"--csv report this run is writing ([Errno 5] Input/output error); "
+                      f"not checked", output)
+
+    def test_a_manifest_link_to_the_report_whose_inspection_fails_is_never_read(self):
+        root, manifest, link, report, code, output, reads = self.run_alias("manifest", io_error(), "eio")
+        self.assert_uncertain(root, link, report, code, output, "[Errno 5] Input/output error")
+        self.assertNotIn(manifest, reads, "the manifest link was read")
+        self.assertIn(f"{manifest}: ERROR — could not check whether this is the --csv report "
+                      f"this run is writing ([Errno 5] Input/output error); not read", output)
+
+    def test_other_inspection_errors_are_treated_the_same(self):
+        for role, error, text in (("master", denied(), "[Errno 13] Permission denied"),
+                                  ("master", OSError(errno.ELOOP, "Too many levels of symbolic links"),
+                                   f"[Errno {errno.ELOOP}] Too many levels of symbolic links"),
+                                  ("manifest", denied(), "[Errno 13] Permission denied")):
+            with self.subTest(role=role, error=text):
+                self.hashed.clear()
+                label = f"{role}-{error.errno}"
+                root, manifest, link, report, code, output, reads = self.run_alias(role, error, label)
+                self.assert_uncertain(root, link, report, code, output, text)
+                self.assertNotIn(manifest if role == "manifest" else link, reads)
+
+    def test_control_established_absence_keeps_its_outcome_and_the_report(self):
+        # No such file, a dangling link, and a path component that is a file
+        for label in ("missing", "dangling", "not-a-folder"):
+            with self.subTest(label):
+                self.hashed.clear()
+                root = self.dir / label
+                folder = root / "bundle"
+                folder.mkdir(parents=True)
+                (folder / "disc_manifest.json").write_text(json.dumps(record("disc.iso")))
+                if label == "dangling":
+                    os.symlink(root / "unmounted" / "disc.iso", folder / "disc.iso")
+                elif label == "not-a-folder":
+                    (root / "plain").write_bytes(b"a file, not a folder")
+                    os.symlink(root / "plain" / "disc.iso", folder / "disc.iso")
+                self.master(folder=root / "sibling")
+                report = root / "report.csv"
+                code, output = self.cli(root, report=report)
+                self.assertEqual(code, 1, output)
+                self.assertIn("MISSING_ISO: ISO not found next to manifest: disc.iso", output)
+                self.assertIn(f"CSV report written to: {report}", output)
+                rows = list(csv.reader(io.StringIO(report.read_text(encoding="utf-8"))))
+                # A dangling link is also an EXCLUDED part of the search (T-134)
+                self.assertEqual(sorted(row[0] for row in rows[1:]),
+                                 ["MISSING_ISO", "PASS"] if label == "missing"
+                                 else ["EXCLUDED", "MISSING_ISO", "PASS"])
+
+    def test_control_without_csv_nothing_changes(self):
+        root, manifest, link, report = self.alias_layout("master", "no-report")
+        code, output = self.cli(root)  # no reservation: the link dangles, the sibling passes
+        self.assertEqual(code, 1, output)
+        self.assertIn("MISSING_ISO: ISO not found next to manifest: disc.iso", output)
+        self.assertEqual(self.hashed, [root / "sibling" / "disc.iso"])
+        self.assertNotIn("--csv", output)
+        self.assertFalse(os.path.lexists(report))
+        healthy = self.dir / "healthy"
+        self.master(folder=healthy)
+        self.assertEqual(self.cli(healthy)[0], 0)
+
+
+class ReportOwnershipTests(Base):
+    """T-138: a report path that stops naming this run's file while the
+    report is written is never announced as saved, and a path whose
+    ownership cannot be established is never unlinked; another file at the
+    path stays byte-for-byte. Faults are injected at os.fdopen (just after
+    the last pre-write check) and os.fstat (the reservation's own check)"""
+
+    FOREIGN = b"SYNTHETIC FOREIGN FILE AT THE REPORT PATH\n"
+
+    def test_a_report_replaced_or_removed_while_it_is_written_is_not_announced(self):
+        real_fdopen = os.fdopen
+        for change in ("replaced", "removed"):
+            with self.subTest(change):
+                folder = self.dir / change
+                iso, manifest = self.master(folder=folder)
+                inputs = (iso.read_bytes(), manifest.read_bytes())
+                report = folder / "report.csv"
+                fired = []
+
+                def late_change(fd, *args, change=change, report=report, fired=fired, **kwargs):
+                    report.unlink()
+                    if change == "replaced":
+                        report.write_bytes(self.FOREIGN)
+                    fired.append(change)
+                    return real_fdopen(fd, *args, **kwargs)
+
+                with mock.patch.object(os, "fdopen", late_change):
+                    code, output = self.cli(folder, report=report)
+                self.assertEqual(fired, [change], "the fault never fired")
+                self.assertEqual(code, 1, output)
+                self.assertIn(f"Could not save CSV report: {report} was {change}", output)
+                self.assertNotIn("CSV report written to", output)
+                if change == "replaced":
+                    self.assertEqual(report.read_bytes(), self.FOREIGN)
+                else:
+                    self.assertFalse(os.path.lexists(report))
+                self.assertEqual((iso.read_bytes(), manifest.read_bytes()), inputs)
+
+    def fstat_failing(self, report, replace):
+        real_fstat = os.fstat
+        fired = []
+
+        def fstat(fd):
+            # Only the reservation's own check: the first fstat once it exists
+            if not fired and os.path.lexists(report):
+                if replace:
+                    report.unlink()
+                    report.write_bytes(self.FOREIGN)
+                fired.append(replace)
+                raise OSError(errno.EIO, "synthetic: Input/output error")
+            return real_fstat(fd)
+
+        return mock.patch.object(os, "fstat", fstat), fired
+
+    def test_an_fstat_failure_after_replacement_leaves_the_foreign_file(self):
+        self.master()
+        report = self.dir / "report.csv"
+        patcher, fired = self.fstat_failing(report, replace=True)
+        with patcher:
+            code, output = self.cli(self.dir, report=report)
+        self.assertEqual(fired, [True], "the fault never fired")
+        self.assertEqual(code, 1, output)
+        self.assertIn("cannot confirm that --csv", output)
+        self.assertIn("Input/output error", output)
+        self.assertEqual(report.read_bytes(), self.FOREIGN)
+        self.assertEqual(self.hashed, [], "an ISO was hashed after the report was refused")
+
+    def test_an_fstat_failure_alone_leaves_the_unconfirmed_reservation(self):
+        self.master()
+        report = self.dir / "report.csv"
+        patcher, fired = self.fstat_failing(report, replace=False)
+        with patcher:
+            code, output = self.cli(self.dir, report=report)
+        self.assertEqual(fired, [False], "the fault never fired")
+        self.assertEqual(code, 1, output)
+        self.assertIn("left in place", output)
+        self.assertEqual(report.read_bytes(), b"")  # this run's own empty file, unproven
+        self.assertEqual(self.hashed, [])
+
+    def test_control_an_unchanged_report_path_is_written_and_announced(self):
+        iso, _ = self.master()
+        report = self.dir / "report.csv"
+        code, output = self.cli(self.dir, report=report)
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"CSV report written to: {report}", output)
+        self.assertEqual([r[0] for r in list(csv.reader(report.open(encoding="utf-8")))[1:]], ["PASS"])
+
+
 class ClassificationTests(Base):
     """T-125: families by content, status whitelist, dry-run and integrity rules"""
 
@@ -921,10 +1242,13 @@ class DiscoveryTests(Base):
         self.assertNotIn(alias, reads, "the unclassified manifest link was read")
         self.assertEqual(self.hashed, [r / "own" / "disc.iso"])  # the healthy sibling is still verified
         self.assertIn(f"{alias}: ERROR — could not inspect the symlink's target: [Errno 5]", output)
-        rows = {row[2]: row for row in self.rows(report)[1:]}
-        self.assertEqual(rows[str(alias)][0], "ERROR")
-        self.assertIn("[Errno 5] Input/output error", rows[str(alias)][9])
-        self.assertEqual(rows[str(r / "own" / "disc_manifest.json")][0], "PASS")
+        # T-137: its target stays uninspectable, so it is not shown to be
+        # separate from the report, which is therefore not kept
+        self.assertIn("; could not check whether it is the --csv report this run is writing "
+                      "([Errno 5] Input/output error)", output)
+        self.assertIn("PASS: verified", output)
+        self.assertIn("Not keeping CSV report", output)
+        self.assertFalse(os.path.lexists(report))
         # Control: an ordinary link with the same fault is a DISCOVERY_ERROR, as before
         folder_link = r / "folder-link"
         os.symlink(r / "own", folder_link)
@@ -934,6 +1258,107 @@ class DiscoveryTests(Base):
         self.assertIn(("target", folder_link), calls, "the fault never reached the search")
         self.assertEqual(code, 1, output)
         self.assertIn(f"DISCOVERY_ERROR: {folder_link}: could not inspect symlink target", output)
+
+    # --- T-137: blocked manifest candidates and the --csv report ---
+
+    @contextlib.contextmanager
+    def target_stat_fails_once(self, link, error):
+        """os.stat, following links, raises error the first time it is asked
+        about link (discovery's own check); later checks see the real target"""
+        real, fired = os.stat, []
+
+        def stat(path, *args, **kwargs):
+            if not fired and not isinstance(path, int) and Path(os.fsdecode(path)) == link \
+                    and kwargs.get("follow_symlinks", True):
+                fired.append(Path(os.fsdecode(path)))
+                raise io_error()
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(os, "stat", stat):
+            yield fired
+
+    def run_blocked(self, r, report, faults):
+        """cli() with faults applied and manifest reads recorded"""
+        reads = []
+        real_read = Path.read_bytes
+
+        def read_bytes(path):
+            reads.append(Path(path))
+            return real_read(path)
+
+        with faults as fired, mock.patch.object(Path, "read_bytes", read_bytes):
+            code, output = self.cli(r, report=report)
+        return code, output, reads, fired
+
+    def blocked_link(self, label, target=None):
+        """A manifest-named link (to the report path unless target is given)
+        beside a healthy bundle"""
+        r = self.dir / label
+        self.masters(r, "own")
+        report = r / "report.csv"
+        link = r / "alias_manifest.json"
+        os.symlink(target or report, link)  # to the report: dangling until it is reserved
+        return r, link, report
+
+    def assert_blocked_and_refused(self, r, link, report, code, output, reads):
+        self.assertEqual(code, 1, output)
+        self.assertNotIn(link, reads, "the blocked manifest link was read")
+        self.assertEqual(self.hashed, [r / "own" / "disc.iso"])  # the healthy sibling only
+        self.assertIn("PASS: verified", output)
+        self.assertIn(f"{link}: ERROR — could not inspect the symlink's target: "
+                      f"[Errno 5] Input/output error; not opened; ", output)
+        self.assertIn("Not keeping CSV report", output)
+        self.assertNotIn("CSV report written to", output)
+        self.assertFalse(os.path.lexists(report), "a report that may be an input was kept")
+        self.assertTrue(link.is_symlink())
+
+    def test_a_blocked_manifest_link_proven_to_be_the_report_refuses_it(self):
+        r, link, report = self.blocked_link("proven")
+        code, output, reads, fired = self.run_blocked(r, report, self.target_stat_fails_once(link, io_error()))
+        self.assertEqual(fired, [link], "the fault never reached the search")
+        self.assert_blocked_and_refused(r, link, report, code, output, reads)
+        self.assertIn("not opened; it is the --csv report this run is writing", output)
+        self.assertIn("1 manifest(s) name it as their ISO or as themselves", output)
+        self.assertNotIn("could not be checked whether", output)
+
+    def test_a_blocked_manifest_link_still_uninspectable_refuses_the_report(self):
+        r, link, report = self.blocked_link("uncertain")
+        code, output, reads, calls = self.run_blocked(
+            r, report, target_stat_fails({link}, io_error(), "target"))
+        self.assertEqual(calls, [("target", link)] * 2, "discovery and the report check were not both reached")
+        self.assert_blocked_and_refused(r, link, report, code, output, reads)
+        self.assertIn("not opened; could not check whether it is the --csv report this run is "
+                      "writing ([Errno 5] Input/output error)", output)
+        self.assertIn("for 1 manifest(s) it could not be checked whether they or their ISO are "
+                      "the report", output)
+        self.assertNotIn("name it as their ISO or as themselves", output)
+
+    def test_control_blocked_candidates_shown_separate_keep_the_report(self):
+        # A link blocked once at discovery whose target is then shown to be
+        # another manifest, and a real FIFO named like a manifest
+        for label in ("separate-link", "fifo"):
+            with self.subTest(label):
+                if label == "fifo":
+                    r = self.dir / label
+                    self.masters(r, "own")
+                    blocked, report = r / "pipe_manifest.json", r / "report.csv"
+                    os.mkfifo(blocked)
+                    faults, reason = contextlib.nullcontext([None]), "not a regular file"
+                else:
+                    r, blocked, report = self.blocked_link(label, target=self.dir / "elsewhere_manifest.json")
+                    (self.dir / "elsewhere_manifest.json").write_text("{}")
+                    faults, reason = self.target_stat_fails_once(blocked, io_error()), "[Errno 5]"
+                code, output, reads, fired = self.run_blocked(r, report, faults)
+                self.assertEqual(len(fired), 1, "the fault never reached the search")
+                self.assertEqual(code, 1, output)
+                self.assertNotIn(blocked, reads)
+                self.assertEqual(self.hashed, [r / "own" / "disc.iso"])
+                self.assertIn(f"CSV report written to: {report}", output)
+                rows = {row[2]: row for row in self.rows(report)[1:]}
+                self.assertEqual(rows[str(blocked)][0], "ERROR")
+                self.assertIn(reason, rows[str(blocked)][9])
+                self.assertNotIn("--csv report", rows[str(blocked)][9])
+                self.assertEqual(rows[str(r / "own" / "disc_manifest.json")][0], "PASS")
 
     def test_a_manifest_link_to_a_fifo_whose_target_cannot_be_inspected_is_never_opened(self):
         r = self.dir / "r"

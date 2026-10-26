@@ -319,7 +319,7 @@ If all commands return version information, you're ready to go!
 
 Creates archival-quality ISO images from optical discs while simultaneously verifying data integrity. Designed for digital preservation workflows where verification and documentation are critical.
 
-The script reads directly from the raw device (bypassing filesystem caching) and calculates the source MD5 and SHA-256 checksums during the copy. After the copy completes, it verifies the backup by re-reading the written ISO from disk and comparing both hashes against the source — so verification reflects the bytes that actually landed on disk, not the in-memory stream.
+The script reads directly from the raw device (bypassing filesystem caching) and calculates the source MD5 and SHA-256 checksums during the copy. After the copy completes, it asks for the ISO to be flushed to its media, then verifies the backup by re-reading the written ISO and comparing both hashes against the source — so verification reflects a second read of the written file, not the in-memory stream. How far that read reaches the media depends on the flush and cache controls the system honoured (see [How Verification Works](#how-verification-works)).
 
 ### Quick Start
 
@@ -423,7 +423,7 @@ The script executes the following steps:
 │     • Read from raw device (/dev/rdiskN)                        │
 │     • Write to ISO file                                         │
 │     • Calculate MD5 + SHA-256 of source stream                  │
-│     • Flush to disk, re-read ISO, verify hashes                 │
+│     • Request flush, re-read ISO, verify hashes                 │
 │     • Display real-time progress                                │
 └─────────────────────────────────────────────────────────────────┘
                               ▼
@@ -466,7 +466,7 @@ For a backup with filename `JPC_AV_00001`, the script creates a directory contai
 
 #### Replacing an Existing Bundle
 
-If the folder already holds a bundle, you are asked before anything starts. Nothing is touched until the new copy has verified. Then the current bundle is moved, unchanged and under its own file names, into a new folder, and the new bundle is published in its place. (A `--dry-run` never replaces a bundle; see [Dry Runs](#dry-runs).)
+If the folder already holds a bundle, you are asked before anything starts. Nothing is touched until the new copy has verified. Then the current bundle is moved, unchanged and under its own file names, into a new folder, and the new bundle is published in its place. Publication requires the verified ISO itself: if it is missing or cannot be inspected when publication starts, nothing is archived or published and the run fails (its files keep `failed-*` names, below); if it disappears after the current bundle was archived, the run fails and the rollback described below applies. (A `--dry-run` never replaces a bundle; see [Dry Runs](#dry-runs).)
 
 ```
 ~/Backups/JPC_AV_00001/
@@ -545,7 +545,7 @@ MD5 (ISO):          a1b2c3d4e5f6...
 MD5 (Raw Disk):     a1b2c3d4e5f6...
 SHA-256 (ISO):      9f8e7d6c5b4a...
 SHA-256 (Raw Disk): 9f8e7d6c5b4a...
-Checksum match: ISO on disk is a true bit-for-bit copy.
+Checksum match: the re-read ISO matches the stream read from the disc.
 ```
 
 #### Exit Codes
@@ -559,7 +559,7 @@ Checksum match: ISO on disk is a true bit-for-bit copy.
 
 > **Note:** Exit `0` covers three record states — the manifest's `overall_status` and the log header are the source of truth:
 > - `success` — verified master produced
-> - `success_with_warnings` — verified master, with a non-fatal problem recorded (e.g. a failed eject or an incomplete tree listing; this workflow is operator-attended, so these don't change the exit code)
+> - `success_with_warnings` — verified master, with a non-fatal problem recorded (e.g. a failed eject, an incomplete tree listing, or a weaker verification: `F_FULLFSYNC` unavailable so only `fsync` was used, or `F_NOCACHE` unavailable for the re-read; this workflow is operator-attended, so these don't change the exit code)
 > - `dry_run` — `--dry-run` rehearsal; no ISO was created and nothing was verified (log header reads `DRY RUN`)
 
 ---
@@ -699,7 +699,7 @@ The script automatically detects disc content and handles different types approp
 | Empty/Unreadable | ⏭️ Skipped | Verify ISO integrity |
 | Analysis error (an error while reading the disc's folders, e.g. a VIDEO_TS listing that fails partway) | ❌ Failed | Nothing is planned or encoded, dry runs included; failure records are written and a batch counts it as failed |
 
-Skipped discs generate a `*_skip_manifest.json` documenting why the disc was skipped.
+A skipped disc gets a log and manifest of its own, `<name>_skipped-<timestamp>-<random>.log.txt` and `<name>_skipped-<timestamp>-<random>_manifest.json`, documenting why it was skipped; a dry run's are named `<name>_dryrun-<timestamp>-<random>…` the same way. Each is created new, so it never replaces another run's records, and it describes only that attempt: a final MP4, log and access manifest beside it come from a conversion. Earlier versions wrote every skip to `<name>_skip_manifest.json` (and every dry-run log to `<name>.mp4.dryrun.log.txt`), each over the last; those files are left in place, and a later successful conversion lists them under `earlier_skip_records` in its access manifest (and in its log) as records of an earlier run.
 
 ### Titlesets: One MP4 Per Titleset
 
@@ -846,13 +846,14 @@ For a successfully converted ISO, the script creates:
     └── JPC_AV_00001_access_manifest.json   # JSON metadata
 ```
 
-For skipped ISOs (non-VIDEO_TS content):
+For skipped ISOs (non-VIDEO_TS content), each skip leaves its own pair of records (a dry run's are named `…_dryrun-…` the same way):
 
 ```
 /path/to/isos/
 ├── data_disc.iso
 └── access_JPC_AV_data_disc/
-    └── data_disc_skip_manifest.json        # Documents why disc was skipped
+    ├── data_disc_skipped-20260612T150000-3f9a2c.log.txt         # Log for that skip
+    └── data_disc_skipped-20260612T150000-3f9a2c_manifest.json   # Documents why the disc was skipped
 ```
 
 For a run that fails or ends unverified before promotion begins, the final MP4s, log and manifest above are left as they were. A run that fails once promotion has begun — a rename stops partway, or its records cannot be written afterwards — can leave MP4s it already promoted beside a missing, incomplete or outdated log and manifest (see [Duration Check and Outcomes](#duration-check-and-outcomes)). The run's own files are named as in [Failed Conversion Naming](#failed-conversion-naming).
@@ -863,7 +864,7 @@ For a run that fails or ends unverified before promotion begins, the final MP4s,
 
 Audits existing ISO preservation masters **without reloading any discs**: it re-hashes each ISO and compares against the source hash recorded in its manifest at imaging time. The `source_hash` was always computed by streaming the physical disc, so it is a valid fixity baseline for ISOs made by *any* version of `makeiso.py`; newer manifests' SHA-256 hashes are compared too when present.
 
-Sudo-free, and it never changes an existing file. `--csv` creates one **new** report file: its path is reserved before anything is hashed, and an existing path (a file, folder, symlink or `/dev/stdout`) or a name ending in `.iso` or `_manifest.json` is refused with exit `1`. Give each report a new name, for example with the date.
+Sudo-free, and it never changes an existing file. `--csv` creates one **new** report file: its path is reserved before anything is hashed, and an existing path (a file, folder, symlink or `/dev/stdout`) or a name ending in `.iso` or `_manifest.json` is refused with exit `1`. The reserved report is never read as a manifest or hashed as a master: a manifest that names the report path as its ISO, directly or through a symlink, is reported `ERROR`, and the report is then not kept (exit `1`); so is a manifest for which that could not be checked (an inspection error other than "no such file" on the manifest or the ISO it names). The report is announced as written only while its path still names the file the run wrote; if that path is replaced or removed during the run, nothing there is removed and the run exits `1`. These checks guard one operator's run against accidental collisions: a change to the path after the last check is not detected. Give each report a new name, for example with the date.
 
 ```bash
 # Verify everything under a collection folder (searched recursively)
@@ -898,7 +899,7 @@ Every `*_manifest.json` found is examined, whatever it is called; what it is com
 | `MISSING_ISO` | Manifest exists but its ISO is gone |
 | `UNVERIFIABLE` | The record cannot be trusted to verify: missing or unrecognized run status, missing integrity record, missing MD5 source hash, a blank, non-text or malformed hash (including a declared SHA-256 with no SHA-256 hash), fields of the wrong type, an ISO name outside its folder, a dry-run record next to an existing ISO (a dry run replaced that master's own manifest), markers of both record families, or a manifest that is neither a `makeiso.py` nor a `makeiso-video.py` record |
 | `SKIPPED` | Nothing to check: an explicitly `failed` or `verification_failed` run, a dry-run record with no ISO beside it, a `makeiso-video.py` record, or an AppleDouble metadata file |
-| `ERROR` | Manifest unreadable, not valid UTF-8 or JSON, or not a JSON object; the ISO could not be read; or a FIFO, device or socket named like a manifest, or a manifest-named symlink whose target cannot be checked (not opened). One bad item never stops the run |
+| `ERROR` | Manifest unreadable, not valid UTF-8 or JSON, or not a JSON object; the ISO could not be read; or a FIFO, device or socket named like a manifest, or a manifest-named symlink whose target cannot be checked (not opened); or a manifest, or the ISO it names, that is this run's `--csv` report or could not be checked for that (not read or hashed). One bad item never stops the run |
 
 Parts of the search are reported separately, never as manifest results. They are listed before checking starts, again at the end, and as their own rows in the CSV report (path at the start of `detail`; no manifest, ISO or hashes):
 
@@ -1023,18 +1024,18 @@ Phase 1 — Creation (single pass over the disc)
                      │   (raw)    │
                      └────────────┘
 
-Phase 2 — Verification (after forcing the file to physical disk)
+Phase 2 — Verification (after asking for the file to be flushed to its media)
 
 ┌──────────────┐     ┌──────────────┐     ┌────────────┐
 │   ISO File   │────▶│  4MB Chunk   │────▶│  MD5 Hash  │
 │  re-read,    │     │              │     │   (iso)    │
-│ cache bypass │     └──────────────┘     └────────────┘
+│ (F_NOCACHE)  │     └──────────────┘     └────────────┘
 └──────────────┘
 ```
 
-During creation, each 4MB chunk is read from the raw device, written to the ISO file, and fed to the source (raw) hashers — both MD5 and SHA-256. After the copy completes, the script forces the file to physical media (`F_FULLFSYNC`), then re-reads the written ISO from disk with the page cache bypassed (`F_NOCACHE`) and hashes it independently with both algorithms. A match requires both digest pairs to agree; MD5 is retained for continuity with existing collection manifests, SHA-256 for current archival fixity practice.
+During creation, each 4MB chunk is read from the raw device, written to the ISO file, and fed to the source (raw) hashers — both MD5 and SHA-256. After the copy completes, the script calls `F_FULLFSYNC` on the file, which asks macOS and the drive to write it to the media, drive cache included (a drive or network volume may not honour it). It then re-reads the written ISO with `F_NOCACHE` set, which asks macOS not to cache that read (data the write left cached may still be served), and hashes it independently with both algorithms. If `F_FULLFSYNC` is unavailable the script falls back to plain `fsync`, which may stop at the drive's cache; if `F_NOCACHE` is unavailable the re-read may come from the page cache. Either fallback is shown on screen and recorded as a warning (the run ends `success_with_warnings`), and the log and manifest record what was applied (`flush_before_verification`, `verification_read_cache_bypass`). A match requires both digest pairs to agree; MD5 is retained for continuity with existing collection manifests, SHA-256 for current archival fixity practice.
 
-Because the second hash comes from the bytes that actually landed on disk — not from the in-memory stream — a mismatch catches write errors, truncated writes, and destination-disk corruption. Verification always runs; there is no option to skip it.
+Because the second hash comes from re-reading the written file — not from the in-memory stream — a mismatch catches write errors and truncated writes, and destination-disk corruption as far as the flush and the re-read reached the media. Neither control is proof that the bytes are on the physical media. Verification always runs; there is no option to skip it.
 
 ### Manifest Structure
 
@@ -1072,7 +1073,7 @@ For `makeiso-video.py`, only DVD-Video discs with VIDEO_TS folders are converted
 
 ## License
 
-MIT License — use freely for any purpose, with or without attribution.
+See [LICENSE](LICENSE) for the license terms.
 
 This project is part of the Johnson Publishing Company Archive (JPCA) digitization and preservation initiative, a collaboration between the [Getty Research Institute (GRI)](https://www.getty.edu/projects/johnson-publishing-company-archive/) and the [Smithsonian National Museum of African American History and Culture (NMAAHC)](https://www.searchablemuseum.com/johnson-publishing-company-image-power/).
 
