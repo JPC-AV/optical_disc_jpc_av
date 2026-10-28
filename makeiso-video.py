@@ -9,7 +9,10 @@ A collaboration between the Getty Research Institute and the
 Smithsonian National Museum of African American History and Culture.
 """
 
+import contextlib
+import errno
 import os
+import shlex
 import subprocess
 import sys
 import datetime
@@ -80,7 +83,10 @@ class DiscContentAnalysis:
     ifo_files: List[Path] = field(default_factory=list)
     bup_files: List[Path] = field(default_factory=list)
     total_vob_size: int = 0
-    disc_type: str = "unknown"  # "dvd_video", "dvd_audio", "data", "mixed", "unknown"
+    vob_sizes: Dict[Path, int] = field(default_factory=dict)  # from the inventory's own check
+    # "dvd_video", "dvd_audio", "mixed", "video_ts_without_vobs", "data",
+    # "empty", "error", "unknown"
+    disc_type: str = "unknown"
     mount_point: Optional[Path] = None
     error: Optional[str] = None
 
@@ -158,6 +164,9 @@ class TitleOutput:
     # such file": its current location is unknown (not absent); see
     # retention_error for the reason and the candidate paths
     location_unverified: bool = False
+    # Its promotion was interrupted and the final name could not be checked
+    # afterwards: that final MP4 may have been replaced by this run
+    final_name_unverified: bool = False
 
 @dataclass
 class ConversionResult:
@@ -197,6 +206,13 @@ class ConversionResult:
     def canonical_files_changed(self) -> List[Path]:
         """Final-name MP4s this run actually created or replaced"""
         return [t.output_path for t in self.titles if t.promoted_this_run]
+
+    @property
+    def canonical_files_uncertain(self) -> List[Path]:
+        """Final-name MP4s this run may have replaced: an interrupted
+        promotion after which the final name could not be checked"""
+        return [t.output_path for t in self.titles
+                if t.final_name_unverified and not t.promoted_this_run]
 
     @property
     def compression_ratio(self) -> Optional[float]:
@@ -284,11 +300,17 @@ def log_divider(title: Optional[str] = None):
 ### === UTILITY FUNCTIONS ===
 
 def get_input(prompt: str) -> str:
-    """Get user input with keyboard interrupt handling"""
+    """Get user input (the operator name, asked before anything starts).
+    Ctrl-C cancels with exit 130, as a Ctrl-C that stops any run does;
+    end of input (no answer) cancels with exit 1. Nothing is started or
+    recorded either way."""
     try:
         return input(prompt).strip()
     except KeyboardInterrupt:
-        log(colorize("red", "\nCancelled by user."))
+        log(colorize("red", "\nCancelled by user (Ctrl-C): nothing was started."))
+        sys.exit(130)
+    except EOFError:
+        log(colorize("red", "\nNo answer (end of input): cancelled."))
         sys.exit(1)
 
 def run_cmd(cmd: List[str], capture_output: bool = True, check: bool = True) -> subprocess.CompletedProcess:
@@ -356,19 +378,24 @@ class ISOMount:
 
     Multi-session/multi-partition ISOs can mount several volumes; the
     returned mount point is the one containing VIDEO_TS when present,
-    falling back to the first volume."""
+    falling back to the first volume. A volume whose VIDEO_TS cannot be
+    checked is never passed over: selection stops and selection_error
+    says why (the run then fails with an analysis error)."""
 
     def __init__(self, iso_path: Path):
         self.iso_path = iso_path
         self.mount_point: Optional[Path] = None
         self.mount_points: List[Path] = []
         self.devices: List[str] = []
+        self.selection_error: Optional[str] = None
         # Detach failures recorded here so the caller can surface them into the
         # conversion record (the context manager has no access to it directly).
         self.detach_errors: List[str] = []
         # Set (to the reason) when an encoder reading this image could not be
         # confirmed stopped: the image is then left attached, never detached
         self.keep_attached: Optional[str] = None
+        # A Ctrl-C stopped the detach: the image may still be attached
+        self.detach_interrupted = False
 
     def __enter__(self) -> Optional[Path]:
         """Mount the ISO and return the most relevant mount point"""
@@ -398,13 +425,12 @@ class ISOMount:
                 log(colorize("yellow", f"ISO mounted {len(self.mount_points)} volumes: "
                                        + ", ".join(str(p) for p in self.mount_points)))
                 for candidate in self.mount_points:
-                    try:
-                        has_video_ts = any(item.is_dir() and item.name.upper() == "VIDEO_TS"
-                                           for item in candidate.iterdir())
-                    except OSError:
-                        # Unlistable root (e.g. mode --x on recorder-authored
-                        # UDF): probe the standard path by name instead
-                        has_video_ts = (candidate / "VIDEO_TS").is_dir()
+                    has_video_ts, problem = self._has_video_ts(candidate)
+                    if problem:
+                        self.selection_error = (f"could not check volume {candidate} for "
+                                                f"VIDEO_TS: {problem}")
+                        log(colorize("red", self.selection_error))
+                        break
                     if has_video_ts:
                         self.mount_point = candidate
                         log(colorize("cyan", f"Using volume containing VIDEO_TS: {candidate}"))
@@ -420,6 +446,29 @@ class ISOMount:
             log(colorize("red", f"Unexpected error mounting ISO: {e}"))
             return None
 
+    @staticmethod
+    def _has_video_ts(volume: Path) -> Tuple[bool, Optional[str]]:
+        """(True, None) when the volume holds a VIDEO_TS folder, (False, None)
+        when it does not, or (False, reason) when that could not be checked:
+        only "no such file" counts as absent, and a VIDEO_TS that was listed
+        but is then not found cannot be trusted either"""
+        try:
+            listed = [item for item in volume.iterdir() if item.name.upper() == "VIDEO_TS"]
+            names_listed = True
+        except OSError:
+            # Unlistable root (e.g. mode --x on recorder-authored UDF):
+            # probe the standard path by name instead
+            listed, names_listed = [volume / "VIDEO_TS"], False
+        for item in listed:
+            st, problem = inspect_path(item, follow_symlinks=True)
+            if problem:
+                return False, f"{item}: {problem}"
+            if st is None and names_listed:
+                return False, f"{item} was listed but then not found"
+            if st is not None and stat.S_ISDIR(st.st_mode):
+                return True, None
+        return False, None
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Unmount the ISO (all volumes for multi-session images).
 
@@ -429,50 +478,89 @@ class ISOMount:
 
         With keep_attached set, nothing is detached (no forced detach, no
         device fallback, no leak sweep): an encoder that may still be reading
-        this image keeps its source, and the operator resolves it."""
+        this image keeps its source, and the operator resolves it.
+
+        Ctrl-C is not held over hdiutil (it has no timeout): one that arrives
+        while detaching stops the detach and is recorded (detach_interrupted,
+        and a detach_errors note that the image may still be attached), not
+        raised. A mount point that cannot be checked is still detached."""
         if self.keep_attached:
             log(colorize("red", f"Warning: leaving {self.iso_path.name} attached at "
                                 f"{', '.join(str(p) for p in self.mount_points) or 'no mount point'}"
                                 f" ({', '.join(self.devices) or 'no device'}): {self.keep_attached}"))
             return
-        detached_any = False
-        for mount_point in self.mount_points:
-            if not mount_point.exists():
-                detached_any = True  # an earlier detach already released this volume
-                continue
-            try:
-                run_cmd(["hdiutil", "detach", str(mount_point), "-force"])
-                log(colorize("green", f"Unmounted: {mount_point}"))
-                detached_any = True
-            except subprocess.CalledProcessError as e:
-                log(colorize("yellow", f"Warning: Failed to unmount cleanly: {e}"))
-                # Fall back to detaching the backing device(s) directly
+        try:
+            detached_any = False
+            for mount_point in self.mount_points:
+                present, problem = inspect_path(mount_point)
+                if present is None and problem is None:
+                    detached_any = True  # an earlier detach already released this volume
+                    continue
+                try:
+                    run_cmd(["hdiutil", "detach", str(mount_point), "-force"])
+                    log(colorize("green", f"Unmounted: {mount_point}"))
+                    detached_any = True
+                except subprocess.CalledProcessError as e:
+                    log(colorize("yellow", f"Warning: Failed to unmount cleanly: {e}"))
+                    # Fall back to detaching the backing device(s) directly
+                    for device in self.devices:
+                        try:
+                            run_cmd(["hdiutil", "detach", device, "-force"])
+                            detached_any = True
+                        except Exception as fallback_error:
+                            msg = f"failed to detach {device}: {fallback_error}"
+                            log(colorize("yellow", f"Warning: fallback {msg}"))
+                            self.detach_errors.append(f"unmount of {self.iso_path.name}: {msg}")
+
+            # Leak sweep: if the image attached devices but exposed NO mount points
+            # (e.g. a raw session macOS would not auto-mount), the loop above never
+            # released them. Detach by device so they do not accumulate across a batch.
+            if not detached_any and self.devices:
                 for device in self.devices:
                     try:
                         run_cmd(["hdiutil", "detach", device, "-force"])
-                        detached_any = True
-                    except Exception as fallback_error:
-                        msg = f"failed to detach {device}: {fallback_error}"
-                        log(colorize("yellow", f"Warning: fallback {msg}"))
+                        log(colorize("green", f"Detached leaked device: {device}"))
+                    except Exception as e:
+                        msg = f"failed to detach leaked device {device}: {e}"
+                        log(colorize("yellow", f"Warning: {msg}"))
                         self.detach_errors.append(f"unmount of {self.iso_path.name}: {msg}")
-
-        # Leak sweep: if the image attached devices but exposed NO mount points
-        # (e.g. a raw session macOS would not auto-mount), the loop above never
-        # released them. Detach by device so they do not accumulate across a batch.
-        if not detached_any and self.devices:
-            for device in self.devices:
-                try:
-                    run_cmd(["hdiutil", "detach", device, "-force"])
-                    log(colorize("green", f"Detached leaked device: {device}"))
-                except Exception as e:
-                    msg = f"failed to detach leaked device {device}: {e}"
-                    log(colorize("yellow", f"Warning: {msg}"))
-                    self.detach_errors.append(f"unmount of {self.iso_path.name}: {msg}")
+        except KeyboardInterrupt:
+            self.detach_interrupted = True
+            msg = (f"unmount of {self.iso_path.name}: interrupted by operator (Ctrl-C); it may "
+                   f"still be attached at "
+                   f"{', '.join(str(p) for p in self.mount_points) or 'no mount point'}"
+                   f" ({', '.join(self.devices) or 'no device'}): check with hdiutil info")
+            self.detach_errors.append(msg)
+            log(colorize("red", f"Warning: {msg}"))
 
 ### === CONTENT ANALYSIS ===
 
+class InventoryError(Exception):
+    """An entry that decides the disc type could not be checked, or was
+    listed and then not found: the inventory cannot be trusted"""
+
+
+def _inventory_check(path: Path, listed: bool) -> Optional[os.stat_result]:
+    """What path is, following links; None when it does not exist (only
+    "no such file" counts as that). Raises InventoryError when the check
+    fails, or when a listed entry is then not found."""
+    st, problem = inspect_path(path, follow_symlinks=True)
+    if problem:
+        raise InventoryError(f"could not inspect {path}: {problem}")
+    if st is None and listed:
+        raise InventoryError(f"{path} was listed but then not found")
+    return st
+
+
 def analyze_iso_content(mount_point: Path) -> DiscContentAnalysis:
-    """Analyze the content structure of a mounted ISO"""
+    """Analyze the content structure of a mounted ISO.
+
+    Folders are listed with Path.iterdir. Only what decides the disc type
+    is checked, once each and following links: a root entry named VIDEO_TS
+    or AUDIO_TS (any case), and each VOB, IFO and BUP file in VIDEO_TS.
+    Only "no such file" counts as absent: any other failed check, or a
+    listed entry that is then not found, is an analysis error, never a
+    missing entry. Other root entries are not checked."""
     analysis = DiscContentAnalysis()
     analysis.mount_point = mount_point
     
@@ -480,10 +568,11 @@ def analyze_iso_content(mount_point: Path) -> DiscContentAnalysis:
         # Check for VIDEO_TS folder (case-insensitive search)
         video_ts_path = None
         audio_ts_path = None
+        standard_names = ("VIDEO_TS", "AUDIO_TS")
 
         root_listable = True
         try:
-            entries = list(mount_point.iterdir())
+            entries = [p for p in mount_point.iterdir() if p.name.upper() in standard_names]
         except PermissionError:
             # Some recorder-authored UDF discs give the volume root search
             # permission but no read permission (mode --x), so it cannot be
@@ -492,35 +581,41 @@ def analyze_iso_content(mount_point: Path) -> DiscContentAnalysis:
             root_listable = False
             log(colorize("yellow", "Volume root is not listable (no read permission); "
                                    "probing standard VIDEO_TS/AUDIO_TS paths directly"))
-            entries = [p for p in (mount_point / "VIDEO_TS", mount_point / "AUDIO_TS")
-                       if p.is_dir()]
-            if not entries:
-                analysis.error = ("Volume root is unreadable and no VIDEO_TS or AUDIO_TS "
-                                  "directory was found at the standard paths")
-                analysis.disc_type = "error"
-                return analysis
+            entries = [mount_point / name for name in standard_names]
 
         for item in entries:
-            if item.is_dir():
-                if item.name.upper() == "VIDEO_TS":
-                    video_ts_path = item
-                    analysis.has_video_ts = True
-                elif item.name.upper() == "AUDIO_TS":
-                    audio_ts_path = item
-                    analysis.has_audio_ts = True
+            st = _inventory_check(item, listed=root_listable)
+            if st is None or not stat.S_ISDIR(st.st_mode):
+                continue
+            if item.name.upper() == "VIDEO_TS":
+                video_ts_path = item
+                analysis.has_video_ts = True
+            else:
+                audio_ts_path = item
+                analysis.has_audio_ts = True
+        if not root_listable and not (analysis.has_video_ts or analysis.has_audio_ts):
+            analysis.error = ("Volume root is unreadable and no VIDEO_TS or AUDIO_TS "
+                              "directory was found at the standard paths")
+            analysis.disc_type = "error"
+            return analysis
         
-        # Analyze VIDEO_TS content
+        # Analyze VIDEO_TS content (regular files only, as before)
         if video_ts_path:
             for file in video_ts_path.iterdir():
-                if file.is_file():
-                    suffix = file.suffix.upper()
-                    if suffix == ".VOB":
-                        analysis.vob_files.append(file)
-                        analysis.total_vob_size += file.stat().st_size
-                    elif suffix == ".IFO":
-                        analysis.ifo_files.append(file)
-                    elif suffix == ".BUP":
-                        analysis.bup_files.append(file)
+                suffix = file.suffix.upper()
+                if suffix not in (".VOB", ".IFO", ".BUP"):
+                    continue
+                st = _inventory_check(file, listed=True)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                if suffix == ".VOB":
+                    analysis.vob_files.append(file)
+                    analysis.vob_sizes[file] = st.st_size
+                    analysis.total_vob_size += st.st_size
+                elif suffix == ".IFO":
+                    analysis.ifo_files.append(file)
+                else:
+                    analysis.bup_files.append(file)
         
         # Determine disc type
         if analysis.has_video_ts and analysis.vob_files:
@@ -530,9 +625,11 @@ def analyze_iso_content(mount_point: Path) -> DiscContentAnalysis:
                 analysis.disc_type = "dvd_video"
         elif analysis.has_audio_ts:
             analysis.disc_type = "dvd_audio"
-        elif not root_listable:
-            # Root can't be enumerated, so we can't tell data from empty
-            analysis.disc_type = "data"
+        elif analysis.has_video_ts:
+            # IFO/BUP files only, or an empty VIDEO_TS: never "no VIDEO_TS"
+            # (an unlistable root ends in one of these branches: it has
+            # failed above when neither standard folder was found)
+            analysis.disc_type = "video_ts_without_vobs"
         else:
             # Check if there's any recognizable content
             file_count = sum(1 for _ in mount_point.rglob("*") if _.is_file())
@@ -555,15 +652,18 @@ def analyze_iso_content(mount_point: Path) -> DiscContentAnalysis:
 MENU_VOB_RE = re.compile(r'VTS_(\d+)_0\.VOB$', re.IGNORECASE)
 CONTENT_VOB_RE = re.compile(r'VTS_(\d+)_([1-9])\.VOB$', re.IGNORECASE)
 
-def plan_titlesets(vob_files: List[Path], output_dir: Path, iso_name: str
+def plan_titlesets(vob_files: List[Path], output_dir: Path, iso_name: str,
+                   sizes: Optional[Dict[Path, int]] = None
                    ) -> Tuple[List[TitlesetPlan], List[Path], List[Path]]:
     """Group content VOBs by titleset (VTS_NN) and assign output paths.
 
     Returns (plans, menu_vobs, unrecognized_vobs). The lowest-numbered
     content titleset is "main" and keeps the unsuffixed output name; others
     get _titleNN suffixes matching their VTS number. Titleset-aware only —
-    a titleset may still contain multiple programs/PGCs.
+    a titleset may still contain multiple programs/PGCs. Sizes come from
+    the inventory (sizes) when given; a VOB is never left out of them.
     """
+    sizes = sizes or {}
     groups: Dict[int, List[Path]] = {}
     menu_vobs: List[Path] = []
     unrecognized: List[Path] = []
@@ -598,10 +698,27 @@ def plan_titlesets(vob_files: List[Path], output_dir: Path, iso_name: str
             vts_number=vts,
             content_vobs=vobs,
             output_path=output,
-            total_size=sum(v.stat().st_size for v in vobs if v.exists()),
+            total_size=sum(sizes[v] if v in sizes else v.stat().st_size for v in vobs),
             is_main=is_main,
         ))
     return plans, menu_vobs, unrecognized
+
+def vob_number_gaps(plans: List[TitlesetPlan]) -> List[str]:
+    """Advisory warnings for titlesets whose content VOBs are not numbered
+    1..N. A gap is one sign that a VOB is missing from the image; no gap
+    proves nothing (a missing last VOB leaves none). Only names are
+    compared: this is not a DVD structure check, and it changes no outcome."""
+    gaps = []
+    for plan in plans:
+        if plan.vts_number == 0:
+            continue  # unrecognized names: there is no numbering to check
+        numbers = sorted({int(CONTENT_VOB_RE.match(v.name).group(2)) for v in plan.content_vobs})
+        missing = [n for n in range(1, numbers[-1] + 1) if n not in numbers]
+        if missing:
+            gaps.append(f"VTS_{plan.vts_number:02d}: content VOB numbering has a gap "
+                        f"(found {', '.join(map(str, numbers))}; "
+                        f"missing {', '.join(map(str, missing))})")
+    return gaps
 
 ### === FFMPEG OPERATIONS ===
 
@@ -846,8 +963,9 @@ def expected_titleset_duration(vobs: List[Path], ifo_path: Optional[Path]) -> Du
     first segment — usable only when every VOB measures (a partial sum can
     hide exactly the segment an encode dropped). Either is rejected when it
     implies an impossible DVD bitrate. An unusable IFO never blocks a usable
-    VOB fallback."""
-    total_bytes = sum(v.stat().st_size for v in vobs if v.exists())
+    VOB fallback. A VOB whose size cannot be read raises (the titleset then
+    fails); it is never left out of the bitrate check."""
+    total_bytes = sum(v.stat().st_size for v in vobs)
 
     def implied_bps(seconds: float) -> float:
         return total_bytes * 8 / seconds
@@ -971,12 +1089,16 @@ def get_video_info(target) -> Dict[str, Any]:
 ### === ENCODER LIFETIME ===
 
 class DeferredInterrupt:
-    """Hold Ctrl-C (SIGINT) for one short section: starting ffmpeg (until
-    its handle is assigned) or stopping it after a failure. A Ctrl-C that
-    arrives meanwhile only sets .received; the caller acts on it afterwards.
-    The previous handler is always restored. Off the main thread (where
-    handlers cannot be set) the section simply runs unprotected. A copy of
-    makeiso.py's helper: the scripts are standalone."""
+    """Hold Ctrl-C (SIGINT) for one short section of local work: starting
+    ffmpeg (until its handle is assigned), stopping it after a failure,
+    reserving a kept name, the promotion renames, and writing and renaming
+    the run records. Never over a native tool (hdiutil, ffprobe, ffmpeg
+    -version) or a whole conversion. A Ctrl-C that arrives meanwhile only
+    sets .received; the caller acts on it afterwards. The previous handler
+    is always restored. Holds never nest (an inner one would keep a Ctrl-C
+    from the outer). Off the main thread (where handlers cannot be set) the
+    section simply runs unprotected. A copy of makeiso.py's helper: the
+    scripts are standalone."""
 
     def __init__(self):
         self.received = False
@@ -1025,18 +1147,37 @@ def stop_encoder(process) -> Optional[str]:
     return "; ".join(problems)
 
 
-def inspect_path(path: Path) -> Tuple[Optional[os.stat_result], Optional[str]]:
+def inspect_path(path: Path, follow_symlinks: bool = False
+                 ) -> Tuple[Optional[os.stat_result], Optional[str]]:
     """(lstat result, None) when path exists, (None, None) when it does not
     (FileNotFoundError), or (None, reason) when the check itself failed - an
-    unknown location, never taken as absence."""
+    unknown location, never taken as absence. With follow_symlinks, the
+    same for what a symlink points to (os.stat): a dangling one is absent."""
     try:
-        return os.lstat(path), None
+        return (os.stat(path) if follow_symlinks else os.lstat(path)), None
     except FileNotFoundError:
         return None, None
     except OSError as e:
         return None, str(e)
 
+@dataclass
+class RecordFile:
+    """One run record this run opened for writing (see _record_file)"""
+    final: Path                      # the record's own name
+    path: Path                       # where it is written: a temp for the canonical pair
+    staged: bool                     # canonical: renamed to final once both are complete
+    identity: Optional[Tuple[int, int]] = None  # (st_dev, st_ino) of the file created
+    complete: bool = False           # written and closed without an error
+    committed: bool = False          # staged, and renamed into place
+
 ### === MAIN CONVERTER CLASS ===
+
+# Where a Ctrl-C landed, for the record (see _interrupted_result)
+ATTACH_PHASE = "while the ISO was being attached; it may be attached: check with hdiutil info"
+DETACH_PHASE = ("while the ISO was being detached; it may still be attached: "
+                "check with hdiutil info")
+# Why an ISO was aborted when the overwrite prompt got no answer (end of input)
+NO_ANSWER_ABORT = "No answer to the overwrite prompt (end of input); nothing was overwritten"
 
 class ISOToMP4Converter:
     """Main class for ISO to MP4 conversion operations"""
@@ -1047,20 +1188,52 @@ class ISOToMP4Converter:
         self.run: Optional[RunContext] = None
         self._token_suffix: Optional[str] = None
         self._mount: Optional[ISOMount] = None  # this run's own source mount
+        # What a Ctrl-C that escapes the conversion is settled from: the
+        # run's result once it exists, whether its outcome is decided, where
+        # the run was, and what it had found (set where each is assigned)
+        self._result: Optional[ConversionResult] = None
+        self._settled = False
+        self._phase = "before the conversion started"
+        self._entered = False  # convert() reached its boundary: this ISO has started
+        self._detach_merged = False
+        self._iso_size: Optional[int] = None
+        self._ffmpeg_checked = False
+        self._ffmpeg_version: Optional[str] = None
+        # Why the overwrite prompt did not go ahead: (error, interrupted)
+        self._overwrite_declined: Tuple[str, bool] = ("Aborted by operator to avoid overwrite", False)
+        # The records step (_write_run_records): what it gathered before any
+        # record file was opened (no native tool runs while one is open),
+        # the record files it opened, how far it got, what stopped it, and
+        # what it has to show
+        self._records_kind: Optional[str] = None
+        self._record_details: Optional[Dict[str, Any]] = None
+        self._record_files: List[RecordFile] = []
+        self._records_stage = "pending"  # pending | committed | recovered | finished
+        self._record_error: Optional[BaseException] = None
+        self._records_written: List[Path] = []
+        self._record_messages: List[Tuple[str, str]] = []
 
     def _run_token(self, kind: str = "failed") -> str:
         """One timestamp-and-random suffix per run names every non-canonical
         artifact — partials, review copies, failure/unverified/skip/dry-run
-        records — with a kind prefix (failed | unverified | aborted | skipped
-        | dryrun), so one attempt's evidence groups together and retries
-        never overwrite it"""
+        records, and the temporary files the canonical records are written
+        to — with a kind prefix (failed | unverified | aborted | skipped |
+        dryrun | writing), so one attempt's evidence groups together and
+        retries never overwrite it"""
         if self._token_suffix is None:
             self._token_suffix = (f"{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}"
                                   f"-{uuid4().hex[:6]}")
         return f"{kind}-{self._token_suffix}"
 
     def convert(self) -> ConversionResult:
-        """Main entry point for conversion"""
+        """Main entry point for conversion: the one place a run ends.
+
+        A Ctrl-C that escapes the conversion is settled from what the run
+        had recorded (_interrupted_result) instead of ending it. Then every
+        processed ISO gets a log and a manifest of some kind, unless the
+        record paths themselves failed the symlink guard (_finish_records).
+        Only a further Ctrl-C while an interruption is being settled can
+        leave here; the batch and main() stop on it."""
         self.start_time = datetime.datetime.now()
         self.run = RunContext(
             run_id=f"{self.start_time.strftime('%Y%m%dT%H%M%S')}_{self.config.operator}_{self.config.iso_name}",
@@ -1068,76 +1241,115 @@ class ISOToMP4Converter:
             start_time=self.start_time,
         )
 
-        result = self._convert_inner()
-
-        # Generate records — every processed ISO gets a log and a manifest of
-        # some kind, unless the record paths themselves failed the symlink guard.
-        # Record writing is best-effort: a filesystem failure here must not
-        # crash the run — but records are part of the deliverable, so a
-        # nominally-successful conversion whose records can't be written is
-        # reported as failed.
-        if not result.records_unsafe:
-            try:
-                if result.success and not result.skipped:
-                    self._generate_summary(result)
-                    self._create_log_file(result)
-                    self._create_manifest(result)
-                elif result.skipped and not result.error_message:
-                    # A skip or dry run describes only this attempt: its log
-                    # and manifest go under its own token, created new, so
-                    # they never write over another run's records
-                    token = self._run_token("dryrun" if self.config.dry_run else "skipped")
-                    self._create_skip_manifest(result, token)
-                    self._create_log_file(result, dry_run=self.config.dry_run, token=token)
-                elif result.error_message:
-                    token = self._run_token("aborted" if result.aborted else "failed")
-                    self._create_error_manifest(result, token)
-                    self._create_log_file(result, is_error=True, token=token)
-                elif result.unverified:
-                    # Nothing was promoted: records go under the run's token,
-                    # leaving any existing canonical log and manifest untouched
-                    token = self._run_token("unverified")
-                    self._create_error_manifest(result, token)
-                    self._create_log_file(result, is_error=True, token=token)
-            except Exception as record_error:
-                log(colorize("red", f"Could not write run records: {record_error}"))
-                if result.success or result.unverified:
-                    result.success = False
-                    result.unverified = False
-                    # A skip without its record is not a valid skip — clear the
-                    # flag so batch accounting counts this as a failure too
-                    result.skipped = False
-                    result.error_message = f"Run records could not be written: {record_error}"
-
+        try:
+            self._entered = True
+            result = self._convert_inner()
+        except KeyboardInterrupt:
+            result = self._interrupted_result()
+        self._finish_records(result)
         return result
 
-    def _check_symlinks(self, paths: List[Path]) -> Optional[str]:
-        """Refuse pre-existing symlinks at planned output paths (writing
-        through one could clobber an arbitrary file elsewhere)"""
-        linked = [p.name for p in paths if p.is_symlink()]
+    def _interrupted_result(self) -> ConversionResult:
+        """The run's result after a Ctrl-C escaped the conversion, from the
+        state recorded as it ran. A run whose outcome was already decided
+        keeps it, with the interruption added as a warning (a failure's
+        cause is never replaced). One interrupted before that is settled as
+        an interrupted encode is: nothing is promoted, and checked outputs
+        are kept as review copies. One interrupted before it had a result
+        fails, naming where the Ctrl-C landed. The batch stops after it."""
+        note = f"Interrupted by operator (Ctrl-C) {self._phase}"
+        result = self._result
+        if result is None:
+            result = ConversionResult(
+                success=False,
+                iso_path=self.config.iso_path,
+                source_size=self._iso_size or 0,
+                error_message=note,
+                interrupted=True
+            )
+        else:
+            result.interrupted = True
+            if not self._settled:
+                self._finish_titlesets(result)  # promotes nothing once interrupted
+                self._settle_outcome(result)
+            elif note not in result.warnings:
+                result.warnings.append(note)
+        if self._mount is not None:
+            self._merge_detach_errors(result, self._mount)
+        self._result, self._settled = result, True
+        if self.run:
+            self.run.mark("interrupted")
+        return result
+
+    def _merge_detach_errors(self, result: ConversionResult, mount):
+        """Surface any unmount failures into the record, once. A volume that
+        fails to detach (e.g. a handle still open) leaks an attached
+        /dev/diskN that can block later mounts in a batch, so it must be
+        visible, not just logged. A detach cut short by Ctrl-C also stops
+        the batch."""
+        if self._detach_merged:
+            return
+        self._detach_merged = True
+        result.warnings.extend(mount.detach_errors)
+        if getattr(mount, "detach_interrupted", False):  # test mounts may lack it
+            result.interrupted = True
+
+    def _check_output_paths(self, paths: List[Path]
+                            ) -> Tuple[Optional[str], Optional[str], List[Path]]:
+        """Check each planned output path once (lstat): returns (symlink
+        refusal, inspection refusal, the paths that exist). A pre-existing
+        symlink is refused (writing through one could clobber an arbitrary
+        file elsewhere), and so is a path that cannot be checked: only "no
+        such file" counts as absent, so an existing output is never
+        replaced without the overwrite prompt."""
+        linked, unchecked, existing = [], [], []
+        for p in paths:
+            st, problem = inspect_path(p)
+            if problem:
+                unchecked.append(f"could not check planned output {p.name}: {problem}")
+            elif st is not None:
+                existing.append(p)
+                if stat.S_ISLNK(st.st_mode):
+                    linked.append(p.name)
+        symlink_error = inspection_error = None
         if linked:
-            message = f"Symlink at planned output path(s): {', '.join(linked)}"
-            log(colorize("red", f"Refusing to continue: {message}"))
-            return message
-        return None
+            symlink_error = f"Symlink at planned output path(s): {', '.join(linked)}"
+            log(colorize("red", f"Refusing to continue: {symlink_error}"))
+        if unchecked:
+            inspection_error = "Inspection error: " + "; ".join(unchecked)
+            log(colorize("red", f"Refusing to continue: {inspection_error}"))
+        return symlink_error, inspection_error, existing
 
     def _convert_inner(self) -> ConversionResult:
         """Conversion flow; every return path gets records via convert()"""
-        # Validate ISO exists
-        if not self.config.iso_path.exists():
+        # Check the ISO once (following a symlink): only "no such file" is
+        # "not found"; a check that fails, or anything but a regular file,
+        # stops the run before anything is attached. The same check gives
+        # the size every record (dependency failures below included) carries
+        iso_st, problem = inspect_path(self.config.iso_path, follow_symlinks=True)
+        if problem or iso_st is None or not stat.S_ISREG(iso_st.st_mode):
+            if problem:
+                error = f"Inspection error: could not check ISO {self.config.iso_path}: {problem}"
+            elif iso_st is None:
+                error = f"ISO file not found: {self.config.iso_path}"
+            else:
+                error = (f"Not a regular file (a folder, FIFO, device or socket), so not "
+                         f"attached: {self.config.iso_path}")
             return ConversionResult(
                 success=False,
                 iso_path=self.config.iso_path,
-                error_message=f"ISO file not found: {self.config.iso_path}"
+                error_message=error
             )
-
-        # Stat the source early so every record (including dependency
-        # failures below) carries the real ISO size
-        iso_size = self.config.iso_path.stat().st_size
+        iso_size = iso_st.st_size
+        self._iso_size = iso_size
 
         # Dependencies: ffmpeg (encode) AND ffprobe (analysis/verification)
-        # are both required before any disc activity
+        # are both required before any disc activity. The version found here
+        # is the one the records give (no native tool runs while they are
+        # written)
+        self._phase = "while ffmpeg and ffprobe were being checked"
         ffmpeg_available, ffmpeg_version = check_ffmpeg()
+        self._ffmpeg_checked, self._ffmpeg_version = True, ffmpeg_version
         if not ffmpeg_available:
             return ConversionResult(
                 success=False,
@@ -1154,21 +1366,23 @@ class ISOToMP4Converter:
                 error_message="ffprobe not found (it ships with ffmpeg). Please install ffmpeg."
             )
         log(colorize("cyan", f"Using ffmpeg version: {ffmpeg_version}"))
+        self._phase = "before the ISO was attached"
 
-        # Symlink guard, phase 1: statically-known record/output paths.
+        # Output path guard, phase 1: statically-known record/output paths.
         # (Per-title MP4 paths are guarded after titleset planning; failure,
         # skip and dry-run records use unpredictable tokened names and need
-        # no guard.)
+        # no guard, so a path that cannot be checked still gets them.)
         static_paths = [self.config.mp4_path, self.config.log_path,
                         self.config.manifest_path]
-        symlink_error = self._check_symlinks(static_paths)
-        if symlink_error:
+        symlink_error, inspection_error, _ = self._check_output_paths(static_paths)
+        if symlink_error or inspection_error:
             return ConversionResult(
                 success=False,
                 iso_path=self.config.iso_path,
                 source_size=iso_size,
-                error_message=symlink_error,
-                records_unsafe=True  # record paths themselves are suspect
+                error_message="; ".join(m for m in (symlink_error, inspection_error) if m),
+                # A symlink makes the record paths themselves suspect
+                records_unsafe=bool(symlink_error)
             )
 
         log(colorize("cyan", f"ISO size: {format_bytes(iso_size)}"))
@@ -1180,8 +1394,23 @@ class ISOToMP4Converter:
 
         mount = ISOMount(self.config.iso_path)
         self._mount = mount
+        self._phase = ATTACH_PHASE
         with mount as mount_point:
-            if not mount_point:
+            self._phase = "during the disc analysis"
+            # A volume whose VIDEO_TS could not be checked (test mounts may
+            # lack the attribute): the right volume is unknown, so nothing
+            # is analysed or encoded
+            selection_error = getattr(mount, "selection_error", None)
+            if selection_error:
+                error = f"Analysis error: {selection_error}"
+                log(colorize("red", f"{error} — nothing planned or encoded"))
+                result = ConversionResult(
+                    success=False,
+                    iso_path=self.config.iso_path,
+                    source_size=iso_size,
+                    error_message=error
+                )
+            elif not mount_point:
                 result = ConversionResult(
                     success=False,
                     iso_path=self.config.iso_path,
@@ -1195,8 +1424,9 @@ class ISOToMP4Converter:
                 analysis = analyze_iso_content(mount_point)
 
                 # An analysis error means the inventory may be incomplete
-                # (e.g. the VIDEO_TS listing failed partway), so it is never
-                # logged, planned or encoded as if it were complete
+                # (e.g. the VIDEO_TS listing failed partway, or a VOB, IFO
+                # or BUP file could not be checked), so it is never logged,
+                # planned or encoded as if it were complete
                 analysis_failed = analysis.error is not None or analysis.disc_type == "error"
                 if not analysis_failed:
                     self._log_analysis(analysis)
@@ -1215,6 +1445,10 @@ class ISOToMP4Converter:
                 elif not analysis.has_video_ts or not analysis.vob_files:
                     skip_reason = self._get_skip_reason(analysis)
                     log(colorize("yellow", f"Skipping: {skip_reason}"))
+                    if analysis.has_video_ts and not analysis.vob_files:
+                        # A VOB-less VIDEO_TS (with or without AUDIO_TS): say
+                        # what to check, not only why nothing was converted
+                        log(colorize("yellow", self._get_skip_recommendation(analysis, skip_reason)))
 
                     # Analysis errors should be counted as failures, not skips
                     is_error = analysis.disc_type == "error"
@@ -1232,23 +1466,25 @@ class ISOToMP4Converter:
                     # Plan titlesets (titleset-aware: grouped by VTS number;
                     # a titleset may still contain multiple programs/PGCs)
                     plans, menu_vobs, unrecognized = plan_titlesets(
-                        analysis.vob_files, self.config.output_dir, self.config.iso_name)
+                        analysis.vob_files, self.config.output_dir, self.config.iso_name,
+                        analysis.vob_sizes)
                     self._log_titleset_plan(plans, menu_vobs, unrecognized)
 
-                    existing_outputs = [] if self.config.dry_run else \
-                        [p.output_path for p in plans if p.output_path.exists()]
+                    # Output path guard, phase 2: per-title output paths are
+                    # only knowable now that titlesets are planned. The same
+                    # check finds the outputs the overwrite prompt is about
+                    output_symlink_error, output_inspection_error, existing = \
+                        self._check_output_paths([p.output_path for p in plans])
+                    existing_outputs = [] if self.config.dry_run else existing
 
-                    # Symlink guard, phase 2: per-title output paths are only
-                    # knowable now that titlesets are planned
-                    output_symlink_error = self._check_symlinks([p.output_path for p in plans])
-
-                    if output_symlink_error:
+                    if output_symlink_error or output_inspection_error:
                         result = ConversionResult(
                             success=False,
                             iso_path=self.config.iso_path,
                             source_size=iso_size,
                             disc_analysis=analysis,
-                            error_message=output_symlink_error
+                            error_message="; ".join(m for m in (output_symlink_error,
+                                                                output_inspection_error) if m)
                         )
                     elif not plans:
                         # Menu-only structure: skip, never convert menus
@@ -1263,13 +1499,15 @@ class ISOToMP4Converter:
                             skip_reason=skip_reason
                         )
                     elif existing_outputs and not self._confirm_overwrite(existing_outputs):
+                        error, interrupted = self._overwrite_declined
                         result = ConversionResult(
                             success=False,
                             iso_path=self.config.iso_path,
                             source_size=iso_size,
                             disc_analysis=analysis,
                             aborted=True,
-                            error_message="Aborted by operator to avoid overwrite"
+                            interrupted=interrupted,
+                            error_message=error
                         )
                     elif self.config.dry_run:
                         log(colorize("cyan", "Dry run:") + " " +
@@ -1285,19 +1523,20 @@ class ISOToMP4Converter:
                             titles=[TitleOutput(vts_number=p.vts_number,
                                                 output_path=p.output_path,
                                                 status="planned")
-                                    for p in plans]
+                                    for p in plans],
+                            warnings=vob_number_gaps(plans)
                         )
                     else:
                         # Create output directory (only for actual conversion)
                         self.config.output_dir.mkdir(parents=True, exist_ok=True)
                         result = self._perform_conversion(analysis, iso_size, plans, unrecognized)
+            if result is not self._result:
+                # Every other outcome is decided when it is built
+                self._result, self._settled = result, True
+            self._phase = DETACH_PHASE
+        self._phase = "after the ISO was detached"
 
-        # Surface any unmount failures into the record. A volume that fails to
-        # detach (e.g. a handle still open) leaks an attached /dev/diskN that can
-        # block later mounts in a batch, so it must be visible, not just logged.
-        if mount.detach_errors:
-            result.warnings.extend(mount.detach_errors)
-
+        self._merge_detach_errors(result, mount)
         self.run.mark("detach")
         return result
     
@@ -1311,9 +1550,11 @@ class ISOToMP4Converter:
             log(colorize("cyan", f"VOB files found: {len(analysis.vob_files)}"))
             log(colorize("cyan", f"Total VOB size: {format_bytes(analysis.total_vob_size)}"))
             
-            # Log VOB files to file only
+            # Log VOB files to file only, with the sizes the inventory found
             for vob in analysis.vob_files:
-                log(colorize("cyan", f"  VOB: {vob.name} ({format_bytes(vob.stat().st_size)})"))
+                size = analysis.vob_sizes.get(vob)
+                log(colorize("cyan", f"  VOB: {vob.name} "
+                                     f"({'size not recorded' if size is None else format_bytes(size)})"))
         
         if analysis.ifo_files:
             log(colorize("cyan", f"IFO files found: {len(analysis.ifo_files)}"))
@@ -1326,22 +1567,42 @@ class ISOToMP4Converter:
         if analysis.disc_type == "data":
             return "Data disc (no VIDEO_TS folder)"
         elif analysis.disc_type == "dvd_audio":
+            if analysis.has_video_ts:
+                return (f"DVD-Audio disc (AUDIO_TS; its VIDEO_TS has no VOB files: "
+                        f"{len(analysis.ifo_files)} IFO, {len(analysis.bup_files)} BUP)")
             return "DVD-Audio disc (AUDIO_TS only, no VIDEO_TS)"
+        elif analysis.disc_type == "video_ts_without_vobs":
+            return (f"No VOB files found in VIDEO_TS ({len(analysis.ifo_files)} IFO, "
+                    f"{len(analysis.bup_files)} BUP); nothing to convert")
         elif analysis.disc_type == "empty":
             return "Empty or unreadable disc"
         elif analysis.disc_type == "error":
             return f"Analysis error: {analysis.error}"
-        elif not analysis.vob_files:
-            return "No VOB files found in VIDEO_TS"
         else:
             return "Unknown reason"
     
     def _confirm_overwrite(self, existing_paths: List[Path]) -> bool:
-        """Confirm overwrite of pre-existing planned outputs"""
+        """Confirm overwrite of pre-existing planned outputs: only "y" goes
+        ahead. No answer (end of input, as in an unattended run) counts as
+        "n"; Ctrl-C cancels, and also stops a batch. Why it did not go ahead
+        is left in self._overwrite_declined (error, interrupted)."""
         names = ", ".join(p.name for p in existing_paths)
-        response = get_input(colorize("yellow",
-            f"Output exists ({names}). Overwrite? (y/n): "))
-        return response.lower() == 'y'
+        try:
+            response = input(colorize("yellow",
+                f"Output exists ({names}). Overwrite? (y/n): ")).strip()
+        except EOFError:
+            self._overwrite_declined = (NO_ANSWER_ABORT, False)
+            log(colorize("yellow", "\nNo answer (end of input): not overwriting."))
+            return False
+        except KeyboardInterrupt:
+            self._overwrite_declined = ("Cancelled at the overwrite prompt (Ctrl-C); "
+                                        "nothing was overwritten", True)
+            log(colorize("red", "\nCancelled by user."))
+            return False
+        if response.lower() == 'y':
+            return True
+        self._overwrite_declined = ("Aborted by operator to avoid overwrite", False)
+        return False
 
     def _log_titleset_plan(self, plans: List[TitlesetPlan], menu_vobs: List[Path],
                            unrecognized: List[Path]):
@@ -1357,6 +1618,8 @@ class ISOToMP4Converter:
         if unrecognized:
             log(colorize("yellow", "Unrecognized VOB name(s), not converted: "
                                    + ", ".join(v.name for v in unrecognized)))
+        for gap in vob_number_gaps(plans):
+            log(colorize("yellow", f"Warning: {gap} (advisory; the outcome is unchanged)"))
     
     def _perform_conversion(self, analysis: DiscContentAnalysis, iso_size: int,
                             plans: List[TitlesetPlan],
@@ -1377,25 +1640,29 @@ class ISOToMP4Converter:
             iso_path=self.config.iso_path,
             source_size=iso_size,
             disc_analysis=analysis,
+            # Every planned titleset is recorded, attempted or not
+            titles=[TitleOutput(vts_number=p.vts_number, output_path=p.output_path)
+                    for p in plans],
         )
+        self._result, self._phase = result, "during the conversion"
 
         if unrecognized_vobs:
             names = ", ".join(v.name for v in unrecognized_vobs)
             result.warnings.append(f"unrecognized VOB name(s) not converted: {names}")
+        result.warnings.extend(vob_number_gaps(plans))  # advisory: no outcome change
 
-        # Every planned titleset is recorded, attempted or not
-        result.titles = [TitleOutput(vts_number=p.vts_number, output_path=p.output_path)
-                         for p in plans]
         for plan, title in zip(plans, result.titles):
             label = "main title" if plan.is_main else f"title {plan.vts_number:02d}"
             log_divider(f"Encoding {label} → {plan.output_path.name}")
 
             # A titleset that does not pass blocks promotion of the whole
             # ISO, but remaining titlesets are still attempted so the record
-            # is complete. Ctrl-C stops here: the interrupted title is
-            # recorded as failed and remaining titlesets stay "not_attempted".
-            # So does an ffmpeg that could not be confirmed stopped
-            # (cleanup_incomplete): nothing more may run beside it.
+            # is complete. Ctrl-C stops here: a title interrupted while it
+            # encodes is recorded as failed (one interrupted while its encode
+            # is being prepared stays "not_attempted"), and remaining
+            # titlesets stay "not_attempted". So does an ffmpeg that could
+            # not be confirmed stopped (cleanup_incomplete): nothing more may
+            # run beside it.
             try:
                 # Source stream inventory (first content VOB is representative)
                 source_counts = probe_stream_counts(plan.content_vobs[0]) or {}
@@ -1433,7 +1700,16 @@ class ISOToMP4Converter:
             result.conversion_time += title.encode_time
 
         self._finish_titlesets(result)
+        self._settle_outcome(result)
+        self._settled, self._phase = True, "while the titleset outcomes were being shown"
+        self._log_title_outcomes(result)
+        return result
 
+    def _settle_outcome(self, result: ConversionResult):
+        """Decide the run's outcome once its titlesets are finished. It may
+        run again for the same result (after a Ctrl-C) and adds each warning
+        once. A Ctrl-C fails the run only if it stopped work: once every
+        titleset is promoted it is a warning and the outcome stands."""
         # Mirror the main title into the legacy top-level fields so existing
         # log/manifest consumers keep working — only for a file this run
         # actually promoted to the final name
@@ -1454,9 +1730,11 @@ class ISOToMP4Converter:
                         where += f" (last known at {t.retained_path})"
                 else:
                     where = f"it is at {t.retained_path}" if t.retained_path else "it was not found"
-                result.warnings.append(f"{t.output_path.name}: output could not be kept under "
-                                       f"its {'.partial' if t.status == 'failed' else 'review'} "
-                                       f"name ({t.retention_error}); {where}")
+                warning = (f"{t.output_path.name}: output could not be kept under "
+                           f"its {'.partial' if t.status == 'failed' else 'review'} "
+                           f"name ({t.retention_error}); {where}")
+                if warning not in result.warnings:
+                    result.warnings.append(warning)
 
         # Run outcome: failure outranks unverified
         errors = [f"{t.output_path.name}: {t.error}" for t in result.titles if t.status == "failed"]
@@ -1467,7 +1745,12 @@ class ISOToMP4Converter:
             errors.append(f"encoder cleanup incomplete: ffmpeg (pid {details.get('pid')}) could "
                           f"not be confirmed stopped; the batch stops and the source stays attached")
         if result.interrupted and not any("Interrupted" in e for e in errors):
-            errors.append("Interrupted by operator (Ctrl-C)")
+            if result.titles and all(t.status == "completed" for t in result.titles):
+                if not any("Interrupted" in w for w in result.warnings):
+                    result.warnings.append("Interrupted by operator (Ctrl-C) after every "
+                                           "titleset was promoted")
+            else:
+                errors.append("Interrupted by operator (Ctrl-C)")
         if errors:
             result.success = False
             result.error_message = "; ".join(errors)
@@ -1477,8 +1760,6 @@ class ISOToMP4Converter:
             result.unverified_reason = "; ".join(
                 f"{t.output_path.name}: {t.duration_check_reason}"
                 for t in result.titles if t.status == "unverified")
-        self._log_title_outcomes(result)
-        return result
 
     def _finish_titlesets(self, result: ConversionResult):
         """Deferred promotion: the ISO's MP4s get their final names only when
@@ -1513,8 +1794,11 @@ class ISOToMP4Converter:
                 title.hold_reason = f"duration check passed, but not promoted: {why}"
             else:
                 title.status = "unverified"
-            # Until it is moved, the output is wherever it was encoded
-            title.retained_path, title.retained_as = title.temp_path, "encoding_temp"
+            # Until it is moved, the output is wherever it was encoded, unless
+            # an interrupted promotion left its location unverified (that
+            # finding stands until a check finds the output)
+            if not title.location_unverified:
+                title.retained_path, title.retained_as = title.temp_path, "encoding_temp"
         for title in remaining:
             try:
                 self._retain_attempt(title, title.temp_path, "unverified")
@@ -1527,44 +1811,84 @@ class ISOToMP4Converter:
     def _promote_titlesets(self, result: ConversionResult):
         """Give every passed titleset its final name, in plan order.
 
-        This is not one atomic transaction: if a rename fails or is
-        interrupted, promotion stops, the run fails and the records name
-        exactly which final files this run changed. There is no rollback."""
+        Ctrl-C is held across these renames (no native tool runs among
+        them) and acknowledged once they are done: the run then keeps its
+        outcome, with the interruption as a warning. This is not one atomic
+        transaction: if a rename fails, or a final name or temp file cannot
+        be checked before its rename (only "no such file" counts as absent),
+        promotion stops before that rename, the run fails and the records
+        name exactly which final files this run changed. There is no
+        rollback. A Ctrl-C that still reaches a rename (raised directly, or
+        off the main thread, where nothing can be held) stops promotion too,
+        once where that output is has been settled by device and inode,
+        never by name."""
         if self.run:
             self.run.mark("promotion")
-        for title in result.titles:
-            existed = os.path.lexists(title.output_path)
-            try:
-                os.replace(title.temp_path, title.output_path)
-            except KeyboardInterrupt:
-                result.interrupted = True
-                if not os.path.lexists(title.temp_path):  # the rename completed first
+        held = DeferredInterrupt()
+        with held:
+            for title in result.titles:
+                final, problem = inspect_path(title.output_path)
+                if problem:
+                    result.promotion_error = (f"{title.output_path.name}: could not check the "
+                                              f"final name before promotion ({problem}); "
+                                              f"not promoted")
+                    break
+                existed = final is not None
+                source, problem = inspect_path(title.temp_path)
+                if problem:
+                    result.promotion_error = (f"{title.output_path.name}: could not check "
+                                              f"{title.temp_path} ({problem}); not promoted")
+                    break
+                try:
+                    os.replace(title.temp_path, title.output_path)
                     self._mark_promoted(title, existed)
-                result.promotion_error = "Interrupted by operator (Ctrl-C) during promotion"
-                break
-            except OSError as e:
-                result.promotion_error = (f"{title.output_path.name}: could not be promoted "
-                                          f"to its final name: {e}")
-                break
+                except KeyboardInterrupt:
+                    result.interrupted = True
+                    if source is not None:  # else there was nothing to rename
+                        self._reconcile_promotion(title, existed, source, result)
+                    result.promotion_error = "Interrupted by operator (Ctrl-C) during promotion"
+                    break
+                except OSError as e:
+                    result.promotion_error = (f"{title.output_path.name}: could not be promoted "
+                                              f"to its final name: {e}")
+                    break
+        if held.received:
+            result.interrupted = True
+            if not result.promotion_error:
+                result.warnings.append("Interrupted by operator (Ctrl-C) during promotion; "
+                                       "it was held until every titleset was promoted")
+        if result.promotion_error:
+            log(colorize("red", f"Promotion stopped: {result.promotion_error}"))
+
+    def _reconcile_promotion(self, title: TitleOutput, existed: bool,
+                             source: os.stat_result, result: ConversionResult):
+        """After an interrupted promotion rename: the title is promoted only
+        if its final name now holds the output (same device and inode). A
+        location that cannot be verified is recorded as such, and a final
+        name that could not be checked is named as possibly replaced. A temp
+        name found not to hold the output is never recorded as its location
+        (as in _retain_attempt)."""
+        where, problems = self._located_after_move(title.temp_path, title.output_path, source)
+        if where == "target":
             self._mark_promoted(title, existed)
-        else:
-            return
-        log(colorize("red", f"Promotion stopped: {result.promotion_error}"))
-        changed = result.canonical_files_changed
-        if changed:
-            names = ", ".join(p.name for p in changed)
-            old_records = [p.name for p in (self.config.manifest_path, self.config.log_path)
-                           if p.exists()]
-            if old_records:
-                result.warnings.append(
-                    f"this run replaced or created {names} but stopped before writing its "
-                    f"own records: the existing {' and '.join(old_records)} describe an "
-                    f"earlier run and no longer match {'it' if len(changed) == 1 else 'them'}")
+        elif where is None:
+            if title.temp_path not in problems:  # the temp name is known not to hold it
+                title.retained_path, title.retained_as = None, None
+            if problems:
+                title.retention_error = (
+                    f"location could not be verified after an interrupted promotion to "
+                    f"{title.output_path} (candidates {title.temp_path}, {title.output_path}): "
+                    + "; ".join(f"{p}: {e}" for p, e in problems.items()))
+                title.location_unverified = True
             else:
-                result.warnings.append(
-                    f"this run replaced or created {names} but stopped before writing its "
-                    f"own records: no canonical manifest describes "
-                    f"{'it' if len(changed) == 1 else 'them'} (see this run's failure records)")
+                title.retention_error = (f"after an interrupted promotion, neither "
+                                         f"{title.temp_path} nor {title.output_path} holds this "
+                                         f"output")
+            if title.output_path in problems:
+                title.final_name_unverified = True
+                result.warnings.append(f"{title.output_path.name} may have been replaced by this "
+                                       f"run: its promotion was interrupted and it could not be "
+                                       f"checked afterwards")
 
     @staticmethod
     def _mark_promoted(title: TitleOutput, existed: bool):
@@ -1627,17 +1951,37 @@ class ISOToMP4Converter:
         for attempt in range(RETENTION_ATTEMPTS):
             name = f"{base}{extension}" if attempt == 0 else f"{base}-{uuid4().hex[:6]}{extension}"
             target = path.with_name(name)
-            try:
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            except FileExistsError:
-                continue
-            except OSError as e:
-                error = f"could not reserve {name}: {e}"
+            # Ctrl-C is held while the name is reserved, so a placeholder is
+            # never left without its identity; one that came is acted on
+            # once this attempt's own placeholder is removed again
+            fd, reserved, reserve_error, held = None, None, None, DeferredInterrupt()
+            with held:
+                try:
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except FileExistsError:
+                    pass
+                except OSError as e:
+                    reserve_error = e
+                if fd is not None:
+                    try:
+                        reserved = os.fstat(fd)
+                    finally:
+                        os.close(fd)
+            if held.received:
+                leftover = self._remove_reservation(target, reserved) if reserved is not None else ""
+                if leftover and self._result is not None:
+                    # An empty placeholder could not be removed: say so
+                    note = (f"{title.output_path.name}: after a Ctrl-C while its kept name was "
+                            f"reserved, {leftover.strip()[1:-1]}")
+                    if note not in self._result.warnings:
+                        self._result.warnings.append(note)
+                    log(colorize("yellow", f"Warning: {note}"))
+                raise KeyboardInterrupt
+            if reserve_error is not None:
+                error = f"could not reserve {name}: {reserve_error}"
                 break
-            try:
-                reserved = os.fstat(fd)
-            finally:
-                os.close(fd)
+            if fd is None:
+                continue
             try:
                 os.replace(path, target)
                 title.retained_path, title.retained_as = target, kept_as
@@ -1815,10 +2159,14 @@ class ISOToMP4Converter:
                         else "could not be kept under its review name")
                 log(colorize("yellow", f"  {what}: {t.retention_error}"))
         if result.titles and not all(t.status == "completed" for t in result.titles):
-            if result.canonical_files_changed:
+            changed, uncertain = result.canonical_files_changed, result.canonical_files_uncertain
+            if changed:
                 log(colorize("red", "Final MP4s changed by this run: "
-                                    + ", ".join(p.name for p in result.canonical_files_changed)))
-            else:
+                                    + ", ".join(p.name for p in changed)))
+            if uncertain:
+                log(colorize("red", "Final MP4s this run may have replaced (could not be "
+                                    "checked): " + ", ".join(p.name for p in uncertain)))
+            if not changed and not uncertain:
                 log(colorize("yellow", "Nothing was promoted: existing final MP4s and records "
                                        "were left as they were."))
             if any(t.retained_as == "review_copy" for t in result.titles):
@@ -1837,16 +2185,21 @@ class ISOToMP4Converter:
         # Encode to a run-private temp path; the final name is only ever
         # written by an atomic replace() after every titleset of the ISO
         # passes. ffmpeg never opens the final path, so a failed retry cannot
-        # damage a pre-existing good file there.
+        # damage a pre-existing good file there. A name whose check fails is
+        # never taken as free (the titleset then fails before ffmpeg starts).
         while True:
             temp_path = plan.output_path.with_name(
                 f"{plan.output_path.stem}.encoding-{uuid4().hex[:6]}.mp4")
-            if not temp_path.exists():
+            taken, problem = inspect_path(temp_path, follow_symlinks=True)
+            if problem:
+                raise OSError(f"could not check {temp_path}: {problem}")
+            if taken is None:
                 break
 
         concat_input = "concat:" + "|".join(str(v) for v in plan.content_vobs)
         ffmpeg_cmd = [
             "ffmpeg",
+            "-nostdin",  # hardening: no terminal input (stdin is /dev/null too)
             "-y",  # Overwrite output
             "-i", concat_input,
             "-map", "0:v:0",   # first video stream
@@ -1861,7 +2214,7 @@ class ISOToMP4Converter:
             "-pix_fmt", "yuv420p",  # Compatibility
             str(temp_path)
         ]
-        log(colorize("cyan", "Command:") + " " + colorize("yellow", " ".join(ffmpeg_cmd)))
+        log(colorize("cyan", "Command:") + " " + colorize("yellow", shlex.join(ffmpeg_cmd)))
 
         process = None                   # None = no ffmpeg acquired by this run
         launch_hold = DeferredInterrupt()
@@ -1870,13 +2223,16 @@ class ISOToMP4Converter:
             # Run ffmpeg with progress output. stdout is discarded rather than
             # piped: we only read stderr below, and an unread stdout pipe could
             # fill its OS buffer and deadlock the encode if ffmpeg ever writes to
-            # it (no reader would drain it). Ctrl-C is held only until the
-            # handle is assigned, then acted on, so a started ffmpeg is always
-            # stopped by the handler below. Undecodable stderr bytes are
-            # replaced rather than raising (cleanup does not depend on this).
+            # it (no reader would drain it). stdin is /dev/null (DEVNULL, with
+            # -nostdin), as hardening: ffmpeg never reads the operator's
+            # terminal. Ctrl-C is held only until the handle is assigned,
+            # then acted on, so a started ffmpeg is always stopped by the
+            # handler below. Undecodable stderr bytes are replaced rather
+            # than raising (cleanup does not depend on this).
             with launch_hold:
                 process = subprocess.Popen(
                     ffmpeg_cmd,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     universal_newlines=True,
@@ -1919,19 +2275,26 @@ class ISOToMP4Converter:
             title.encode_time = time.time() - encode_start
 
             if process.returncode != 0:
-                stderr_text = "".join(stderr_output)
-                log(colorize("red", f"ffmpeg error:\n{stderr_text}"))
+                # The cause is recorded before the (possibly long) error
+                # output is shown, so a Ctrl-C meanwhile cannot replace it
                 title.status = "failed"
                 title.error = f"ffmpeg failed with return code {process.returncode}"
+                stderr_text = "".join(stderr_output)
+                log(colorize("red", f"ffmpeg error:\n{stderr_text}"))
                 self._retain_attempt(title, temp_path, "failed")
                 return
 
         except KeyboardInterrupt:
             # The cause is recorded first, so the record stays truthful
-            # whatever happens while ffmpeg is being stopped
+            # whatever happens while ffmpeg is being stopped; a cause already
+            # recorded is kept, with the interruption added
             title.encode_time = time.time() - encode_start
-            title.status = "failed"
-            title.error = "Interrupted by operator (Ctrl-C)"
+            if title.status == "failed" and title.error:
+                if "Interrupted by operator" not in title.error:
+                    title.error = f"{title.error}; then Interrupted by operator (Ctrl-C)"
+            else:
+                title.status = "failed"
+                title.error = "Interrupted by operator (Ctrl-C)"
             log(colorize("red", "\nConversion interrupted by user."))
             self._stop_failed_encode(title, temp_path, process, result)
             raise
@@ -1956,12 +2319,21 @@ class ISOToMP4Converter:
         name = plan.output_path.name
         stage = "verification"
         try:
-            if not temp_path.exists():
+            # Only "no such file" means it was not created: a check that
+            # fails leaves its location unknown, and the record says so
+            output, problem = inspect_path(temp_path, follow_symlinks=True)
+            if problem:
+                title.status = "failed"
+                title.error = f"post-encode {stage} failed: could not check {temp_path}: {problem}"
+                log(colorize("red", f"{name}: {title.error}"))
+                self._retain_attempt(title, temp_path, "failed")
+                return
+            if output is None:
                 title.status = "failed"
                 title.error = "Output file was not created"
                 return
 
-            title.output_size = temp_path.stat().st_size
+            title.output_size = output.st_size
             if title.output_size == 0:
                 title.status = "failed"
                 title.error = "Output file is empty"
@@ -2008,8 +2380,12 @@ class ISOToMP4Converter:
                     f"{name}: checksum calculation failed — no fixity recorded")
 
         except KeyboardInterrupt:
-            title.status = "failed"
-            title.error = f"Interrupted by operator (Ctrl-C) during post-encode {stage}"
+            interruption = f"Interrupted by operator (Ctrl-C) during post-encode {stage}"
+            if title.status == "failed" and title.error:  # never replace a recorded cause
+                title.error = f"{title.error}; then {interruption}"
+            else:
+                title.status = "failed"
+                title.error = interruption
             self._retain_attempt(title, temp_path, "failed")
             raise
         except Exception as e:
@@ -2066,6 +2442,332 @@ class ISOToMP4Converter:
         return (self.config.output_dir / f"{stem}.log.txt",
                 self.config.output_dir / f"{stem}_manifest.json")
 
+    ### --- run records ---
+
+    def _record_kind(self, result: ConversionResult) -> Optional[str]:
+        """Which records a result gets: "canonical" (the final log and
+        manifest), or a pair under the run's token of that kind; None when
+        the record paths themselves failed the symlink guard"""
+        if result.records_unsafe:
+            return None
+        if result.success and not result.skipped:
+            return "canonical"
+        if result.skipped and not result.error_message:
+            # A skip or dry run describes only this attempt: its log and
+            # manifest go under its own token, created new, so they never
+            # write over another run's records
+            return "dryrun" if self.config.dry_run else "skipped"
+        if result.error_message:
+            return "aborted" if result.aborted else "failed"
+        if result.unverified:
+            # Nothing was promoted: records go under the run's token,
+            # leaving any existing canonical log and manifest untouched
+            return "unverified"
+        return None
+
+    def _finish_records(self, result: ConversionResult):
+        """Write the run's records (_write_run_records). A Ctrl-C that lands
+        between its held steps is noted (the batch stops) and the steps not
+        yet done run once more; a further one is left to the batch and
+        main()."""
+        try:
+            self._write_run_records(result)
+        except KeyboardInterrupt:
+            result.interrupted = True
+            self._write_run_records(result)
+
+    def _write_run_records(self, result: ConversionResult):
+        """Every processed ISO gets a log and a manifest of some kind, log
+        first, unless the record paths themselves failed the symlink guard.
+        Record writing must not crash the run, but records are part of the
+        deliverable: a run whose records cannot be written fails.
+
+        1. What only a native tool can tell (the ffmpeg version, if it was
+           not checked at the start; for the access manifest, ffprobe's view
+           of the promoted MP4 and the processor name) is gathered first,
+           with Ctrl-C not held: one there leaves the rest out, with a
+           warning, and stops the batch.
+        2. The records are written with Ctrl-C held. The canonical log and
+           manifest go to temporary files beside them, renamed into place
+           only once both are complete, log first, so an error, a Ctrl-C or
+           a killed process never leaves either half-written under its
+           final name (nothing is flushed to the storage: a power loss, or a
+           volume that does not rename atomically, is not covered). The
+           pair is still not one transaction: the log can be renamed into
+           place and the manifest fail. Tokened records are written at
+           their own names.
+        3. If that fails, this run's own temporary, incomplete and orphaned
+           record files are removed (nothing else), and the run fails.
+           Unless failure records were what failed, it then writes
+           failed-<token> records, naming any canonical records that no
+           longer match the MP4s it promoted. Anything that could not be
+           written or removed is listed on screen.
+        4. The outcome is shown; a Ctrl-C there only cuts it short."""
+        if self._records_kind is None:
+            self._records_kind = self._record_kind(result)
+        kind = self._records_kind
+        if kind is None:
+            return  # the record paths themselves failed the symlink guard
+        if self._record_details is None:
+            self._gather_record_details(result, kind)
+        if self._records_stage == "pending":
+            token = None if kind == "canonical" else self._run_token(kind)
+            held = DeferredInterrupt()
+            with held:
+                if kind != "canonical":
+                    self._add_stale_records_warning(result, [])
+                self._record_error, self._records_written = self._commit_records(result, kind, token)
+                self._records_stage = "committed"
+            if held.received:
+                result.interrupted = True
+                self._record_messages.append(
+                    ("yellow", "Ctrl-C was received while the run records were being written; "
+                               "it was held until they were finished."))
+        if self._records_stage == "committed":
+            held = DeferredInterrupt()
+            with held:
+                if self._record_error is None:
+                    self._record_messages.extend(self._saved_messages(kind))
+                else:
+                    self._recover_records(result, kind)
+                self._records_stage = "recovered"
+            if held.received:
+                result.interrupted = True
+        if self._records_stage == "recovered":
+            self._records_stage = "finished"
+            self._report_records(result)
+
+    def _gather_record_details(self, result: ConversionResult, kind: Optional[str]):
+        """What the records need from native tools, gathered before any
+        record file is opened and with Ctrl-C not held (they have no
+        timeout). These details are optional: one whose tool fails (any
+        error) is left out with a warning naming the cause, and a Ctrl-C
+        here leaves out what is still missing, with a warning, and stops
+        the batch; the records are written all the same."""
+        details: Dict[str, Any] = {"ffmpeg_version": self._ffmpeg_version}
+        wanted = [] if self._ffmpeg_checked else ["ffmpeg version"]
+        if kind == "canonical":
+            wanted += ["video technical information", "processor"]
+        done = []
+        try:
+            for item in wanted:
+                try:
+                    if item == "ffmpeg version":
+                        details["ffmpeg_version"] = check_ffmpeg()[1]
+                    elif item == "processor":
+                        details["processor"] = platform.processor()
+                    else:
+                        details["video_info"] = (get_video_info(result.mp4_path)
+                                                 if result.mp4_path else {})
+                except Exception as e:
+                    result.warnings.append(f"{item} not gathered for the records: "
+                                           f"{str(e) or type(e).__name__}")
+                done.append(item)
+        except KeyboardInterrupt:
+            result.interrupted = True
+            missing = [item for item in wanted if item not in done]
+            result.warnings.append(f"{' and '.join(missing)} not gathered for the records: "
+                                   f"interrupted by operator (Ctrl-C)")
+        self._record_details = details
+
+    @contextlib.contextmanager
+    def _record_file(self, path: Path, mode: str = "w"):
+        """Open one run record for writing, as open(path, mode) would. The
+        canonical log and manifest are written to a temporary file beside
+        them, <name>.writing-<token>.tmp, that the commit renames into
+        place; other records are written at their own (tokened) names, "x"
+        creating them new. Each file is noted with the identity it was
+        created with, so this run can remove its own temporary, incomplete
+        or orphaned records, and never anything else."""
+        staged = path in (self.config.log_path, self.config.manifest_path)
+        target = path.with_name(f"{path.name}.{self._run_token('writing')}.tmp") if staged else path
+        exclusive = staged or mode == "x"
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC),
+                     0o666)
+        record = RecordFile(final=path, path=target, staged=staged)
+        self._record_files.append(record)
+        try:
+            st = os.fstat(fd)
+            record.identity = (st.st_dev, st.st_ino)
+            f = open(fd, "w")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            yield f
+        record.complete = True
+
+    def _commit_records(self, result: ConversionResult, kind: str,
+                        token: Optional[str]) -> Tuple[Optional[BaseException], List[Path]]:
+        """Write one log and manifest, log first, with Ctrl-C held by the
+        caller; the canonical pair is then renamed into place, log first.
+        Returns what stopped it, if anything (a KeyboardInterrupt here was
+        raised directly, not held), and the canonical records renamed."""
+        self._record_files = []
+        written: List[Path] = []
+        try:
+            if kind == "canonical":
+                self._create_log_file(result)
+                self._create_manifest(result)
+                for record in self._record_files:
+                    if record.staged:
+                        os.replace(record.path, record.final)
+                        record.committed = True
+                        written.append(record.final)
+            elif kind in ("skipped", "dryrun"):
+                self._create_log_file(result, dry_run=self.config.dry_run, token=token)
+                self._create_skip_manifest(result, token)
+            else:
+                self._create_log_file(result, is_error=True, token=token)
+                self._create_error_manifest(result, token)
+        except (Exception, KeyboardInterrupt) as e:
+            return e, written
+        return None, written
+
+    def _saved_messages(self, kind: str) -> List[Tuple[str, str]]:
+        """Where each record of a completed write is, for the screen"""
+        label = {"canonical": "Manifest", "skipped": "Skip manifest",
+                 "dryrun": "Dry-run manifest", "aborted": "Aborted manifest",
+                 "unverified": "Unverified manifest"}.get(kind, "Error manifest")
+        return [("cyan", f"{label if r.final.name.endswith('_manifest.json') else 'Log'} "
+                         f"saved to: {r.final}") for r in self._record_files]
+
+    def _recover_records(self, result: ConversionResult, kind: str):
+        """After a record write failed (Ctrl-C held by the caller): remove
+        this run's own leftovers, fail the run, and write failed-<token>
+        records instead, unless failure records were what failed. What
+        cannot be recorded is listed on screen."""
+        error = self._record_error
+        if isinstance(error, KeyboardInterrupt):
+            result.interrupted = True
+        reason = "interrupted by operator (Ctrl-C)" if isinstance(error, KeyboardInterrupt) else str(error)
+        self._record_messages.append(("red", f"Could not write run records: {reason}"))
+        failure_records = kind in ("failed", "aborted")
+        # A pair that failure records replace goes entirely; complete failure
+        # records are kept, as the only record of this run
+        leftovers = self._discard_records(keep_complete=failure_records)
+        if result.success or result.unverified:
+            result.success = False
+            result.unverified = False
+            # A skip without its record is not a valid skip — clear the
+            # flag so batch accounting counts this as a failure too
+            result.skipped = False
+            result.error_message = f"Run records could not be written: {reason}"
+        if failure_records:
+            self._record_messages.append(("red", f"Not recorded: {result.error_message}"))
+            self._report_unrecorded(result, leftovers)
+            return
+        if kind == "canonical":
+            self._add_stale_records_warning(result, self._records_written)
+        result.warnings.extend(leftovers)
+        token = self._run_token("failed")
+        fallback_error, _ = self._commit_records(result, "failed", token)
+        if fallback_error is None:
+            self._record_messages.extend(self._saved_messages("failed"))
+            return
+        if isinstance(fallback_error, KeyboardInterrupt):
+            result.interrupted = True
+            fallback_reason = "interrupted by operator (Ctrl-C)"
+        else:
+            fallback_reason = str(fallback_error)
+        self._record_messages.append(("red", f"Could not write failure records either: "
+                                             f"{fallback_reason}"))
+        self._report_unrecorded(result, self._discard_records(keep_complete=True))
+
+    def _discard_records(self, keep_complete: bool) -> List[str]:
+        """Remove this run's own files from a record write that failed:
+        every temporary or incomplete one, and complete ones too unless
+        keep_complete. A file is removed only while it is still the one this
+        run created (same device and inode). Returns a note for each one
+        that is left, or that could not be checked."""
+        notes = []
+        for record in self._record_files:
+            if record.committed or (keep_complete and record.complete):
+                continue
+            current, problem = inspect_path(record.path)
+            what = f"{record.path}, from this run's record write that failed (not a record)"
+            if problem:
+                notes.append(f"could not check {what}: {problem}")
+                continue
+            if current is None or (record.identity is not None and (
+                    (current.st_dev, current.st_ino) != record.identity
+                    or not stat.S_ISREG(current.st_mode))):
+                continue  # gone, or not this run's file any more: left alone
+            if record.identity is None:
+                notes.append(f"{what} was left: it could not be identified as this run's own")
+                continue
+            try:
+                os.unlink(record.path)
+            except OSError as e:
+                notes.append(f"{what} could not be removed: {e}")
+        return notes
+
+    def _report_unrecorded(self, result: ConversionResult, leftovers: List[str]):
+        """No records could be written for this run: put on screen what they
+        would have said (its warnings), its record files that are left, and
+        where its MP4s and kept outputs are"""
+        for note in result.warnings + leftovers:
+            self._record_messages.append(("red", f"Not recorded: {note}"))
+        for record in self._record_files:
+            if record.complete and not record.staged and inspect_path(record.path)[0] is not None:
+                self._record_messages.append(("red", f"Written, without the rest of its "
+                                                     f"records: {record.path}"))
+        for t in result.titles:
+            if t.promoted_this_run:
+                self._record_messages.append(("red", f"Promoted by this run: {t.output_path}"))
+            elif t.retained_path or t.location_unverified:
+                where = (f"location unknown ({t.retention_error})" if t.location_unverified
+                         else f"kept as {t.retained_path}")
+                self._record_messages.append(("red", f"{t.output_path.name}: {where}"))
+
+    def _add_stale_records_warning(self, result: ConversionResult, written: List[Path]):
+        """When this run promoted MP4s but did not write both canonical
+        records, warn which records no longer match them: each canonical
+        record is named as written by this run, from an earlier run, absent
+        or not checkable (only "no such file" counts as absent)"""
+        changed = result.canonical_files_changed
+        canonical = (self.config.manifest_path, self.config.log_path)
+        if not changed or all(p in written for p in canonical):
+            return
+        them = "it" if len(changed) == 1 else "them"
+        parts, earlier = [], []
+        for path in canonical:
+            if path in written:
+                parts.append(f"{path.name} was written by this run")
+                continue
+            current, problem = inspect_path(path)
+            if problem:
+                parts.append(f"{path.name} could not be checked ({problem})")
+            elif current is not None:
+                earlier.append(path.name)
+            elif path == self.config.manifest_path:
+                parts.append(f"no canonical manifest describes {them}")
+            else:
+                parts.append("there is no canonical log")
+        if earlier:
+            parts.append(f"the existing {' and '.join(earlier)} "
+                         + (f"describes an earlier run and no longer matches {them}"
+                            if len(earlier) == 1 else
+                            f"describe an earlier run and no longer match {them}"))
+        what = ("stopped before writing its own records" if self._records_kind != "canonical"
+                else "could not write its own canonical records")
+        warning = (f"this run replaced or created {', '.join(p.name for p in changed)} but "
+                   f"{what}: {'; '.join(parts)}")
+        if warning not in result.warnings:
+            result.warnings.append(warning)
+
+    def _report_records(self, result: ConversionResult):
+        """Show what the records step found, then a success's summary. The
+        records are final by now, so a Ctrl-C here only cuts this short
+        (and stops the batch)."""
+        try:
+            for colour, message in self._record_messages:
+                log(colorize(colour, message))
+            if result.success and not result.skipped:
+                self._generate_summary(result)
+        except KeyboardInterrupt:
+            result.interrupted = True
+
     def _earlier_skip_records(self) -> List[str]:
         """Skip and dry-run records left under the old fixed names (see
         ConversionConfig), for success records to name; one that cannot be
@@ -2089,16 +2791,18 @@ class ISOToMP4Converter:
         Failure/aborted/unverified, skip and dry-run logs are written under
         the run's token so such a run never overwrites the log a prior
         success manifest references (nor an earlier failure's or skip's
-        log). A skip or dry-run log is created new, never over a file."""
+        log). A skip or dry-run log is created new, never over a file. The
+        canonical log is written to a temporary file (see _record_file)."""
         log_path = self._token_records(token)[0] if token else self.config.log_path
         skip_record = bool(token) and result.skipped and not is_error
+        details = self._record_details or {}
     
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
     
         end_time = datetime.datetime.now()
         total_duration = (end_time - self.start_time).total_seconds()
         
-        with open(log_path, "x" if skip_record else "w") as f:
+        with self._record_file(log_path, "x" if skip_record else "w") as f:
             f.write("=" * 70 + "\n")
             if dry_run:
                 f.write("ISO TO MP4 ACCESS COPY CONVERSION LOG (DRY RUN)\n")
@@ -2147,10 +2851,14 @@ class ISOToMP4Converter:
             if result.unverified_reason:
                 f.write(f"Unverified:       {result.unverified_reason}\n")
             if result.titles and not dry_run and not result.success:
-                changed = result.canonical_files_changed
-                f.write("Final MP4s:       "
-                        + (("changed by this run: " + ", ".join(p.name for p in changed))
-                           if changed else "none promoted or changed by this run") + "\n")
+                changed, uncertain = result.canonical_files_changed, result.canonical_files_uncertain
+                final_mp4s = ("changed by this run: " + ", ".join(p.name for p in changed) if changed
+                              else "none confirmed promoted or changed by this run" if uncertain
+                              else "none promoted or changed by this run")
+                if uncertain:
+                    final_mp4s += (f"; {', '.join(p.name for p in uncertain)} may have been "
+                                   f"replaced (could not be checked)")
+                f.write(f"Final MP4s:       {final_mp4s}\n")
                 if any(t.retained_as == "review_copy" for t in result.titles):
                     f.write("Note:             review copies (*.mp4.unverified) are not deliverables\n")
             for warning in result.warnings:
@@ -2274,15 +2982,13 @@ class ISOToMP4Converter:
             f.write(f"Machine:          {platform.machine()}\n")
             f.write(f"Python Version:   {platform.python_version()}\n")
             
-            ffmpeg_available, ffmpeg_version = check_ffmpeg()
-            f.write(f"FFmpeg Version:   {ffmpeg_version}\n")
+            # As found at the start of the run (no native tool runs here)
+            f.write(f"FFmpeg Version:   {details.get('ffmpeg_version', self._ffmpeg_version)}\n")
             f.write(f"Tool Version:     v1.0\n\n")
             
             f.write("=" * 70 + "\n")
             f.write(f"Log generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 70 + "\n")
-        
-        log(colorize("cyan", f"Log saved to: {log_path}"))
     
     def _run_identity(self, now: datetime.datetime) -> Dict[str, str]:
         """Shared run_id/uuid for all record writers"""
@@ -2353,14 +3059,13 @@ class ISOToMP4Converter:
         }
 
     def _create_manifest(self, result: ConversionResult):
-        """Create comprehensive JSON manifest"""
+        """Create comprehensive JSON manifest, from what was gathered before
+        it is written (see _gather_record_details), to a temporary file
+        renamed into place once complete (see _record_file)"""
         now = datetime.datetime.now()
-        
-        # Get ffmpeg version
-        _, ffmpeg_version = check_ffmpeg()
-        
-        # Get video info
-        video_info = get_video_info(result.mp4_path) if result.mp4_path else {}
+        details = self._record_details or {}
+        ffmpeg_version = details.get("ffmpeg_version", self._ffmpeg_version)
+        video_info = details.get("video_info") or {}
         
         manifest = {
             "conversion_metadata": {
@@ -2440,7 +3145,7 @@ class ISOToMP4Converter:
                 "operating_system": platform.system(),
                 "os_version": platform.release(),
                 "machine_architecture": platform.machine(),
-                "processor": platform.processor(),
+                "processor": details.get("processor"),
                 "python_version": platform.python_version(),
                 "ffmpeg_version": ffmpeg_version
             },
@@ -2466,10 +3171,8 @@ class ISOToMP4Converter:
             }
         }
         
-        with open(self.config.manifest_path, "w") as f:
+        with self._record_file(self.config.manifest_path) as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
-        
-        log(colorize("cyan", f"Manifest saved to: {self.config.manifest_path}"))
     
     def _create_skip_manifest(self, result: ConversionResult, token: str):
         """Create manifest for skipped files (and dry runs), under the run's
@@ -2524,10 +3227,8 @@ class ISOToMP4Converter:
         }
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(manifest_path, "x") as f:
+        with self._record_file(manifest_path, "x") as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
-
-        log(colorize("cyan", f"{'Dry-run' if self.config.dry_run else 'Skip'} manifest saved to: {manifest_path}"))
     
     def _create_error_manifest(self, result: ConversionResult, failure_token: str):
         """Create manifest for failed, operator-aborted or unverified conversions.
@@ -2585,7 +3286,9 @@ class ISOToMP4Converter:
             "titlesets": self._titlesets_section(result),
 
             "archival_notes": {
-                "note": ("Conversion aborted by operator before any encoding"
+                "note": (("No answer to the overwrite prompt (end of input), so nothing was "
+                          "encoded or overwritten" if result.error_message == NO_ANSWER_ABORT
+                          else "Conversion aborted by operator before any encoding")
                          if result.aborted else
                          ("Nothing was promoted: at least one titleset could not be "
                           "verified. Existing final MP4s and records were left as they "
@@ -2599,11 +3302,8 @@ class ISOToMP4Converter:
         manifest_path = self.config.output_dir / f"{self.config.iso_name}_{failure_token}_manifest.json"
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(manifest_path, "w") as f:
+        with self._record_file(manifest_path) as f:
             json.dump(manifest, f, indent=2, sort_keys=False)
-
-        label = "Aborted" if result.aborted else ("Unverified" if result.unverified else "Error")
-        log(colorize("cyan", f"{label} manifest saved to: {manifest_path}"))
     
     def _get_skip_recommendation(self, analysis: Optional[DiscContentAnalysis],
                                  skip_reason: Optional[str] = None) -> str:
@@ -2625,8 +3325,17 @@ class ISOToMP4Converter:
             return "DVD-Video disc with AUDIO_TS - ready for conversion (video only)"
         elif analysis.disc_type == "data":
             return "Data disc - consider alternate extraction method (file copy)"
+        elif analysis.disc_type == "dvd_audio" and analysis.has_video_ts:
+            # DVD-Video discs often carry an empty AUDIO_TS, so this may be an
+            # incomplete DVD-Video image as much as a DVD-Audio disc
+            return ("DVD-Audio disc, or an incomplete DVD-Video image: its VIDEO_TS has no VOB "
+                    "files - verify the ISO and check the source disc; a DVD-Audio disc "
+                    "requires specialized audio extraction tools")
         elif analysis.disc_type == "dvd_audio":
             return "DVD-Audio disc - requires specialized audio extraction tools"
+        elif analysis.disc_type == "video_ts_without_vobs":
+            return ("VIDEO_TS has no VOB files - the image may be incomplete or unfinalized: "
+                    "verify the ISO and check the source disc")
         elif analysis.disc_type == "empty":
             return "Empty or unreadable disc - verify ISO integrity"
         else:
@@ -2683,33 +3392,291 @@ def _access_dir_name(iso_path: Path) -> str:
 # makeiso.py keeps a replaced preservation bundle, unchanged and with its
 # canonical file names, in <filename>_overwritten-<YYYYmmddTHHMMSS>-<6 hex>/
 ARCHIVE_FOLDER_RE = re.compile(r".+_overwritten-\d{8}T\d{6}-[0-9a-f]{6}")
+# makeiso.py's in-progress (or abandoned) copy of a disc, never a verified
+# master: <filename>_attempt-<YYYYmmddTHHMMSS>-<6 hex>.iso
+ATTEMPT_ISO_RE = re.compile(r".+_attempt-\d{8}T\d{6}-[0-9a-f]{6}")
+# A symlink target that is not there: dangling, or a path component is a file
+TARGET_MISSING = (errno.ENOENT, errno.ENOTDIR)
 
-def _in_archive_folder(iso_path: Path, iso_dir: Path) -> bool:
-    """True when an ISO sits inside a makeiso.py archive folder below the
-    batch root. Those are superseded masters with the current master's file
-    name: converting them would write access copies inside the archive
-    folder, or, with -o, collide with the current master's access folder."""
-    return any(ARCHIVE_FOLDER_RE.fullmatch(part)
-               for part in iso_path.relative_to(iso_dir).parts[:-1])
+@dataclass
+class BatchDiscovery:
+    """What a batch search found (see find_batch_isos). Paths are as
+    reached from the batch folder, never resolved."""
+    isos: List[Path] = field(default_factory=list)       # masters to process, in order
+    archived: List[Path] = field(default_factory=list)   # superseded masters in archive folders
+    not_masters: List[Tuple[Path, str]] = field(default_factory=list)  # listed, never processed
+    notes: List[Tuple[Path, str]] = field(default_factory=list)        # not searched; exit unaffected
+    problems: List[Tuple[Path, str]] = field(default_factory=list)     # incomplete search or refused ISO
+
+def _reason(e: OSError) -> str:
+    """An OSError as "[Errno N] text", without the path the listing names"""
+    return f"[Errno {e.errno}] {e.strerror}" if e.errno and e.strerror else str(e)
+
+def _not_a_master(name: str) -> Optional[str]:
+    """Why a batch never converts an .iso of this name, or None. By name
+    only, so nothing is opened"""
+    if name.startswith("._"):
+        return "macOS AppleDouble metadata file (._*), not a master"
+    if ATTEMPT_ISO_RE.fullmatch(Path(name).stem):
+        return "makeiso.py attempt ISO (*_attempt-<stamp>-<random>.iso), not a verified master"
+    return None
+
+def find_batch_isos(iso_dir: Path) -> BatchDiscovery:
+    """Find the ISOs a batch converts, listing every folder one at a time
+    (os.scandir) and recording, instead of skipping, anything that leaves
+    the search incomplete: a batch folder that cannot be checked or
+    listed, a folder that cannot be listed or whose listing stops partway
+    (the entries already read are still used), an entry that cannot be
+    inspected or disappears, a folder loop, an .iso symlink whose target
+    is missing or cannot be checked, and an .iso that is not a regular file
+    (FIFO, device or socket: never opened). A given symlinked batch folder
+    is followed; symlinked folders inside it never are (they are notes),
+    while an .iso symlink to a regular file is converted. A folder named
+    *.iso is searched, never taken as an ISO.
+
+    Superseded masters in makeiso.py archive folders (*_overwritten-*/) are
+    listed, not converted: converting them would write access copies inside
+    the archive folder, or, with -o, collide with the current master's
+    access folder. Nothing there is converted, so a part of one that
+    cannot be searched is a note, not a problem. AppleDouble (._*) and
+    makeiso.py attempt ISOs are listed as not masters (-i still converts
+    one). No folder is exempt by name."""
+    found = BatchDiscovery()
+    try:
+        root_st = os.stat(iso_dir)
+    except FileNotFoundError:
+        found.problems.append((iso_dir, "batch folder not found"))
+        return found
+    except OSError as e:
+        found.problems.append((iso_dir, f"could not check the batch folder: {_reason(e)}"))
+        return found
+    if not stat.S_ISDIR(root_st.st_mode):
+        found.problems.append((iso_dir, "not a folder; give the folder that holds the ISOs"))
+        return found
+    # (folder, inside an archive folder, its ancestors' identities, their paths)
+    stack = [(iso_dir, False, ((root_st.st_dev, root_st.st_ino),), (iso_dir,))]
+    while stack:
+        folder, archived, chain, chain_paths = stack.pop()
+        report = found.notes if archived else found.problems
+        where = " (inside a makeiso.py archive folder; nothing there is converted)" if archived else ""
+        try:
+            listing = os.scandir(folder)
+        except FileNotFoundError:
+            report.append((folder, "folder disappeared during the search" + where))
+            continue
+        except OSError as e:
+            report.append((folder, f"could not list folder: {_reason(e)}" + where))
+            continue
+        entries = []
+        with listing:
+            while True:
+                try:
+                    entry = next(listing)
+                except StopIteration:
+                    break
+                except OSError as e:
+                    report.append((folder, f"listing stopped partway: {_reason(e)}" + where))
+                    break
+                entries.append(entry)  # used even if the listing fails later
+        for entry in entries:
+            path = folder / entry.name
+            is_iso = path.suffix.lower() == ".iso"
+            if not is_iso:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        continue  # an ordinary file: nothing to find in it
+                except OSError:
+                    pass  # the lstat below says what it is, or why it cannot be inspected
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                report.append((path, "entry disappeared during the search" + where))
+                continue
+            except OSError as e:
+                report.append((path, f"could not inspect entry: {_reason(e)}" + where))
+                continue
+            if stat.S_ISDIR(st.st_mode):  # every real folder, whatever its name
+                identity = (st.st_dev, st.st_ino)
+                if identity in chain:
+                    report.append((path, f"folder loop: the same folder as "
+                                         f"{chain_paths[chain.index(identity)]}" + where))
+                else:
+                    stack.append((path, archived or bool(ARCHIVE_FOLDER_RE.fullmatch(entry.name)),
+                                  chain + (identity,), chain_paths + (path,)))
+                continue
+            if stat.S_ISLNK(st.st_mode) and not is_iso:
+                # Never followed; one to a folder (or to what cannot be
+                # checked) is listed, since what it holds is not searched
+                try:
+                    target_mode = os.stat(path).st_mode
+                except OSError as e:
+                    detail = ("its target is missing" if e.errno in TARGET_MISSING
+                              else f"its target could not be checked: {_reason(e)}")
+                    found.notes.append((path, f"symlink not followed -> {_link_text(path)}; {detail}"))
+                    continue
+                if stat.S_ISDIR(target_mode):
+                    found.notes.append((path, f"symlinked folder not followed -> {_link_text(path)}"))
+                continue
+            if not is_iso:
+                continue  # nothing to find in it
+            if archived:
+                found.archived.append(path)
+                continue
+            why = _not_a_master(entry.name)
+            if why:
+                found.not_masters.append((path, why))
+                continue
+            mode = st.st_mode
+            if stat.S_ISLNK(mode):
+                try:
+                    mode = os.stat(path).st_mode
+                except OSError as e:
+                    # Unclassified, so never handed on: it could be a FIFO or device
+                    if e.errno in TARGET_MISSING:
+                        detail = f"symlink target missing -> {_link_text(path)}; not processed"
+                    else:
+                        detail = (f"could not inspect the symlink's target -> {_link_text(path)}: "
+                                  f"{_reason(e)}; not processed")
+                    found.problems.append((path, detail))
+                    continue
+                if stat.S_ISDIR(mode):
+                    found.notes.append((path, f"symlinked folder not followed -> {_link_text(path)}"))
+                    continue
+            if stat.S_ISREG(mode):
+                found.isos.append(path)
+            else:
+                found.problems.append((path, "not a regular file (FIFO, device or socket); "
+                                             "not processed"))
+    found.isos.sort()
+    found.archived.sort()
+    for listed in (found.not_masters, found.notes, found.problems):
+        listed.sort()
+    return found
+
+def _link_text(path: Path) -> str:
+    """What a symlink says it points to, for a listing"""
+    try:
+        return os.readlink(path)
+    except OSError:
+        return "?"
+
+def _batch_output_dir(iso_path: Path, iso_dir: Path, output_dir: Path) -> Path:
+    """An ISO's access folder: beside the ISO by default, or under
+    output_dir if one was given"""
+    base = output_dir if output_dir != iso_dir else iso_path.parent
+    return base / _access_dir_name(iso_path)
+
+def _log_discovery(iso_dir: Path, found: BatchDiscovery):
+    """What the search left out, and why, before anything is processed"""
+    def shown(path: Path) -> str:
+        return str(path) if path == iso_dir else str(path.relative_to(iso_dir))
+
+    if found.archived:
+        log(colorize("yellow", f"Skipping {len(found.archived)} superseded ISO(s) in makeiso.py "
+                               f"archive folders (*_overwritten-*/; convert one with -i if needed):"))
+        for p in found.archived:
+            log(colorize("yellow", f"  {shown(p)}"))
+    if found.not_masters:
+        log(colorize("yellow", f"Skipping {len(found.not_masters)} file(s) that are not masters "
+                               f"(convert one with -i if needed):"))
+        for p, why in found.not_masters:
+            log(colorize("yellow", f"  {shown(p)}: {why}"))
+    if found.notes:
+        log(colorize("yellow", f"Not searched ({len(found.notes)}): symlinked folders inside the "
+                               f"batch folder are not followed (give one itself with --batch), and "
+                               f"nothing in a makeiso.py archive folder is converted:"))
+        for p, detail in found.notes:
+            log(colorize("yellow", f"  {shown(p)}: {detail}"))
+    if found.problems:
+        log(colorize("red", f"Search incomplete or ISO refused ({len(found.problems)}); the ISOs "
+                            f"found are still processed, and the batch exits 1 unless a Ctrl-C "
+                            f"stops it:"))
+        for p, detail in found.problems:
+            log(colorize("red", f"  {shown(p)}: {detail}"))
+
+def _recorded_cleanup_incomplete(converter) -> bool:
+    """Whether a converter's run recorded an ffmpeg that could not be
+    confirmed stopped (all that may be known after a further Ctrl-C)"""
+    result = getattr(converter, "_result", None)
+    return bool(result is not None and result.cleanup_incomplete)
+
+def _count_batch_result(results: Dict[str, Any], iso_path: Path,
+                        result: Optional[ConversionResult], cleanup_incomplete: bool = False):
+    """Add one processed ISO to the batch results. result None: a further
+    Ctrl-C left its run without a result here (counted as failed)."""
+    results["processed"] += 1
+    if result is None:
+        results["failed"] += 1
+        results["details"].append({
+            "iso": iso_path.name, "success": False, "skipped": False, "aborted": False,
+            "unverified": False, "interrupted": True, "cleanup_incomplete": cleanup_incomplete,
+            "error": "Interrupted by operator (Ctrl-C); its run records may be missing "
+                     "or incomplete",
+            "skip_reason": None
+        })
+        return
+
+    # Failure outranks skipped: a run can end up failed-while-skip-shaped
+    # (e.g. its skip record could not be written) and must count as failed.
+    # An unverified run is never also failed (failure outranks it).
+    if result.unverified:
+        results["unverified"] += 1
+    elif not result.success:
+        results["failed"] += 1
+    elif result.skipped:
+        # Differentiate dry-run skips (VIDEO_TS that would convert) from actual skips
+        if result.skip_reason == "Dry run mode":
+            results["would_convert"] += 1
+        else:
+            results["skipped"] += 1
+    else:
+        results["success"] += 1
+
+    results["details"].append({
+        "iso": iso_path.name,
+        "success": result.success,
+        "skipped": result.skipped,
+        "aborted": result.aborted,
+        "unverified": result.unverified,
+        "interrupted": result.interrupted,
+        "cleanup_incomplete": result.cleanup_incomplete,
+        "error": result.error_message,
+        "skip_reason": result.skip_reason
+    })
 
 def process_batch(iso_dir: Path, output_dir: Path, operator: str, 
-                  dry_run: bool = False, **encoding_kwargs) -> Dict[str, Any]:
-    """Process multiple ISOs in a directory"""
-    
-    # Find all ISO files (case-insensitive, avoids duplicates on macOS),
-    # leaving out superseded masters in makeiso.py archive folders
-    found = sorted(p for p in iso_dir.rglob("*") if p.suffix.lower() == ".iso")
-    archived = [p for p in found if _in_archive_folder(p, iso_dir)]
-    iso_files = [p for p in found if not _in_archive_folder(p, iso_dir)]
-    if archived:
-        log(colorize("yellow", f"Skipping {len(archived)} superseded ISO(s) in makeiso.py "
-                               f"archive folders (*_overwritten-*/; convert one with -i if needed):"))
-        for p in archived:
-            log(colorize("yellow", f"  {p.relative_to(iso_dir)}"))
+                  dry_run: bool = False, progress: Optional[Dict[str, Any]] = None,
+                  **encoding_kwargs) -> Dict[str, Any]:
+    """Process every ISO the search of iso_dir finds (find_batch_isos), in
+    order. Each access folder belongs to the first ISO that maps to it; a
+    later one is refused, not processed. Anything the search could not
+    cover, and every refused ISO, is a discovery error ("discovery_errors"
+    in the results; main() exits 1 unless a Ctrl-C stopped the batch),
+    listed before processing and again in the summary when any ISO is
+    processed: the ISOs that were found are still processed. progress,
+    if given, is kept up to date with the results and the current
+    converter, so main() can still tell what was recorded if a further
+    Ctrl-C leaves here."""
+    found = find_batch_isos(iso_dir)
+    iso_files, claimed = [], {}
+    for p in found.isos:
+        # Names that differ only in case count as one folder (as on macOS)
+        folder = _batch_output_dir(p, iso_dir, output_dir)
+        first = claimed.setdefault(str(folder).casefold(), p)
+        if first == p:
+            iso_files.append(p)
+        else:
+            found.problems.append((p, f"would share {folder} with {first}; not processed"))
+    found.problems.sort()
+    discovery_errors = [{"path": str(p), "detail": detail} for p, detail in found.problems]
+    _log_discovery(iso_dir, found)
     
     if not iso_files:
-        log(colorize("yellow", f"No ISO files found in: {iso_dir}"))
-        return {"processed": 0, "success": 0, "skipped": 0, "unverified": 0, "failed": 0}
+        log(colorize("yellow", f"No ISO files found in: {iso_dir}" if not discovery_errors else
+                               f"No ISO file to process in: {iso_dir} (see the "
+                               f"{len(discovery_errors)} problem(s) listed above)"))
+        return {"processed": 0, "success": 0, "skipped": 0, "unverified": 0, "failed": 0,
+                "discovery_errors": discovery_errors}
     
     log_divider("Batch Processing")
     log(colorize("cyan", f"Found {len(iso_files)} ISO files"))
@@ -2721,78 +3688,120 @@ def process_batch(iso_dir: Path, output_dir: Path, operator: str,
         "skipped": 0,        # Non-VIDEO_TS discs
         "unverified": 0,     # Nothing failed, but nothing promoted either
         "failed": 0,
+        "interrupted": None, # the ISO a Ctrl-C stopped the batch at
+        "not_started": 0,    # ISOs a Ctrl-C left unstarted
+        "discovery_errors": discovery_errors,  # not searched, or refused: exit 1
         "details": []
     }
-    
-    for i, iso_path in enumerate(iso_files, 1):
-        log_divider(f"Processing {i}/{len(iso_files)}: {iso_path.name}")
-        
-        # Create config for this ISO — access folder next to source ISO by default,
-        # or under output_dir if explicitly provided
-        base = output_dir if output_dir != iso_dir else iso_path.parent
-        config = ConversionConfig(
-            iso_path=iso_path,
-            output_dir=base / _access_dir_name(iso_path),
-            operator=operator,
-            dry_run=dry_run,
-            **encoding_kwargs
-        )
-        
-        # Run conversion
-        converter = ISOToMP4Converter(config)
-        result = converter.convert()
-        
-        results["processed"] += 1
-        
-        # Failure outranks skipped: a run can end up failed-while-skip-shaped
-        # (e.g. its skip record could not be written) and must count as failed.
-        # An unverified run is never also failed (failure outranks it).
-        if result.unverified:
-            results["unverified"] += 1
-        elif not result.success:
-            results["failed"] += 1
-        elif result.skipped:
-            # Differentiate dry-run skips (VIDEO_TS that would convert) from actual skips
-            if result.skip_reason == "Dry run mode":
-                results["would_convert"] += 1
+    if progress is not None:
+        progress["results"] = results
+
+    stopped_before = False  # the Ctrl-C came between ISOs: the one named never started
+    try:
+        for i, iso_path in enumerate(iso_files, 1):
+            # A Ctrl-C stops the batch: no further ISO is started. One that
+            # reaches an ISO's run is recorded by it (convert() never lets a
+            # first one through). One that lands between ISOs leaves the next
+            # one not started; a further one while an ISO's interruption is
+            # being recorded leaves that ISO counted as failed.
+            converter = result = None
+            counted = interrupted = False
+            try:
+                log_divider(f"Processing {i}/{len(iso_files)}: {iso_path.name}")
+
+                # Create config for this ISO — access folder next to source ISO by default,
+                # or under output_dir if explicitly provided
+                config = ConversionConfig(
+                    iso_path=iso_path,
+                    output_dir=_batch_output_dir(iso_path, iso_dir, output_dir),
+                    operator=operator,
+                    dry_run=dry_run,
+                    **encoding_kwargs
+                )
+
+                # Run conversion
+                converter = ISOToMP4Converter(config)
+                if progress is not None:
+                    progress["converter"] = converter
+                result = converter.convert()
+                # Counted with Ctrl-C held (bookkeeping only): one held here
+                # stops the batch after this ISO
+                held = DeferredInterrupt()
+                with held:
+                    _count_batch_result(results, iso_path, result)
+                    counted = True
+                interrupted = held.received or result.interrupted
+            except KeyboardInterrupt:
+                interrupted = True
+                with DeferredInterrupt():
+                    if counted:
+                        pass
+                    elif result is not None:
+                        _count_batch_result(results, iso_path, result)
+                        counted = True
+                    elif converter is not None and getattr(converter, "_entered", False):
+                        _count_batch_result(results, iso_path, None,
+                                            _recorded_cleanup_incomplete(converter))
+                        counted = True
+            cleanup = (result.cleanup_incomplete if result is not None
+                       else _recorded_cleanup_incomplete(converter))
+            if interrupted:
+                results["interrupted"] = iso_path.name
+                results["not_started"] = len(iso_files) - i + (0 if counted else 1)
+                stopped_before = not counted
+            if interrupted or cleanup:
+                try:
+                    if interrupted:
+                        log(colorize("red", "Batch interrupted by operator — stopping."))
+                    if cleanup:
+                        log(colorize("red", "Batch stopped: an ffmpeg could not be confirmed "
+                                            "stopped and its source stays attached (see the "
+                                            "warning above); no further ISO is started."))
+                except KeyboardInterrupt:
+                    if not results["interrupted"]:
+                        results["interrupted"] = iso_path.name
+                        results["not_started"] = len(iso_files) - i
+                break
+    except KeyboardInterrupt:
+        # Only in the few steps between those above, once an ISO has been
+        # counted and before the next one starts: the batch stops there,
+        # and every ISO not counted yet is not started
+        if not results["interrupted"]:
+            done = results["processed"]
+            results["not_started"] = len(iso_files) - done
+            if done < len(iso_files):
+                results["interrupted"], stopped_before = iso_files[done].name, True
             else:
-                results["skipped"] += 1
+                results["interrupted"] = "the end of the batch"
+
+    # Summary (a Ctrl-C here only cuts it short)
+    try:
+        log_divider("Batch Summary")
+        log(colorize("cyan", f"Total processed: {results['processed']}"))
+        if dry_run:
+            log(colorize("green", f"Would convert: {results['would_convert']}"))
         else:
-            results["success"] += 1
-        
-        results["details"].append({
-            "iso": iso_path.name,
-            "success": result.success,
-            "skipped": result.skipped,
-            "aborted": result.aborted,
-            "unverified": result.unverified,
-            "error": result.error_message,
-            "skip_reason": result.skip_reason
-        })
+            log(colorize("green", f"Successfully converted: {results['success']}"))
+        if results["skipped"] > 0:
+            log(colorize("yellow", f"Skipped (no convertible content): {results['skipped']}"))
+        if results["unverified"] > 0:
+            log(colorize("yellow", f"Unverified (nothing promoted; review copies kept): "
+                                   f"{results['unverified']}"))
+        log(colorize("red", f"Failed: {results['failed']}"))
+        if results["interrupted"]:
+            where = (f"before {results['interrupted']} started ({results['processed']} of "
+                     f"{len(iso_files)} processed)" if stopped_before else
+                     f"at {results['interrupted']} ({results['processed']} of {len(iso_files)})")
+            log(colorize("red", f"Interrupted by operator (Ctrl-C) {where}; "
+                                f"{results['not_started']} ISO(s) not started"))
+        if discovery_errors:
+            log(colorize("red", f"Search incomplete or ISO refused: {len(discovery_errors)} "
+                                f"(not searched or not processed):"))
+            for error in discovery_errors:
+                log(colorize("red", f"  {error['path']}: {error['detail']}"))
+    except KeyboardInterrupt:
+        results["interrupted"] = results["interrupted"] or "the batch summary"
 
-        if result.interrupted:
-            log(colorize("red", "Batch interrupted by operator — stopping."))
-            break
-        if result.cleanup_incomplete:
-            log(colorize("red", "Batch stopped: an ffmpeg could not be confirmed stopped and its "
-                                "source stays attached (see the warning above); no further ISO "
-                                "is started."))
-            break
-
-    # Summary
-    log_divider("Batch Summary")
-    log(colorize("cyan", f"Total processed: {results['processed']}"))
-    if dry_run:
-        log(colorize("green", f"Would convert: {results['would_convert']}"))
-    else:
-        log(colorize("green", f"Successfully converted: {results['success']}"))
-    if results["skipped"] > 0:
-        log(colorize("yellow", f"Skipped (no convertible content): {results['skipped']}"))
-    if results["unverified"] > 0:
-        log(colorize("yellow", f"Unverified (nothing promoted; review copies kept): "
-                               f"{results['unverified']}"))
-    log(colorize("red", f"Failed: {results['failed']}"))
-    
     return results
 
 ### === ARGUMENT PARSING ===
@@ -2863,11 +3872,41 @@ def print_help():
   MP4s get their final names only if EVERY titleset of the ISO passes;
   otherwise nothing is promoted, existing MP4s and records stay as they
   are, and passed titlesets are held as review copies too. A run that
-  fails once promotion has begun (a rename stops partway, or the records
+  fails once promotion has begun (a rename fails partway, or the records
   cannot be written afterwards) keeps the MP4s it promoted: no rollback.
+  The log and manifest are written to temporary files and renamed into
+  place, log first: an error, a Ctrl-C or a killed process never leaves
+  either half-written under its final name. They are not flushed to the
+  storage, so a power loss, or a volume that does not rename atomically,
+  is not covered. If they cannot be written, the run writes
+  *_failed-<token> records instead, saying which final log and manifest
+  no longer match its MP4s (or, if those cannot be written either, it
+  says so on screen).
+  At the overwrite prompt, no answer (end of input) counts as "n".
+  If the ISO, a VIDEO_TS file or an output cannot be checked (any error
+  other than "no such file"), the run fails instead of treating it as
+  missing.
   Exit status: 0 converted, skipped or successful dry run; 1 any failure,
-  unverified result or abort, or arguments without -i or --batch; 2 an
-  option or value rejected by the argument parser.
+  unverified result or abort, a batch search that was incomplete or
+  refused an ISO, or arguments without -i or --batch; 2 an option or
+  value rejected by the argument parser; 130 a Ctrl-C stopped the run or
+  batch, which takes precedence over 0 and 1 except that an ffmpeg not
+  confirmed stopped keeps 1 (see below).
+
+{colorize('yellow', 'CTRL-C:')}
+  Ctrl-C ends the current ISO with records of what it did, and a batch
+  that has started converting starts no further ISO and shows its
+  summary; during the search for ISOs it stops the batch with no
+  summary, and at the operator-name prompt nothing starts. An outcome
+  already decided (a skip, dry run, unverified result or failure)
+  stands, with the interruption as a warning. Before that (checking the
+  tools, attaching, analysing or encoding) it fails the run as an
+  interrupted encode does; at the overwrite prompt the ISO is recorded
+  as aborted. Ctrl-C during the final renames, or while the records are
+  written, is held until they finish; once every MP4 is promoted the
+  outcome stands, with the interruption as a warning. A Ctrl-C while the
+  ISO is being attached or detached is recorded: it may still be
+  attached (check hdiutil info); an attach cut short is not detached.
 
 {colorize('yellow', 'IF FFMPEG CANNOT BE CONFIRMED STOPPED:')}
   After a failure or Ctrl-C, ffmpeg is killed and given up to 10 seconds to
@@ -2882,10 +3921,18 @@ def print_help():
 
 {colorize('yellow', 'DISC TYPES HANDLED:')}
   • {colorize('green', 'DVD-Video (VIDEO_TS):')} Converted to MP4
+  • {colorize('yellow', 'VIDEO_TS without VOB files:')} Skipped (IFO/BUP only, or empty: verify the image)
   • {colorize('yellow', 'DVD-Audio (AUDIO_TS):')} Skipped (requires different tools)
   • {colorize('yellow', 'Data discs:')} Skipped (use file copy instead)
-  • {colorize('red', 'Analysis errors:')} Failed, nothing encoded (VIDEO_TS unreadable or only partly listed)
+  • {colorize('red', 'Analysis errors:')} Failed, nothing encoded (VIDEO_TS unreadable or only partly listed,
+    or a VOB, IFO or BUP file that cannot be checked)
   • {colorize('yellow', 'Batch mode:')} skips superseded masters in makeiso.py *_overwritten-* folders (use -i, with -o, for one)
+    and lists AppleDouble ._*.iso and makeiso.py *_attempt-*.iso files without converting them (use -i
+    for one). Symlinked folders inside the batch folder are not followed (they are listed); an .iso
+    symlink to a regular file is converted. A folder that cannot be listed, an entry that cannot be
+    checked, an .iso that is not a regular file, or a second ISO for an access folder already used
+    is listed, the ISOs found are still converted, and the batch exits 1 unless a Ctrl-C stops it
+    (see the exit status above).
 
 {colorize('cyan', 'Part of the Johnson Publishing Company Archive (JPCA) digitization workflow.')}
 """
@@ -2972,34 +4019,78 @@ def main():
     
     # Batch mode
     if args.batch:
+        # A batch folder that is missing or cannot be checked is reported
+        # by the search (find_batch_isos), and the batch exits 1
         batch_dir = Path(args.batch).expanduser()
-        if not batch_dir.exists():
-            log(colorize("red", f"Error: Batch directory not found: {batch_dir}"))
-            sys.exit(1)
         
         # Default output is same directory as batch input
         output_base = Path(args.output).expanduser() if args.output else batch_dir
-        
-        results = process_batch(
-            iso_dir=batch_dir,
-            output_dir=output_base,
-            operator=operator,
-            dry_run=args.dry_run,
-            crf=args.crf,
-            preset=args.preset,
-            audio_bitrate=args.audio_bitrate
-        )
-        
-        if results["failed"] > 0 or results.get("unverified", 0) > 0:
+
+        progress: Dict[str, Any] = {}
+        try:
+            results = process_batch(
+                iso_dir=batch_dir,
+                output_dir=output_base,
+                operator=operator,
+                dry_run=args.dry_run,
+                progress=progress,
+                crf=args.crf,
+                preset=args.preset,
+                audio_bitrate=args.audio_bitrate
+            )
+        except KeyboardInterrupt:
+            # A further Ctrl-C: the same exit rule, from what was recorded
+            cleanup = (any(d.get("cleanup_incomplete")
+                           for d in progress.get("results", {}).get("details", []))
+                       or _recorded_cleanup_incomplete(progress.get("converter")))
+            log(colorize("red", "\nInterrupted by operator (Ctrl-C): the batch stopped; each "
+                                "processed ISO's records give its outcome."
+                                + (" An ffmpeg could not be confirmed stopped (see above): "
+                                   "exit status 1." if cleanup else "")))
+            sys.exit(1 if cleanup else 130)
+
+        # A Ctrl-C that stopped the batch exits 130, unless an ffmpeg could
+        # not be confirmed stopped (that keeps 1). Otherwise a failure, an
+        # unverified ISO, or a search that was incomplete or refused an ISO
+        # exits 1, even when every ISO it found succeeded
+        if results.get("interrupted") and not any(
+                d.get("cleanup_incomplete") for d in results.get("details", [])):
+            sys.exit(130)
+        if results["failed"] > 0 or results.get("unverified", 0) > 0 \
+                or results.get("discovery_errors"):
             sys.exit(1)
         sys.exit(0)
     
     # Single file mode
     iso_path = Path(args.iso).expanduser()
 
-    # If a directory was passed, look for a single ISO inside it
-    if iso_path.is_dir():
-        iso_files = sorted(p for p in iso_path.iterdir() if p.is_file() and p.suffix.lower() == ".iso")
+    # Only "no such file" means not found: a path that cannot be checked
+    # stops here, naming the error, before anything is started or recorded
+    given, problem = inspect_path(iso_path, follow_symlinks=True)
+    if problem:
+        log(colorize("red", f"Error: could not check {iso_path}: {problem}"))
+        sys.exit(1)
+    if given is None:
+        log(colorize("red", f"Error: ISO file not found: {iso_path}"))
+        sys.exit(1)
+
+    # If a directory was passed, look for a single ISO inside it (macOS
+    # AppleDouble ._* companions are never masters, so they do not count)
+    if stat.S_ISDIR(given.st_mode):
+        try:
+            names = sorted(p for p in iso_path.iterdir() if not p.name.startswith("._")
+                           and p.suffix.lower() == ".iso")
+        except OSError as e:
+            log(colorize("red", f"Error: could not list {iso_path}: {e}"))
+            sys.exit(1)
+        iso_files = []
+        for p in names:
+            found, problem = inspect_path(p, follow_symlinks=True)
+            if problem:
+                log(colorize("red", f"Error: could not check {p}: {problem}"))
+                sys.exit(1)
+            if found is not None and stat.S_ISREG(found.st_mode):
+                iso_files.append(p)
         if len(iso_files) == 1:
             log(colorize("yellow", f"Directory provided — using ISO found inside: {iso_files[0].name}"))
             iso_path = iso_files[0]
@@ -3011,10 +4102,6 @@ def main():
             log(colorize("red", f"Error: Multiple .iso files found — please specify one directly: {iso_list}"))
             sys.exit(1)
 
-    if not iso_path.exists():
-        log(colorize("red", f"Error: ISO file not found: {iso_path}"))
-        sys.exit(1)
-    
     # Determine output directory — default: access folder next to the ISO
     output_base = Path(args.output).expanduser() if args.output else iso_path.parent
     output_dir = output_base / _access_dir_name(iso_path)
@@ -3032,26 +4119,42 @@ def main():
     
     # Run conversion
     converter = ISOToMP4Converter(config)
-    result = converter.convert()
-    
-    # Exit with appropriate code
-    if result.success:
-        if result.skipped:
-            log(colorize("yellow", f"Skipped: {result.skip_reason}"))
-            sys.exit(0)
+    try:
+        result = converter.convert()
+    except KeyboardInterrupt:
+        # A further Ctrl-C: the same exit rule, from what the run recorded
+        cleanup = _recorded_cleanup_incomplete(converter)
+        log(colorize("red", "\nInterrupted by operator (Ctrl-C) while the interruption was being "
+                            "recorded: this ISO's records may be missing or incomplete."
+                            + (" An ffmpeg could not be confirmed stopped (see above): exit "
+                               "status 1." if cleanup else "")))
+        sys.exit(1 if cleanup else 130)
+
+    # Exit with appropriate code: 130 when a Ctrl-C stopped the run (its
+    # records give the outcome), unless an ffmpeg could not be confirmed
+    # stopped (that keeps 1)
+    code = 0 if result.success else 1
+    try:
+        if result.success:
+            if result.skipped:
+                log(colorize("yellow", f"Skipped: {result.skip_reason}"))
+            else:
+                log(colorize("green", "Conversion completed successfully!"))
+        elif result.unverified:
+            log(colorize("yellow", "Unverified: nothing promoted; review copies kept "
+                                   f"(not deliverables): {result.unverified_reason}"))
+        elif result.aborted:
+            log(colorize("yellow", f"Aborted: {result.error_message}"))
         else:
-            log(colorize("green", "Conversion completed successfully!"))
-            sys.exit(0)
-    elif result.unverified:
-        log(colorize("yellow", "Unverified: nothing promoted; review copies kept "
-                               f"(not deliverables): {result.unverified_reason}"))
-        sys.exit(1)
-    elif result.aborted:
-        log(colorize("yellow", f"Aborted: {result.error_message}"))
-        sys.exit(1)
-    else:
-        log(colorize("red", f"Conversion failed: {result.error_message}"))
-        sys.exit(1)
+            log(colorize("red", f"Conversion failed: {result.error_message}"))
+        if result.interrupted and not result.cleanup_incomplete:
+            log(colorize("yellow", "Stopped by Ctrl-C: exit status 130 (the run's records give "
+                                   "its outcome)."))
+    except KeyboardInterrupt:
+        result.interrupted = True
+    if result.interrupted and not result.cleanup_incomplete:
+        code = 130
+    sys.exit(code)
 
 ### === SCRIPT ENTRYPOINT ===
 

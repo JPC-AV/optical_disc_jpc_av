@@ -18,6 +18,7 @@ import platform
 import argparse
 import json
 import logging
+import errno
 import fcntl
 import signal
 import stat
@@ -189,6 +190,9 @@ class BackupResult:
     warnings: List[str] = field(default_factory=list)  # non-fatal problems (run still valid)
     flush_method: Optional[str] = None   # as IsoCreationResult: how the ISO was flushed
     cache_bypass: Optional[bool] = None  # as IsoCreationResult: F_NOCACHE set for the re-read
+    # F_FULLFSYNC, fsync or F_NOCACHE calls that did not return, by control
+    # (see control_error); empty when every control that was called returned
+    control_errors: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Where this run's own tree/isolyzer/log/manifest actually are, by role,
     # once a move (publication, move-back, failure marking) - successful or
     # not - has decided it; otherwise the config-derived name applies.
@@ -246,7 +250,7 @@ class IsoCreationResult:
     sha256_iso: Optional[str]
     output_path: Path
     warnings: List[str] = field(default_factory=list)  # degraded-but-not-fatal conditions
-    flush_method: Optional[str] = None   # "F_FULLFSYNC", or "fsync" when that was unavailable
+    flush_method: Optional[str] = None   # "F_FULLFSYNC", or "fsync" when that was not supported
     cache_bypass: Optional[bool] = None  # whether F_NOCACHE was set for the verification read
 
 @dataclass(frozen=True)
@@ -296,7 +300,7 @@ class BackupPreparation:
     """State gathered before any copy work starts."""
     disk_info: Dict[str, Any]
     disk_size: int
-    created_output_dir: bool
+    created_folders: List[Path]  # folders this run made for its output, top-down
     attempt: ArtifactSet
 
 @dataclass
@@ -364,11 +368,16 @@ def log_divider(title: Optional[str] = None):
 ### === UTILITY FUNCTIONS ===
 
 def get_input(prompt: str) -> str:
-    """Get user input with keyboard interrupt handling"""
+    """Get user input with keyboard interrupt handling. End of input (stdin
+    closed or Ctrl-D) is never taken as an answer: it counts as "no" and
+    stops the run (exit 1). Every prompt comes before anything is changed."""
     try:
         return input(prompt).strip()
     except KeyboardInterrupt:
         log(colorize("red", "\nCancelled by user."))
+        sys.exit(1)
+    except EOFError:
+        log(colorize("red", "\nNo answer (end of input), taken as no: stopping; nothing was changed."))
         sys.exit(1)
 
 def run_cmd(cmd: List[str], capture_output: bool = True, plist: bool = False) -> Any:
@@ -384,9 +393,9 @@ def run_cmd(cmd: List[str], capture_output: bool = True, plist: bool = False) ->
 # shlex.quote, so a name with spaces, quotes, $, ` or ; stays one argument
 
 def tree_command(config: "BackupConfig") -> List[str]:
-    """The tree listing's argv"""
-    return ["tree", "-RapugD", "--si", "--du",
-            config.mount_point or f"/Volumes/{config.volume_name}"]
+    """The tree listing's argv: of the disc's reported mount point, never a
+    guessed one (an unmounted disc gets no listing; see _generate_tree_listing)"""
+    return ["tree", "-RapugD", "--si", "--du", config.mount_point]
 
 def dd_command(disk_id: str) -> List[str]:
     """dd's argv. dd only reads the raw device: makeiso.py reads dd's
@@ -400,24 +409,77 @@ def spot_check_command(iso: str, disk_id: str) -> str:
             f"disc=$({shlex.join(dd_command(disk_id))} 2>/dev/null | md5 -q); "
             f'[ "$iso" = "$disc" ] && echo MATCH || echo MISMATCH')
 
-def flush_wording(flush_method: Optional[str]) -> str:
-    """What was done to get the written ISO onto its media before verification"""
+# fcntl controls that answer with one of these errnos are taken as not
+# supported by the destination (macOS keeps ENOTSUP and EOPNOTSUPP distinct);
+# any other error is a failure. A chosen conservative policy: fcntl(2)
+# documents no F_FULLFSYNC errors
+UNSUPPORTED_CONTROL_ERRNOS = frozenset(
+    code for code in (getattr(errno, "ENOTSUP", None), getattr(errno, "EOPNOTSUPP", None))
+    if code is not None)
+NOT_PROVIDED = "not provided by this Python's fcntl module"
+
+def control_error(error: Optional[OSError], may_be_unsupported: bool = True) -> Dict[str, Any]:
+    """How one flush or cache control (F_FULLFSYNC, fsync, F_NOCACHE) did not
+    return, as recorded in integrity_verification.control_errors: errno, its
+    name, the message and treated_as. error None means the fcntl module has
+    no such constant. treated_as is "unsupported" for that or an errno in
+    UNSUPPORTED_CONTROL_ERRNOS (when may_be_unsupported), else "failure"."""
+    if error is None:
+        return {"errno": None, "name": None, "message": NOT_PROVIDED, "treated_as": "unsupported"}
+    code = error.errno
+    unsupported = may_be_unsupported and code in UNSUPPORTED_CONTROL_ERRNOS
+    return {"errno": code, "name": errno.errorcode.get(code) if isinstance(code, int) else None,
+            "message": error.strerror or str(error),
+            "treated_as": "unsupported" if unsupported else "failure"}
+
+def errno_text(record: Dict[str, Any]) -> str:
+    """A control_error record as text: e.g. EIO (errno 5: Input/output error)"""
+    if record["errno"] is None:
+        return record["message"]
+    return f"{record['name'] or 'error'} (errno {record['errno']}: {record['message']})"
+
+def control_error_text(control: str, record: Dict[str, Any]) -> str:
+    """e.g. F_FULLFSYNC returned EIO (errno 5: ...), or F_FULLFSYNC not
+    provided by this Python's fcntl module"""
+    if record["errno"] is None and record["message"] == NOT_PROVIDED:
+        return f"{control} {NOT_PROVIDED}"
+    return f"{control} returned {errno_text(record)}"
+
+def flush_wording(flush_method: Optional[str],
+                  control_errors: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    """What was done to get the written ISO onto its media before verification
+    (control_errors: the controls that did not return, see control_error)"""
+    errors = control_errors or {}
     if flush_method == "F_FULLFSYNC":
         return ("F_FULLFSYNC (asks the drive to write its cache to the media; a drive "
                 "or network volume may not honour it)")
     if flush_method == "fsync":
+        cause = (f"; {control_error_text('F_FULLFSYNC', errors['F_FULLFSYNC'])}"
+                 if "F_FULLFSYNC" in errors else "")
         return ("fsync only (F_FULLFSYNC unavailable: the drive's own write cache may "
-                "not have been flushed)")
+                f"not have been flushed{cause})")
+    flush_errors = [(c, errors[c]) for c in ("F_FULLFSYNC", "fsync") if c in errors]
+    if any(record["treated_as"] == "failure" for _, record in flush_errors):
+        return ("no flush completed ("
+                + "; ".join(control_error_text(c, record) for c, record in flush_errors)
+                + "); the copy was not verified")
     return "not recorded"
 
-def reread_wording(cache_bypass: Optional[bool]) -> str:
-    """How the written ISO was re-read for verification"""
+def reread_wording(cache_bypass: Optional[bool],
+                   nocache_error: Optional[Dict[str, Any]] = None) -> str:
+    """How the written ISO was re-read for verification (nocache_error: why
+    F_NOCACHE was not set, see control_error)"""
     if cache_bypass:
         return ("written ISO re-read with F_NOCACHE set (macOS is asked not to cache "
                 "the read; data the write left cached may still be served)")
     if cache_bypass is False:
+        if nocache_error and nocache_error["treated_as"] == "failure":
+            return ("written ISO re-read without F_NOCACHE (it could not be set: "
+                    f"{control_error_text('F_NOCACHE', nocache_error)}; the read may have "
+                    "been served from the page cache)")
+        cause = (f"; {control_error_text('F_NOCACHE', nocache_error)}" if nocache_error else "")
         return ("written ISO re-read without F_NOCACHE (unavailable: the read may have "
-                "been served from the page cache)")
+                f"been served from the page cache{cause})")
     return "written ISO re-read"
 
 def calculate_disc_speed_multiplier(speed_mb_s: float, media_type: str) -> str:
@@ -500,7 +562,7 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         t = run.step_times.get(step, fallback) if run else fallback
         return t.strftime('%H:%M:%S')
     
-    with (opener(log_path) if opener else open(log_path, "w")) as f:
+    with (opener(log_path) if opener else open(log_path, "w", encoding="utf-8")) as f:
         # === HEADER SUMMARY ===
         f.write("=" * 70 + "\n")
         f.write("OPTICAL DISC TO ISO BACKUP LOG\n")
@@ -560,10 +622,13 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         f.write("OPERATION DETAILS\n")
         f.write("-" * 20 + "\n")
         
-        # Tree generation
+        # Tree generation (never of a guessed mount point)
         f.write(f"[{step_time('tree', start_time)}] Tree Listing Generation\n")
-        f.write(f"  Command: {shlex.join(tree_command(config))}\n")
-        f.write(f"  Output:  {record.files.tree.name}\n\n")
+        if config.mount_point:
+            f.write(f"  Command: {shlex.join(tree_command(config))}\n")
+            f.write(f"  Output:  {record.files.tree.name}\n\n")
+        else:
+            f.write("  Status:  Not run (the disc was not mounted: diskutil reported no mount point)\n\n")
         
         # Disk unmount
         if result.unmount_interrupted:
@@ -606,9 +671,10 @@ def create_formatted_log(log_path: Path, config: BackupConfig, result: BackupRes
         if result.md5_iso and result.md5_raw:
             f.write("VERIFICATION RESULTS\n")
             f.write("-" * 20 + "\n")
-            f.write(f"Method:         {reread_wording(result.cache_bypass)}, "
+            f.write(f"Method:         "
+                    f"{reread_wording(result.cache_bypass, result.control_errors.get('F_NOCACHE'))}, "
                     f"compared to streamed raw disk hashes\n")
-            f.write(f"Flush:          {flush_wording(result.flush_method)}\n")
+            f.write(f"Flush:          {flush_wording(result.flush_method, result.control_errors)}\n")
             f.write(f"MD5 (ISO):          {result.md5_iso}\n")
             f.write(f"MD5 (Raw Disk):     {result.md5_raw}\n")
             if result.sha256_iso and result.sha256_raw:
@@ -750,6 +816,10 @@ class DryRunStopped(Exception):
     """A dry run that cannot finish truthfully (its tree listing failed, or
     one of its file names was taken): it stops before writing anything more"""
 
+class FlushFailed(RuntimeError):
+    """F_FULLFSYNC, or the fsync fallback, failed: the copy is neither
+    verified nor published (the errors are in OpticalDiscBackup._control_errors)"""
+
 ### === MAIN BACKUP CLASS ===
 
 class OpticalDiscBackup:
@@ -769,6 +839,17 @@ class OpticalDiscBackup:
         self._published = False
         self._archive_dir: Optional[Path] = None  # this run's overwritten-* folder
         self._rollback_problems: List[str] = []    # files rollback could not put back
+        # Set as the first bundle file is about to move (archive or publish):
+        # from then on a failed publication never says nothing moved
+        self._moves_started = False
+        self._prior_archived = False               # a prior bundle file was archived
+        # Set together with the attempt ISO's creation (held Ctrl-C): a failed
+        # run's records say whether its copy started from this, never from a
+        # later look at the filesystem. _copy_attempted is set just before:
+        # once it is, the attempt ISO may exist
+        self._copy_attempted = False
+        self._copy_started = False
+        self._control_errors: Dict[str, Dict[str, Any]] = {}  # see control_error
         self._dry_run_files: List[Path] = []       # files a dry run created, in order
         self._operator_uid_value: Optional[int] = None
         self._operator_uid_known = False
@@ -803,19 +884,23 @@ class OpticalDiscBackup:
         except OSError as e:
             log(colorize("yellow", f"Warning: could not change the owner of {path}: {e}"))
 
-    def _keep_new_dry_run_folder_owner(self, folder: Path):
-        """A dry run never changes the owner of the output folder it created.
+    def _keep_new_dry_run_folder_owner(self, folders: List[Path]):
+        """A dry run never changes the owner of a folder it created (the
+        output folder, and any missing parent folders, in creation order).
         mkdir gives no descriptor, and reopening the path cannot prove the
         folder now there is the one it made (another folder, even one with the
-        same owner, could have been moved in), so the folder keeps its owner,
-        with a warning. Only the files this run creates exclusively change
-        owner, through their own descriptors."""
+        same owner, could have been moved in), so each keeps its owner, with
+        one warning naming them all. Only the files this run creates
+        exclusively change owner, through their own descriptors."""
         if self._operator_uid() is None:
             return
-        log(colorize("yellow", f"Warning: the output folder {folder} was created by this dry "
-                               f"run and keeps its owner (root); only the files it creates are "
-                               f"handed to {os.environ.get('SUDO_USER')}. Create the folder "
-                               f"yourself first to manage it without sudo."))
+        made = (f"the output folder {folders[0]} was created by this dry run and keeps its "
+                f"owner (root)" if folders == [self.config.output_dir] else
+                f"the folders {', '.join(str(p) for p in folders)} were created by this dry run "
+                f"(in that order) and each keeps its owner (root)")
+        log(colorize("yellow", f"Warning: {made}; only the files it creates are handed to "
+                               f"{os.environ.get('SUDO_USER')}. Create the folder yourself first "
+                               f"to manage it without sudo."))
 
     def _create_dry_run_file(self, path: Path, encoding: Optional[str] = None):
         """Create one of a dry run's files (tree listing, log, manifest). A dry
@@ -855,6 +940,19 @@ class OpticalDiscBackup:
                    f"changed; choose a fresh --dir or --filename.")
         return BackupResult(False, self.config.output_path, disk_size, error_message=message)
 
+    def _dry_run_unchecked_refusal(self, unknown: List[str], occupied: List[Path],
+                                   unchanged: str, disk_size: int) -> BackupResult:
+        """A dry run beside a canonical name that could not be checked (an
+        error other than "no such file"): refused, never taken as free.
+        Takes precedence over (and also lists) names that are taken."""
+        taken = f"; it also holds {', '.join(p.name for p in occupied)}" if occupied else ""
+        message = (f"Dry run refused: could not check {', '.join(unknown)} in "
+                   f"{self.config.output_dir}{taken}. A dry run writes its own tree listing, log "
+                   f"and manifest under {self.config.filename}'s canonical names, so it runs only "
+                   f"where each of them can be checked and none is taken. "
+                   f"{unchanged[0].upper()}{unchanged[1:]}; choose a fresh --dir or --filename.")
+        return BackupResult(False, self.config.output_path, disk_size, error_message=message)
+
     def _dry_run_stopped(self, reason: str, disk_size: int) -> BackupResult:
         message = f"Dry run stopped: {reason}. {self._dry_run_files_note()}"
         return BackupResult(False, self.config.output_path, disk_size, error_message=message)
@@ -871,21 +969,63 @@ class OpticalDiscBackup:
         self._rollback_problems.append(message)
         log(colorize("yellow", f"Warning: {message}"))
 
+    def _publication_outcome(self) -> str:
+        """What a failed publication left where, for its error. Only a failure
+        before any bundle file began to move says nothing was archived or
+        replaced; after that it says where the rollback left the prior
+        bundle, or that the warnings (the rollback problems, naming each
+        file's location or that it could not be checked) say so"""
+        if not self._moves_started:
+            return "nothing was archived or replaced"
+        if self._rollback_problems:
+            return ("publication had begun and its rollback could not finish: the warnings say "
+                    "where the prior bundle and this run's files are, or that they could not be "
+                    "checked; check each manifest with verifyiso.py before moving any file by hand")
+        if self._prior_archived:
+            return ("publication had begun and was rolled back: the prior bundle is back at its "
+                    "canonical names")
+        return ("publication had begun and was rolled back: none of this run's files is left at "
+                "a canonical name")
+
     def _restore_archived_artifacts(self, archived: List[Tuple[Path, Path]],
                                     clear: bool = True):
         """Put archived canonical artifacts back after a failed promotion.
 
-        Best effort, and never replacing a file: if any canonical slot is
-        occupied (or the caller could not clear them), nothing is restored and
-        the prior files stay in the archive folder. If a restore fails partway,
-        the files already restored are moved back into the folder. If renames
-        keep failing, files can be left split between canonical names and the
-        folder: the recorded problem then names where each one actually is.
-        The archive folder is removed only when it is empty again."""
-        pending = [(o, a) for o, a in archived if os.path.lexists(a)]
-        occupied = [o.name for o, _ in pending if os.path.lexists(o)]
+        Best effort, and never replacing a file. Every name is checked with
+        inspect_path: one that cannot be checked (an error other than "no
+        such file") is never taken as free or absent. If any archive entry
+        or canonical slot cannot be checked, or a canonical slot is occupied
+        (or the caller could not clear them), nothing is restored and the
+        prior files stay in the archive folder, as archived. If a restore
+        fails partway, the files already restored are moved back into the
+        folder. If renames keep failing, files can be left split between
+        canonical names and the folder: the recorded problem then names where
+        each one actually is, or that it could not be checked. The archive
+        folder is removed only when it is empty again."""
+        where = self._relative(self._archive_dir) if self._archive_dir else "its archive folder"
+        pending: List[Tuple[Path, Path]] = []
+        occupied: List[str] = []
+        unknown: List[str] = []
+        for original, archive in archived:
+            here, problem = inspect_path(archive)
+            if problem:
+                unknown.append(f"{self._relative(archive)} ({problem})")
+                continue
+            if here is None:
+                self._rollback_problem(f"{original.name} is no longer in {where}; it was not restored")
+                continue
+            pending.append((original, archive))
+            slot, problem = inspect_path(original)
+            if problem:
+                unknown.append(f"{original.name} ({problem})")
+            elif slot is not None:
+                occupied.append(original.name)
+        if unknown:
+            self._rollback_problem(f"prior bundle left in {where}, where this run archived it "
+                                   f"(could not check {', '.join(unknown)}); nothing was restored "
+                                   f"over this run's files")
+            return
         if pending and (occupied or not clear):
-            where = self._relative(self._archive_dir) if self._archive_dir else "its archive folder"
             reason = (f"{', '.join(occupied)} still occupied" if occupied
                       else "this run's files could not all be moved out of the canonical names")
             self._rollback_problem(f"prior bundle left intact in {where} ({reason}); "
@@ -893,23 +1033,33 @@ class OpticalDiscBackup:
             return
         restored: List[Tuple[Path, Path]] = []
         for original, archive in reversed(archived):
-            if not os.path.lexists(archive):
+            here, problem = inspect_path(archive)
+            if problem:
+                problem = f"could not check {self._relative(archive)} ({problem})"
+            elif here is None:
                 continue
-            problem = None
-            if os.path.lexists(original):
-                problem = f"{original.name} is occupied"
             else:
-                try:
-                    archive.replace(original)
-                    restored.append((original, archive))
-                    log(colorize("yellow", f"Restored prior artifact: {original.name}"))
-                    continue
-                except OSError as e:
-                    problem = f"could not restore {original.name}: {e}"
+                slot, slot_problem = inspect_path(original)
+                if slot_problem:
+                    problem = f"could not check {original.name} ({slot_problem})"
+                elif slot is not None:
+                    problem = f"{original.name} is occupied"
+                else:
+                    try:
+                        archive.replace(original)
+                        restored.append((original, archive))
+                        log(colorize("yellow", f"Restored prior artifact: {original.name}"))
+                        continue
+                    except OSError as e:
+                        problem = f"could not restore {original.name}: {e}"
             # Keep the prior bundle together: move back what was restored
             for done_original, done_archive in reversed(restored):
                 try:
-                    if os.path.lexists(done_archive):
+                    occupant, check_problem = inspect_path(done_archive)
+                    if check_problem:
+                        raise OSError(f"could not check {self._relative(done_archive)} "
+                                      f"({check_problem})")
+                    if occupant is not None:
                         raise OSError(f"{self._relative(done_archive)} is occupied")
                     done_original.rename(done_archive)
                 except OSError as e:
@@ -917,20 +1067,35 @@ class OpticalDiscBackup:
                                            f"{self._relative(done_archive)}: {e}")
             # Say where every file this rollback handled actually is now
             where = self._relative(self._archive_dir) if self._archive_dir else "the archive folder"
-            in_folder = [o.name for o, a in archived if os.path.lexists(a)]
-            at_canonical = [o.name for o, a in archived
-                            if not os.path.lexists(a) and os.path.lexists(o)]
-            missing = [o.name for o, a in archived
-                       if not os.path.lexists(a) and not os.path.lexists(o)]
-            if not at_canonical and not missing:
+            # (its own names: `problem` above is why the rollback stopped)
+            in_folder, at_canonical, missing, unchecked = [], [], [], []
+            for o, a in archived:
+                entry, entry_problem = inspect_path(a)
+                if entry_problem:
+                    unchecked.append(f"{o.name} ({self._relative(a)}: {entry_problem})")
+                    continue
+                if entry is not None:
+                    in_folder.append(o.name)
+                    continue
+                slot, slot_problem = inspect_path(o)
+                if slot_problem:
+                    unchecked.append(f"{o.name} ({slot_problem})")
+                elif slot is not None:
+                    at_canonical.append(o.name)
+                else:
+                    missing.append(o.name)
+            if not at_canonical and not missing and not unchecked:
                 outcome = (f"the files it had restored were moved back, so they are all in "
                            f"{where} ({', '.join(in_folder)})")
             else:
-                outcome = ("continuing rename errors left the prior files split: "
+                outcome = (("continuing rename errors left the prior files split: "
+                            if at_canonical or missing else "the prior files may be split: ")
                            + "; ".join(part for part in (
                                f"at canonical names: {', '.join(at_canonical)}" if at_canonical else "",
                                f"in {where}: {', '.join(in_folder)}" if in_folder else "",
-                               f"not found: {', '.join(missing)}" if missing else "") if part))
+                               f"not found: {', '.join(missing)}" if missing else "",
+                               f"could not check: {', '.join(unchecked)}" if unchecked else "")
+                                      if part))
             self._rollback_problem(f"rollback stopped ({problem}); {outcome}; nothing was "
                                    f"restored over this run's files")
             return
@@ -952,8 +1117,18 @@ class OpticalDiscBackup:
         verified, so a failed retry leaves the existing master untouched.
 
         The folder is created exclusively (an existing one is never reused),
-        and only when there is something to archive."""
-        existing = [p for p in self._standard_artifacts() if os.path.lexists(p)]
+        and only when there is something to archive. A canonical name that
+        cannot be checked (inspect_path: an error other than "no such file")
+        is never left out as absent: it raises before the folder is made,
+        when nothing has moved. In the folder, a name that is taken or
+        cannot be checked is never replaced."""
+        existing = []
+        for path in self._standard_artifacts():
+            here, problem = inspect_path(path)
+            if problem:
+                raise OSError(f"could not check existing artifact {path.name} ({problem})")
+            if here is not None:
+                existing.append(path)
         archived: List[Tuple[Path, Path]] = []
         if not existing:
             return archived
@@ -963,15 +1138,25 @@ class OpticalDiscBackup:
         self._archive_dir = folder
         try:
             for path in existing:
-                if path.is_symlink():
+                here, problem = inspect_path(path)
+                if problem:
+                    raise OSError(f"could not check existing artifact {path.name} ({problem})")
+                if here is not None and stat.S_ISLNK(here.st_mode):
                     raise OSError(f"Symlink appeared at canonical artifact path during publish: {path}")
                 archive_path = folder / path.name
-                if os.path.lexists(archive_path):
+                occupant, problem = inspect_path(archive_path)
+                if problem:
+                    raise OSError(f"could not check {self._relative(archive_path)} ({problem}); "
+                                  f"not replacing it")
+                if occupant is not None:
                     raise OSError(f"{self._relative(archive_path)} already exists; not replacing it")
+                self._moves_started = True
                 path.rename(archive_path)
+                self._prior_archived = True
                 archived.append((path, archive_path))
                 log(colorize("yellow", f"Existing artifact archived to: {self._relative(archive_path)}"))
-        except OSError:
+        except (OSError, KeyboardInterrupt):
+            # (an interrupt here can only be one that escaped the held section)
             self._restore_archived_artifacts(archived)
             raise
         return archived
@@ -1019,8 +1204,23 @@ class OpticalDiscBackup:
                 cleared = False
         return cleared
 
-    def _check_publish_symlinks(self, paths: List[Path]):
-        linked = [p.name for p in paths if p.is_symlink()]
+    def _check_publish_symlinks(self, paths: List[Path], what: str,
+                                required: Tuple[Path, ...] = ()):
+        """The check before anything is archived or published (what names
+        the files in messages). A name that cannot be checked (inspect_path:
+        an error other than "no such file") is never taken as absent: it
+        stops publication, as does a symlink, or a missing name in required
+        (this run's staged log and manifest, written just before)"""
+        linked = []
+        for path in paths:
+            here, problem = inspect_path(path)
+            if problem:
+                raise OSError(f"could not check {what}{path.name} ({problem})")
+            if here is None:
+                if path in required:
+                    raise OSError(f"{what}{path.name} is missing")
+            elif stat.S_ISLNK(here.st_mode):
+                linked.append(path.name)
         if linked:
             raise OSError(f"Symlink appeared at publish path(s): {', '.join(linked)}")
 
@@ -1043,18 +1243,30 @@ class OpticalDiscBackup:
         passed completeness and checksum verification. Archiving, publishing
         and any rollback run as one short section with Ctrl-C held
         (DeferredInterrupt), so a Ctrl-C can never leave a half-moved
-        bundle; the caller acts on a held Ctrl-C afterwards. If promotion
-        fails (OSError), the prior bundle is restored as far as the
-        filesystem allows (best effort, see _restore_archived_artifacts) and
-        the attempt falls through the normal failed-run record path."""
+        bundle; the caller acts on a held Ctrl-C afterwards.
+
+        Every name is checked with inspect_path: one that cannot be checked
+        (an error other than "no such file") is never taken as absent.
+        Before anything moves, an existing canonical artifact or a staged
+        file of this run that cannot be checked or is a symlink, or a
+        missing staged log or manifest, stops publication with nothing
+        archived or replaced. After that, a slot that cannot be checked is
+        never replaced. If promotion fails once files have begun to move
+        (OSError, or an interrupt that escaped the hold), the prior bundle is
+        restored as far as the filesystem allows (best effort, see
+        _restore_archived_artifacts); either way the attempt falls through
+        the normal failed-run record path, which says what moved
+        (_publication_outcome)."""
         archived: List[Tuple[Path, Path]] = []
         published: List[Tuple[str, Path, Path]] = []
         publish_order = attempt.publish_pairs(self.config.canonical_artifacts)
+        staged = [src for role, (src, _) in zip(ARTIFACT_ROLES, publish_order) if role != "iso"]
         self._held_interrupt = DeferredInterrupt()
         with self._held_interrupt:
             try:
-                self._check_publish_symlinks(self._standard_artifacts())
-                self._check_publish_symlinks([src for src, _ in publish_order if src.exists()])
+                self._check_publish_symlinks(self._standard_artifacts(), "existing artifact ")
+                self._check_publish_symlinks(staged, "this run's ",
+                                             required=(attempt.log, attempt.manifest))
                 # Checked before the prior bundle is archived, and again as the
                 # ISO is published (if it disappears in between, the rollback
                 # below restores the prior bundle as far as it can)
@@ -1063,16 +1275,31 @@ class OpticalDiscBackup:
                 for role, (src, dst) in zip(ARTIFACT_ROLES, publish_order):
                     if role == "iso":
                         self._require_verified_iso(src)
-                    elif not src.exists():
-                        continue
-                    self._check_publish_symlinks([src, dst])
-                    if os.path.lexists(dst):
-                        raise OSError(f"{dst.name} appeared during publish; not replacing it")
+                    else:
+                        here, problem = inspect_path(src)
+                        if problem:
+                            raise OSError(f"could not check this run's {src.name} ({problem}); "
+                                          f"not publishing without it")
+                        if here is None:
+                            if role in ("log", "manifest"):
+                                raise OSError(f"this run's {src.name} is missing")
+                            continue  # no tree listing or isolyzer output was made
+                        if stat.S_ISLNK(here.st_mode):
+                            raise OSError(f"Symlink appeared at publish path(s): {src.name}")
+                    occupant, problem = inspect_path(dst)
+                    if problem:
+                        raise OSError(f"could not check {dst.name} ({problem}); not replacing it")
+                    if occupant is not None:
+                        raise OSError(f"Symlink appeared at publish path(s): {dst.name}"
+                                      if stat.S_ISLNK(occupant.st_mode) else
+                                      f"{dst.name} appeared during publish; not replacing it")
+                    self._moves_started = True
                     src.replace(dst)
                     published.append((role, src, dst))
                     self._set_location(result, role, dst)
                     log(colorize("green", f"Published verified artifact: {dst.name}"))
-            except OSError:
+            except (OSError, KeyboardInterrupt):
+                # (an interrupt here can only be one that escaped the hold)
                 cleared = self._move_published_attempts_back(result, published)
                 self._restore_archived_artifacts(archived, clear=cleared)
                 raise
@@ -1090,44 +1317,70 @@ class OpticalDiscBackup:
         failure token is chosen once, and a repeat call resumes an
         interrupted marking from what is on disk. A file that cannot be
         renamed, or whose location cannot be checked, is recorded where it
-        last was, with a warning."""
+        last was, with a warning.
+
+        Only the ISO, tree listing and isolyzer output are renamed. An
+        attempt-* log or manifest is only ever a staged success record
+        (failure records are written after the failure token is set), so
+        it is never given a failed-* name: one _discard_staged_records could
+        not remove keeps its attempt-* name, where the records name it.
+        An attempt ISO found here means the copy started (creation_path),
+        even if the fact recorded as it was created was lost in that
+        instant, and so does one that cannot be checked once its creation
+        was attempted (it may exist). A copy that never tried to create one
+        (the recorded fact: no inspection then) or whose ISO is confirmed
+        absent has its ISO named under the failure token (iso_created
+        false), like its other files."""
         if self.config.failure_token is None:
             self.config.failure_token = (f"failed-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}"
                                          f"-{uuid4().hex[:6]}")
         self.config.attempt_token = None
         marker = ".iso.mismatch" if result.checksum_match is False else ".iso.partial"
-        failed = self.config.artifacts  # tree, isolyzer, log and manifest now carry the failure token
+        failed = self.config.artifacts  # tree and isolyzer now carry the failure token
         targets = {
             "iso": self.config.output_dir / f"{self.config.filename}_{self.config.failure_token}{marker}",
             "tree": failed.tree, "isolyzer": failed.isolyzer,
-            "log": failed.log, "manifest": failed.manifest,
         }
-        for role in ARTIFACT_ROLES:
+        for role in ("iso", "tree", "isolyzer"):
             src, dst = getattr(attempt, role), targets[role]
             here = result.iso_path if role == "iso" else result.artifact_paths.get(role, src)
             if here != src:
                 continue  # recorded elsewhere (a canonical name, or already marked)
+            if role == "iso" and result.creation_path is None and not self._copy_attempted:
+                # The recorded fact: the copy never tried to create the ISO, so
+                # none of this run's can be there; nothing to inspect
+                self._set_location(result, role, dst)
+                continue
             current, problem = inspect_path(src)
             if current is None and not problem:
                 current, problem = inspect_path(dst)
                 if current is not None:
                     self._set_location(result, role, dst)  # renamed by an earlier, interrupted call
-                if current is not None or not problem:
-                    continue  # or never created: it keeps its planned name in the records
+                    if role == "iso" and result.creation_path is None:
+                        result.creation_path = src
+                    continue
+                if not problem:
+                    # Never created: it keeps its planned name in the records
+                    # (for the ISO, the one under the failure token)
+                    if role == "iso" and result.creation_path is None:
+                        self._set_location(result, role, dst)
+                    continue
             if problem:
                 self._set_location(result, role, src)
+                if role == "iso" and result.creation_path is None and self._copy_attempted:
+                    result.creation_path = src  # it may have been created: never "Not started"
                 note = (f"could not verify where this run's {role} is ({problem}); "
                         f"it was last at {src.name} and may now be at {dst.name}")
                 result.warnings.append(note)
                 log(colorize("yellow", f"Warning: {note}"))
                 continue
+            if role == "iso" and result.creation_path is None:
+                result.creation_path = src  # it is there, so the copy started
             try:
                 src.rename(dst)
             except OSError as e:
                 self._set_location(result, role, src)
                 note = f"could not rename {src.name} to {dst.name} ({e}); it is still at {src.name}"
-                if role in ("log", "manifest"):
-                    note += " (this run's staged success record: it does not describe a successful run)"
                 result.warnings.append(note)
                 log(colorize("yellow", f"Warning: {note}"))
                 continue
@@ -1152,7 +1405,8 @@ class OpticalDiscBackup:
             if not any(problem in w and path.name in w for w in result.warnings):
                 result.warnings.append(f"could not check {path.name} while writing the records "
                                        f"({problem}): its presence and size are unknown")
-        opener = self._create_dry_run_file if self.config.dry_run else None
+        opener = ((lambda path: self._create_dry_run_file(path, encoding="utf-8"))
+                  if self.config.dry_run else None)
         create_formatted_log(self.config.log_path, self.config, result,
                              start_time, disk_info, iso_analysis, self.run, opener=opener,
                              metadata=metadata)
@@ -1177,7 +1431,9 @@ class OpticalDiscBackup:
         (renamed as failure records) claiming success. One that a failed
         rollback left at a canonical name is this run's own too (publication
         only ever moves into an empty slot) and is removed there. If one
-        cannot be removed, or checked, the failure records say so."""
+        cannot be removed, or checked, the failure records say so: it keeps
+        its name (_mark_failed_attempt never renames it), so they name it
+        where it is, and the ownership fix hands it over."""
         canonical = self.config.canonical_artifacts
         for role in ("log", "manifest"):
             # Only its attempt name or the canonical name a failed rollback
@@ -1203,8 +1459,9 @@ class OpticalDiscBackup:
             try:
                 path.unlink()
             except OSError as e:
+                result.artifact_paths[role] = path  # where it stays (for the ownership fix)
                 note = (f"could not remove {path.name}{where} ({e}): it is this run's staged "
-                        f"success {role} and does not describe a successful run")
+                        f"success {role}, kept at that name, and does not describe a successful run")
                 result.warnings.append(note)
                 log(colorize("yellow", f"Warning: {note}"))
                 continue
@@ -1246,7 +1503,7 @@ class OpticalDiscBackup:
 
         disk_size = disk_info.get("TotalSize", 0)
         self.config.media_type = disk_info.get("OpticalMediaType", "Unknown")
-        self.config.mount_point = disk_info.get("MountPoint") or f"/Volumes/{self.config.volume_name}"
+        self.config.mount_point = disk_info.get("MountPoint") or None  # never guessed
 
         if not disk_info.get("OpticalMediaType") and not self.config.force:
             device_desc = disk_info.get('MediaName', disk_info.get('IORegistryEntryName', 'unknown device'))
@@ -1255,47 +1512,109 @@ class OpticalDiscBackup:
             return None, BackupResult(False, self.config.output_path, disk_size,
                                       error_message=f"/dev/{self.config.disk_id} is not optical media")
 
-        try:
-            self.config.output_dir.mkdir(parents=True)
-            created_output_dir = True
-        except FileExistsError:
-            created_output_dir = False
-        if created_output_dir and self.config.dry_run:
-            self._keep_new_dry_run_folder_owner(self.config.output_dir)
+        if self.config.dry_run and not self.config.mount_point:
+            # A dry run's tree listing is one of its outputs: it stops before
+            # creating anything (a normal run goes on without a listing)
+            return None, self._dry_run_stopped("the disc is not mounted (diskutil reported no "
+                                               "mount point), so its tree listing cannot be "
+                                               "made", disk_size)
 
-        if self.config.output_dir.is_symlink() or not self.config.output_dir.is_dir():
+        created_folders, problem = self._create_output_folders()
+        if created_folders and self.config.dry_run:
+            self._keep_new_dry_run_folder_owner(created_folders)
+
+        # Only "no such file" means absent (inspect_path): the output folder
+        # or a bundle name that cannot be checked refuses the run before
+        # anything starts; it is never taken as free
+        unchanged = ("nothing was changed" if not created_folders else
+                     f"nothing was written (this run only created "
+                     f"{', '.join(str(p) for p in created_folders)})")
+        if problem:
+            # A folder on the way that could not be made: refused, as a
+            # folder that cannot be checked is
+            if self.config.dry_run:
+                return None, self._dry_run_stopped(f"could not create {problem}; {unchanged}",
+                                                   disk_size)
+            return None, BackupResult(False, self.config.output_path, disk_size,
+                                      error_message=f"Could not create {problem}; {unchanged}")
+        folder, problem = inspect_path(self.config.output_dir)
+        if problem:
+            return None, BackupResult(False, self.config.output_path, disk_size,
+                                      error_message=f"Could not check output folder "
+                                                    f"{self.config.output_dir} ({problem}); {unchanged}")
+        if folder is None or not stat.S_ISDIR(folder.st_mode):
             log(colorize("red", f"Output path {self.config.output_dir} exists but is not a real directory "
                                 f"(file or symlink). Refusing to continue."))
             return None, BackupResult(False, self.config.output_path, disk_size,
                                       error_message=f"Output path {self.config.output_dir} is not a directory")
 
-        planned = self._standard_artifacts()
+        checked = [(p,) + inspect_path(p) for p in self._standard_artifacts()]
+        present = [p for p, here, _ in checked if here is not None]
+        unknown = [f"{p.name} ({problem})" for p, _, problem in checked if problem]
+        if unknown:
+            # An artifact that cannot be checked is never archived or replaced
+            if self.config.dry_run:
+                return None, self._dry_run_unchecked_refusal(unknown, present, unchanged, disk_size)
+            return None, BackupResult(False, self.config.output_path, disk_size,
+                                      error_message=f"Could not check existing artifact(s) in "
+                                                    f"{self.config.output_dir}: {', '.join(unknown)}; "
+                                                    f"{unchanged} (an artifact that cannot be "
+                                                    f"checked is never archived or replaced)")
+
         if self.config.dry_run:
             # A dry run writes its tree listing, log and manifest at the
             # canonical names, so it runs only where none of the five is taken
             # by anything (a file, an empty file, a folder, a live or broken
             # symlink). There is no overwrite prompt.
-            occupied = [p for p in planned if os.path.lexists(p)]
-            if occupied:
-                return None, self._dry_run_refusal(occupied, disk_size)
+            if present:
+                return None, self._dry_run_refusal(present, disk_size)
 
-        linked = [p.name for p in planned if p.is_symlink()]
+        linked = [p.name for p, here, _ in checked if here is not None and stat.S_ISLNK(here.st_mode)]
         if linked:
             log(colorize("red", f"Refusing to continue: symlink(s) at planned output path(s): {', '.join(linked)}"))
             return None, BackupResult(False, self.config.output_path, disk_size,
                                       error_message=f"Symlink at planned output path(s): {', '.join(linked)}")
 
         if not self.config.dry_run:
-            existing_artifacts = [p for p in planned if p.exists()]
+            existing_artifacts = present
             if existing_artifacts and not self._confirm_overwrite(existing_artifacts):
                 names = ", ".join(p.name for p in existing_artifacts)
                 return None, BackupResult(False, self.config.output_path, disk_size,
                                           error_message=f"Aborted to avoid replacing existing artifact(s): {names}")
 
             self.config.attempt_token = f"attempt-{datetime.datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:6]}"
-        prepared = BackupPreparation(disk_info, disk_size, created_output_dir,
+        prepared = BackupPreparation(disk_info, disk_size, created_folders,
                                      self.config.artifacts)
         return prepared, None
+
+    def _create_output_folders(self) -> Tuple[List[Path], Optional[str]]:
+        """Create the output folder if it is missing, with any missing parent
+        folders, one level at a time from the top. Returns exactly the
+        folders this run made (top-down; only these ever change owner), and
+        why creation stopped, or None. The walk up stops at the nearest
+        folder that exists or cannot be checked (inspect_path: only "no such
+        file" means missing; an ancestor that cannot be checked is never
+        taken as missing); a folder that appears meanwhile (FileExistsError)
+        is not this run's. Any other mkdir error (a dangling symlink in the
+        path, no permission) stops creation there, for the caller to refuse."""
+        missing: List[Path] = []
+        folder = self.config.output_dir
+        while True:
+            here, problem = inspect_path(folder)
+            if here is not None or problem or folder.parent == folder:
+                break
+            missing.append(folder)
+            folder = folder.parent
+        created: List[Path] = []
+        for folder in reversed(missing):
+            try:
+                folder.mkdir()
+            except FileExistsError:
+                continue
+            except OSError as e:
+                return created, f"{folder} ({e})"
+            created.append(folder)
+        return created, None
 
     def _run_copy_phase(self, disk_size: int) -> CopyPhaseResult:
         tree_ok = False
@@ -1332,7 +1651,14 @@ class OpticalDiscBackup:
             except (Exception, KeyboardInterrupt) as e:
                 if isinstance(e, KeyboardInterrupt) and self.config.dry_run:
                     raise  # a dry run makes no master: Ctrl-C simply stops it
-                backup_error = "Interrupted by operator (Ctrl-C)" if isinstance(e, KeyboardInterrupt) else str(e)
+                if isinstance(e, KeyboardInterrupt):
+                    backup_error = "Interrupted by operator (Ctrl-C)"
+                    # A Ctrl-C while the copy's own error was being handled
+                    # (dd's teardown waits for dd) keeps that error too
+                    if iso_result is None and isinstance(e.__context__, Exception):
+                        backup_error += f" (after the copy had failed: {e.__context__})"
+                else:
+                    backup_error = str(e)
                 iso_analysis = {"skipped": True, "reason": f"backup failed: {backup_error}"}
                 log(colorize("red", f"Backup failed: {backup_error}"))
             finally:
@@ -1368,8 +1694,11 @@ class OpticalDiscBackup:
             success=phase.backup_error is None,
             iso_path=self.config.output_path,
             disk_size=disk_size,
+            # Whether a failed copy started is the fact recorded as the
+            # attempt ISO was created, never a look at the filesystem here
+            # (_mark_failed_attempt reconciles it with the ISO it finds)
             creation_path=(iso_result.output_path if iso_result else
-                           (attempt.iso if attempt.iso.exists() else None)),
+                           (attempt.iso if self._copy_started else None)),
             md5_iso=iso_result.md5_iso if iso_result else None,
             md5_raw=iso_result.md5_raw if iso_result else None,
             sha256_iso=iso_result.sha256_iso if iso_result else None,
@@ -1382,7 +1711,8 @@ class OpticalDiscBackup:
             eject_interrupted=self._eject_interrupted,
             unmount_interrupted=self._unmount_interrupted,
             flush_method=iso_result.flush_method if iso_result else None,
-            cache_bypass=iso_result.cache_bypass if iso_result else None
+            cache_bypass=iso_result.cache_bypass if iso_result else None,
+            control_errors=dict(self._control_errors)
         )
         self._classify_result(result, phase.tree_ok, iso_result, phase.iso_analysis)
         return result
@@ -1402,7 +1732,9 @@ class OpticalDiscBackup:
         elif result.success and not self.config.dry_run and not result.finalized:
             result.warnings.append("disc finalization (eject) failed")
         if result.success and not tree_ok:
-            result.warnings.append("tree listing failed or incomplete")
+            result.warnings.append("tree listing failed or incomplete" if self.config.mount_point else
+                                   "tree listing not made: the disc was not mounted (diskutil "
+                                   "reported no mount point)")
         if result.success and not self.config.dry_run and iso_analysis.get('error'):
             result.warnings.append(f"isolyzer structural analysis not performed ({iso_analysis['error']})")
         # Degraded-independence notes from the copy/verify pass (fsync or page-cache
@@ -1472,6 +1804,7 @@ class OpticalDiscBackup:
                                                      f"{e.__context__})")
                     else:
                         result.error_message = f"Could not publish verified attempt artifacts: {e}"
+                    result.error_message += f"; {self._publication_outcome()}"
                     result.success = False
                     result.warnings.extend(self._rollback_problems)
                     log(colorize("red", f"Backup failed: {result.error_message}"))
@@ -1488,11 +1821,13 @@ class OpticalDiscBackup:
                              "Ctrl-C was held until the failed publication's rollback had run "
                              "(any file it could not put back is listed in the warnings)"))
 
-    def _fix_ownership(self, result: BackupResult, created_output_dir: bool):
-        """Hand this run's files to SUDO_USER. Runs after the records are
-        final, so it is best effort throughout: a file that cannot be
-        checked is skipped with a warning, the others are still handed
-        over, and no error here changes the run's result or exit status."""
+    def _fix_ownership(self, result: BackupResult, created_folders: List[Path]):
+        """Hand this run's files, and the folders it created for them
+        (created_folders, never an existing ancestor), to SUDO_USER. Runs
+        after the records are final, so it is best effort throughout: a file
+        that cannot be checked is skipped with a warning, the others are
+        still handed over, and no error here changes the run's result or
+        exit status."""
         if self.config.dry_run:
             return  # a dry run's files changed owner as it created them; its new folder keeps its owner
         sudo_user = os.environ.get("SUDO_USER")
@@ -1502,9 +1837,8 @@ class OpticalDiscBackup:
             # This run's files where they actually are (see RecordView.current),
             # plus any staged record a failed rollback left elsewhere
             current = RecordView.from_run(self.config, result).current
-            artifacts = list(dict.fromkeys([*current.archive_order, *result.artifact_paths.values()]))
-            if created_output_dir:
-                artifacts.insert(0, self.config.output_dir)
+            artifacts = list(dict.fromkeys([*created_folders, *current.archive_order,
+                                            *result.artifact_paths.values()]))
             # The archive folder this run created, but not the archived files:
             # they keep whatever ownership their own run gave them
             if self._archive_dir is not None:
@@ -1568,7 +1902,7 @@ class OpticalDiscBackup:
                                                     phase.iso_analysis)
         try:
             self._generate_summary(result)
-            self._fix_ownership(result, prepared.created_output_dir)
+            self._fix_ownership(result, prepared.created_folders)
         except KeyboardInterrupt:
             if self.config.dry_run:
                 raise  # a dry run makes no master: Ctrl-C simply stops it
@@ -1611,6 +1945,14 @@ class OpticalDiscBackup:
         file not creatable, writable or closable, tree missing or failing)
         raises DryRunStopped instead."""
         log_divider("Generating Tree Listing")
+        if not self.config.mount_point:
+            # Never a guessed mount point: that could list another volume
+            reason = ("the disc is not mounted (diskutil reported no mount point), so its "
+                      "tree listing cannot be made")
+            if self.config.dry_run:
+                raise DryRunStopped(reason)
+            log(colorize("yellow", f"Warning: {reason}; continuing without one."))
+            return False
         tree_cmd = tree_command(self.config)
         try:
             log(colorize("cyan", "Generating tree listing..."))
@@ -1657,9 +1999,20 @@ class OpticalDiscBackup:
         if ANSI_ENABLED:
             print("\n" * 4, end="")
 
-        # A KeyboardInterrupt here propagates to create_backup(), which records
-        # the interruption as a failed run and renames the partial ISO.
-        with open(self.config.output_path, 'wb') as iso_file:
+        # Creating the attempt ISO and recording that this run created it are
+        # one step, with Ctrl-C held (a held Ctrl-C is acted on just after):
+        # a failed run's records then say whether its copy started from that
+        # fact, never from a later look at the filesystem. From here on a
+        # KeyboardInterrupt propagates to _run_copy_phase, which records the
+        # interruption as a failed run (the partial ISO gets a failed-* name).
+        held = DeferredInterrupt()
+        with held:
+            self._copy_attempted = True
+            iso_file = open(self.config.output_path, 'wb')
+            self._copy_started = True
+        with iso_file:
+            if held.received:
+                raise KeyboardInterrupt
             with subprocess.Popen(dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
                 while True:
                     chunk = proc.stdout.read(4 * 1024 * 1024)  # 4MB chunks
@@ -1687,32 +2040,29 @@ class OpticalDiscBackup:
                     log(dd_output)
 
             # Ask for the data to reach the media before the verification pass
-            # below: plain fsync on macOS may stop at the drive's cache, and
-            # F_FULLFSYNC asks the drive to flush it too (a drive or network
-            # volume may still not honour it, so neither is a guarantee)
+            # below (FlushFailed, raised here, fails the run unverified)
             iso_file.flush()
-            try:
-                fcntl.fcntl(iso_file.fileno(), fcntl.F_FULLFSYNC)
-                flush_method = "F_FULLFSYNC"
-            except (OSError, AttributeError):
-                os.fsync(iso_file.fileno())
-                flush_method = "fsync"
-                warnings.append("F_FULLFSYNC unavailable; fell back to fsync, which on "
-                                "macOS may not flush the drive's own write cache before "
-                                "verification")
-                log(colorize("yellow", f"Warning: {warnings[-1]}"))
+            flush_method = self._flush_for_verification(iso_file.fileno(), warnings)
 
         # Completeness check: a bit-perfect *equal* copy is not enough — it must
         # also be *complete*. dd exits 0 on a short read (bad sector, flaky USB
         # optical drive), and the streamed and re-read hashes would then match
         # over the same truncated bytes. Compare what we wrote against the disc's
-        # reported size and fail hard on any shortfall. (disk_size == 0 means the
-        # size was unknown up front, so there is nothing to compare against.)
+        # reported size and fail hard on any shortfall. An empty copy is never
+        # certified, whatever the size; when the size was not reported
+        # (disk_size 0), completeness cannot be checked, which is a warning.
         if disk_size and bytes_written < disk_size:
             raise RuntimeError(
                 f"Short read: copied {bytes_written} of {disk_size} bytes "
                 f"({disk_size - bytes_written} bytes missing). The disc may have a "
                 f"read error; the ISO is incomplete and will not be certified.")
+        if bytes_written == 0:
+            raise RuntimeError("dd produced no data: nothing was copied from the disc, so the "
+                               "empty ISO will not be certified")
+        if not disk_size:
+            warnings.append("the disc's size was not reported (diskutil TotalSize missing or 0), "
+                            "so the copy's completeness was not checked against it")
+            log(colorize("yellow", f"Warning: {warnings[-1]}"))
 
         creation_time = time.time() - start_time
         raw_hash = raw_hasher.hexdigest()
@@ -1743,17 +2093,7 @@ class OpticalDiscBackup:
             print("\n" * 4, end="")
 
         with open(self.config.output_path, 'rb') as iso_file:
-            # Ask macOS not to cache this read, so it is not simply served
-            # from memory (data the write left cached may still be used)
-            try:
-                fcntl.fcntl(iso_file.fileno(), fcntl.F_NOCACHE, 1)
-                cache_bypass = True
-            except (OSError, AttributeError):
-                cache_bypass = False
-                warnings.append("F_NOCACHE unavailable; the verification read may have "
-                                "been served from the page cache rather than re-read from "
-                                "disk, weakening the independence of the verification pass")
-                log(colorize("yellow", f"Warning: {warnings[-1]}"))
+            cache_bypass = self._set_nocache(iso_file.fileno(), warnings)
             while True:
                 chunk = iso_file.read(4 * 1024 * 1024)  # 4MB chunks
                 if not chunk:
@@ -1793,7 +2133,72 @@ class OpticalDiscBackup:
             flush_method=flush_method,
             cache_bypass=cache_bypass,
         )
-    
+
+    def _flush_for_verification(self, fd: int, warnings: List[str]) -> str:
+        """Ask for the written ISO to reach its media before verification and
+        return the flush applied. Plain fsync on macOS may stop at the
+        drive's cache; F_FULLFSYNC asks the drive to flush it too (a drive or
+        network volume may still not honour it, so neither is a guarantee).
+        Only an F_FULLFSYNC that is not supported (no such constant in fcntl,
+        or ENOTSUP/EOPNOTSUPP) falls back to fsync, with a warning naming the
+        errno. Any other F_FULLFSYNC error, or a failing fsync, raises
+        FlushFailed: the copy is not re-read, analysed or published. Every
+        error is kept in _control_errors."""
+        name = self.config.output_path.name
+        error: Optional[OSError] = None
+        command = getattr(fcntl, "F_FULLFSYNC", None)
+        if command is not None:
+            try:
+                fcntl.fcntl(fd, command)
+                return "F_FULLFSYNC"
+            except OSError as e:
+                error = e
+        # (handled outside the except: a later Ctrl-C is never chained to it)
+        fullfsync = self._control_errors["F_FULLFSYNC"] = control_error(error)
+        if fullfsync["treated_as"] == "failure":
+            raise FlushFailed(f"F_FULLFSYNC failed on {name}: {errno_text(fullfsync)}; "
+                              f"the copy was not verified") from error
+        try:
+            os.fsync(fd)
+            error = None
+        except OSError as e:
+            error = e
+        if error is not None:
+            fsync = self._control_errors["fsync"] = control_error(error, may_be_unsupported=False)
+            raise FlushFailed(f"fsync failed on {name}: {errno_text(fsync)}, after F_FULLFSYNC "
+                              f"was not supported ({errno_text(fullfsync)}); the copy was not "
+                              f"verified") from error
+        warnings.append("F_FULLFSYNC unavailable; fell back to fsync, which on macOS may not "
+                        "flush the drive's own write cache before verification "
+                        f"({control_error_text('F_FULLFSYNC', fullfsync)})")
+        log(colorize("yellow", f"Warning: {warnings[-1]}"))
+        return "fsync"
+
+    def _set_nocache(self, fd: int, warnings: List[str]) -> bool:
+        """Ask macOS not to cache the verification read, so it is not simply
+        served from memory (data the write left cached may still be used);
+        True when F_NOCACHE was set. Only a hint, so an error never fails
+        the run (a failing read itself still does): it is kept in
+        _control_errors with a warning, "unavailable" when not supported
+        (as for F_FULLFSYNC), otherwise "could not be set"."""
+        error: Optional[OSError] = None
+        command = getattr(fcntl, "F_NOCACHE", None)
+        if command is not None:
+            try:
+                fcntl.fcntl(fd, command, 1)
+                return True
+            except OSError as e:
+                error = e
+        nocache = self._control_errors["F_NOCACHE"] = control_error(error)
+        consequence = ("the verification read may have been served from the page cache rather "
+                       "than re-read from disk, weakening the independence of the verification pass")
+        cause = control_error_text("F_NOCACHE", nocache)
+        warnings.append(f"F_NOCACHE unavailable; {consequence} ({cause})"
+                        if nocache["treated_as"] == "unsupported" else
+                        f"F_NOCACHE could not be set ({cause}); {consequence}")
+        log(colorize("yellow", f"Warning: {warnings[-1]}"))
+        return False
+
     def _display_progress(self, title: str, current: int, total: int, start_time: float):
         """Display progress information"""
         if not ANSI_ENABLED:
@@ -2117,7 +2522,8 @@ class OpticalDiscBackup:
                 "used_space_bytes": disk_info.get('VolumeSize', result.disk_size),
                 "used_space_formatted": format_bytes(disk_info.get('VolumeSize', result.disk_size)),
                 "allocation_block_size": disk_info.get('VolumeAllocationBlockSize', disk_info.get('DeviceBlockSize', 'Unknown')),
-                "mount_point": disk_info.get('MountPoint', f"/Volumes/{self.config.volume_name}")
+                # As reported by diskutil; null when the disc was not mounted (never a guess)
+                "mount_point": disk_info.get('MountPoint') or None
             },
             
             "output_files": {
@@ -2133,7 +2539,9 @@ class OpticalDiscBackup:
             
             "operations_performed": {
                 "tree_listing": {
-                    "command": shlex.join(tree_command(self.config)),
+                    # null: not run, the disc was not mounted
+                    "command": (shlex.join(tree_command(self.config))
+                                if self.config.mount_point else None),
                     "output_file": record.files.tree.name,
                     "summary": tree_summary
                 },
@@ -2156,6 +2564,8 @@ class OpticalDiscBackup:
                                         if result.iso_path == self.config.canonical_output_path else
                                         "run-private attempt ISO was not promoted because the run failed")
                                        if result.creation_path and result.creation_path != self.config.canonical_output_path
+                                       else "not applicable: this run wrote no ISO"
+                                       if result.creation_path is None
                                        else "written directly to canonical filename"),
                     "block_size": "4MB",
                     "performed": bool(result.creation_path) and not self.config.dry_run
@@ -2207,11 +2617,16 @@ class OpticalDiscBackup:
                 "sha256_iso_hash": result.sha256_iso,
                 "sha256_source_hash": result.sha256_raw,
                 "hashes_match": result.checksum_match,
-                "verification_method": f"Source hashed in-stream during creation; {reread_wording(result.cache_bypass)} and hashed",
+                "verification_method": (f"Source hashed in-stream during creation; "
+                                        f"{reread_wording(result.cache_bypass, result.control_errors.get('F_NOCACHE'))} "
+                                        f"and hashed"),
                 # What was applied, as recorded by the copy: null when not recorded
                 "flush_before_verification": result.flush_method,
                 "verification_read_cache_bypass": result.cache_bypass,
-                "flush_note": flush_wording(result.flush_method),
+                "flush_note": flush_wording(result.flush_method, result.control_errors),
+                # Each control that did not return: errno, name, message and
+                # treated_as ("unsupported", or "failure"); {} when all returned
+                "control_errors": result.control_errors,
                 "integrity_status": "verified" if result.checksum_match else ("failed" if result.checksum_match is False else "not_performed"),
                 "notes": "Re-read ISO matches the source stream (MD5 and SHA-256)" if result.checksum_match else None
             },
@@ -2547,18 +2962,31 @@ def print_help():
   moved, unchanged, into {colorize('cyan', '<name>_overwritten-<stamp>-<rand>/')} and the new one is
   published. Ctrl-C is held during those few renames, so it cannot stop them
   halfway; if a rename fails they are rolled back as far as the filesystem
-  allows, and the records say where every file is.
+  allows, and the records say where every file is. A bundle file that cannot
+  be checked (an error other than "no such file") is never taken as absent:
+  the run is refused before anything starts (exit 1, nothing written); if
+  that happens by the time publication starts, nothing is archived or
+  replaced and the verified copy is kept under a failed-* name; after the
+  current bundle was archived, a name that cannot be checked is never
+  replaced or restored over, and the records say where the prior bundle is.
+  Under sudo, the bundle and any folders a run creates for it (the output
+  folder, and --dir and its parents where they were missing) are handed to
+  you; folders that already existed are left alone.
 
 {colorize('yellow', 'DRY RUNS:')}
   A --dry-run makes no ISO, but writes its own tree listing, log and manifest
   under the canonical names. It is refused (exit 1, nothing written) if any
   <name>.iso, .iso.log.txt, _manifest.json, _tree.txt or _isolyzer.xml is
-  already there, as a file, folder or symlink: choose a fresh --dir or
-  --filename. Other files in the folder are left alone. A dry run that fails
-  exits 1 and lists the files it created, which may be incomplete; remove only
-  those. Ctrl-C simply stops it and can leave them incomplete too. Under sudo,
-  the files a dry run creates are handed to you, but a folder it creates stays
-  owned by root; create the folder yourself first to manage it without sudo.
+  already there, as a file, folder or symlink, or cannot be checked: choose a
+  fresh --dir or --filename. It stops (exit 1, nothing created) if the disc is
+  not mounted, since its tree listing would have nothing to list (a normal run
+  goes on without a listing, with a warning). Other files in the folder are
+  left alone. A dry run that fails exits 1 and lists the files it created,
+  which may be incomplete; remove only those. Ctrl-C simply stops it and can
+  leave them incomplete too. Under sudo, the files a dry run creates are
+  handed to you, but folders it creates (the output folder, and --dir and its
+  parents where they were missing) stay owned by root; create the folder
+  yourself first to manage it without sudo.
 
 {colorize('yellow', 'EXIT STATUS:')}
   0 success; 1 failure (including a refused or failed dry run); 2 checksum

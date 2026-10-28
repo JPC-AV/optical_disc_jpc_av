@@ -23,7 +23,10 @@ that could not be checked (an inspection error other than "no such file"
 on the manifest or its ISO name). The report is announced only while its
 path still names the file this run wrote; these checks guard one
 operator's run, and a change to the path after the last check is not
-detected. No sudo needed.
+detected. An unfinished report is removed only while the run can show the
+path still names the file it created; if that cannot be checked, the file
+is left in place, and the run says so, as it does when a removal fails.
+No sudo needed.
 
 Usage:
   python3 verifyiso.py /path/to/collection [more/paths ...]
@@ -31,24 +34,42 @@ Usage:
 
 Exit codes:
   0    every checked ISO matched its recorded hashes, and every folder under
-       the given paths was searched (symlinks inside a search are never
-       followed: a symlinked folder counts only when its target was searched
-       through a given path; a symlink loop holds nothing)
+       the given paths was searched (symlinked folders inside a search are
+       never followed: one counts only when its target was searched through
+       a given path; a symlink loop, a link that leads back to itself, holds
+       nothing). A run in which every manifest was SKIPPED says that no
+       master was verified; when the search was complete it still exits 0
   1    at least one mismatch, missing ISO, unverifiable manifest or error; part
        of a given path could not be searched (DISCOVERY_ERROR) or a symlinked
        folder or dangling symlink was not searched (EXCLUDED); no manifests
-       were found; or the --csv report was refused or could not be written
-  130  interrupted with Ctrl-C (an unfinished report is removed)
+       were found; the --csv report was refused or could not be written; or
+       a given path could not be found ("Path not found": missing, a dangling
+       symlink, a path through a file, or one the system stops resolving
+       with "too many levels of symbolic links"), which stops the whole run
+       before anything is checked
+  2    the command line is not valid (no path, an unknown option, --csv with
+       no path); nothing is checked
+  130  interrupted with Ctrl-C (an unfinished report is removed while it can
+       be shown to be this run's file; if that cannot be checked, or the
+       removal fails, the run names the file left in place)
 
 Discovery: folders are listed one by one and every problem is reported, not
 skipped - a folder that cannot be listed, a listing that stops partway, an
 entry that cannot be inspected, a folder that disappears. Reachable folders
 and other paths are still searched, but the run then exits 1 even if every
-bundle found passed. No folder is skipped by name, so give the collection
+bundle found passed (a given path that cannot be found at all is different:
+see exit code 1). No folder is skipped by name, so give the collection
 folder rather than a volume root (whose system folders a normal user often
-cannot list). A given path that is a symlink is followed. A given file must
-be a *_manifest.json; a FIFO, device or socket named like a manifest is never
-opened (ERROR).
+cannot list). A given path that is a symlink is followed. A symlink inside a
+search, not named like a manifest, that the system will not follow (a loop,
+or a chain of more links than it follows) is followed one link at a time: a
+loop holds nothing, a longer chain is judged by where it ends, and one that
+cannot be followed to its end is a DISCOVERY_ERROR. Such a link at the ISO
+name, or named like a manifest, is an ERROR (not read, not hashed). A given
+file must be a *_manifest.json; a FIFO,
+device or socket named like a manifest is never opened (ERROR), and the ISO
+a manifest names is opened only when it is a regular file (anything else
+there is an ERROR, not opened).
 
 Manifests are classified by content, not by file name: a makeiso.py
 preservation record is checked; a makeiso-video.py access-copy record is
@@ -57,11 +78,16 @@ record is UNVERIFIABLE (and fails the audit) when it cannot be trusted to
 verify: missing or unrecognized run status, missing integrity record,
 missing MD5 source hash, a blank, non-text or malformed hash (including a
 declared SHA-256 with no SHA-256 hash), wrong field types, an ISO filename
-that tries to escape the manifest's own directory, a dry-run record lying
-next to an existing ISO (a dry run replaced that master's own manifest), or
-markers of both record families at once. A *_manifest.json that is neither
-family is UNVERIFIABLE too. These never silently pass. Explicitly failed
-runs and dry runs with no ISO are SKIPPED.
+that tries to escape the manifest's own directory or cannot name a file (an
+embedded NUL, or a character the file system cannot encode), a dry-run
+record lying next to an existing ISO (a dry run replaced that master's own
+manifest), or markers of both record families at once. A *_manifest.json
+that is neither family is UNVERIFIABLE too. These never silently pass.
+Explicitly failed runs and dry runs with nothing at all at the ISO name
+(not even a dangling symlink) are SKIPPED. MISSING_ISO means the ISO is
+not there (no such file, or a dangling symlink); an ISO that is there but
+cannot be inspected or read, or a
+dry-run record whose ISO name cannot be checked, is an ERROR.
 """
 
 import argparse
@@ -133,6 +159,9 @@ DISCOVERY_ERROR = "DISCOVERY_ERROR"
 EXCLUDED = "EXCLUDED"
 # A target that is not there: dangling, or a path component is a file
 TARGET_MISSING = (errno.ENOENT, errno.ENOTDIR)
+# Links followed one at a time, after os.stat gave up on a chain (ELOOP),
+# before it is reported as one that could not be followed to its end
+SYMLINK_CHAIN_LIMIT = 256
 
 
 @dataclass
@@ -160,6 +189,101 @@ def _target(path) -> Tuple[Optional[os.stat_result], Optional[OSError]]:
         return None, e
 
 
+def _entry(path) -> Tuple[Optional[os.stat_result], Optional[OSError]]:
+    """os.lstat of the entry itself (a dangling symlink is there):
+    (result, None), or (None, error)"""
+    try:
+        return os.lstat(path), None
+    except OSError as e:
+        return None, e
+
+
+def _realpath(path) -> Tuple[Optional[str], Optional[OSError]]:
+    """The real path of path, as the system reads it: (real path, None), or
+    (None, error) when a part of it is missing or cannot be inspected or
+    read. Never a guess: os.path.realpath takes a part it cannot inspect for
+    a plain folder, so '<symlink>/..' would name the link's own folder, a
+    different place. Symlinks followed are bounded by SYMLINK_CHAIN_LIMIT
+    (ELOOP beyond: a loop, or a chain too long to follow)"""
+    followed = 0
+
+    def resolve(base: str, rest: str) -> str:
+        nonlocal followed
+        if os.path.isabs(rest):
+            base = os.sep
+        for name in rest.split(os.sep):
+            if not name:
+                continue
+            if name in (os.curdir, os.pardir):
+                # base holds no symlink, so its parent is its real parent
+                if not stat.S_ISDIR(os.lstat(base).st_mode):
+                    raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), base)
+                if name == os.pardir:
+                    base = os.path.dirname(base)
+                continue
+            here = os.path.join(base, name)
+            if not stat.S_ISLNK(os.lstat(here).st_mode):
+                base = here
+                continue
+            followed += 1
+            if followed > SYMLINK_CHAIN_LIMIT:
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), here)
+            base = resolve(base, os.readlink(here))
+        return base
+
+    try:
+        path = os.fspath(path)
+        return resolve(os.sep if os.path.isabs(path) else os.getcwd(), path), None
+    except OSError as e:
+        return None, e
+
+
+def _physical(path) -> Tuple[Optional[str], Optional[OSError]]:
+    """The real path of the folder that holds path, plus path's own name
+    (never resolved): '<symlink>/..' names the link target's parent, as the
+    system reads it, not the folder the link sits in. (None, error) when
+    that folder cannot be resolved (see _realpath): never a guessed key"""
+    path = os.fspath(path)
+    folder, error = _realpath(os.path.dirname(path) or os.curdir)
+    if error is not None:
+        return None, error
+    return os.path.join(folder, os.path.basename(path)), None
+
+
+def _symlink_chain(path, error: OSError) -> Tuple[Optional[os.stat_result], Optional[OSError], int]:
+    """os.stat gave up on path with error (ELOOP), which a symlink loop gives,
+    but so does a chain of more links than the system follows. Follow the
+    chain one link at a time to tell them apart, and return (result, error,
+    links followed):
+      (None, None, n)   a link was reached again (same folder, name and file):
+                        a loop, which has no target and holds nothing;
+      (result, None, n) the entry the chain ends at;
+      (None, e, n)      what the chain leads to is missing or cannot be
+                        inspected, the folder of a link in it cannot be
+                        resolved (so a loop cannot be told apart), or the
+                        chain is longer than SYMLINK_CHAIN_LIMIT (then the
+                        original error)."""
+    current, seen = os.fspath(path), set()
+    while len(seen) <= SYMLINK_CHAIN_LIMIT:
+        st, failed = _entry(current)
+        if failed is not None:
+            return None, failed, len(seen)
+        if not stat.S_ISLNK(st.st_mode):
+            return st, None, len(seen)
+        here, failed = _physical(current)
+        if failed is not None:
+            return None, failed, len(seen)
+        link = (here, st.st_dev, st.st_ino)
+        if link in seen:
+            return None, None, len(seen)
+        seen.add(link)
+        try:
+            current = os.path.join(os.path.dirname(current), os.readlink(current))
+        except OSError as e:
+            return None, e, len(seen)
+    return None, error, len(seen)
+
+
 def find_preservation_manifests(roots: List[Path],
                                 issues: Optional[List[DiscoveryIssue]] = None) -> List[Path]:
     """Find every *_manifest.json under the roots. Which family a manifest
@@ -168,12 +292,17 @@ def find_preservation_manifests(roots: List[Path],
 
     Folders are listed one at a time with os.scandir, and anything that stops
     the search from being complete is recorded in issues instead of being
-    skipped: a path or folder that cannot be checked or listed, a listing that
+    skipped: a path or folder that cannot be checked or listed (including a
+    given path whose real path cannot be resolved: never searched under a
+    guessed identity, which could hide another bundle), a listing that
     stops partway (the entries already read are still used), an entry that
     cannot be inspected or disappears, a folder loop. Symlinks inside a search
     are never followed; one to a folder, or a dangling one, is EXCLUDED, and
-    counts as searched only if its target was listed through a given path. A
-    given symlink is followed. A candidate that is a FIFO, device or socket
+    counts as searched only if its target was listed through a given path.
+    One that os.stat gives up on (ELOOP) is followed a link at a time: only a
+    link reached again is an exempt loop; a longer chain is judged by where
+    it ends, and one that cannot be followed to its end is a DISCOVERY_ERROR.
+    A given symlink is followed. A candidate that is a FIFO, device or socket
     (or a link to one), or a link whose target cannot be checked, is returned
     but recorded as ERROR, never to be opened.
     Each manifest is returned once, however many given paths reach it.
@@ -212,7 +341,9 @@ def find_preservation_manifests(roots: List[Path],
 
     for root in roots:
         found: List[Tuple[Path, str]] = []
-        root_key = os.path.realpath(root)
+        root_key, unresolved = _realpath(root)
+        if root_key is None:
+            root_key = ("unresolved", os.fspath(root))  # equal to no real path
         try:
             root_st = os.stat(root)
         except FileNotFoundError:
@@ -223,13 +354,20 @@ def find_preservation_manifests(roots: List[Path],
             continue
         if stat.S_ISREG(root_st.st_mode):
             if root.name.endswith(MANIFEST_SUFFIX):
-                found.append((root, os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(root))),
-                                                 root.name)))
+                key, failed = _physical(root)
+                if failed is not None:
+                    note(root, root_key, DISCOVERY_ERROR, f"could not resolve its folder's real path: "
+                                                          f"{_reason(failed)}; not checked")
+                else:
+                    found.append((root, key))
             else:
                 note(root, root_key, DISCOVERY_ERROR, "not a manifest file (*_manifest.json); nothing "
                                                       "was checked for it - give its folder or its manifest")
         elif not stat.S_ISDIR(root_st.st_mode):
             note(root, root_key, DISCOVERY_ERROR, "not a file or folder; nothing was checked for it")
+        elif unresolved is not None:
+            note(root, root_key, DISCOVERY_ERROR, f"could not resolve its real path: {_reason(unresolved)}; "
+                                                  f"nothing was checked for it")
         else:
             stack = [(root, root_key, ((root_st.st_dev, root_st.st_ino),), (root,))]
             while stack:
@@ -288,19 +426,33 @@ def find_preservation_manifests(roots: List[Path],
                         except OSError:
                             text = "?"
                         st, error = _target(path)
+                        loop, via = False, ""
                         if error is not None and error.errno == errno.ELOOP:
+                            # ELOOP alone is no proof of a loop: a chain of more
+                            # links than the system follows gives it too
+                            st, error, links = _symlink_chain(path, error)
+                            loop = st is None and error is None
+                            via = (f" (a chain of {links} symlink(s))" if links <= SYMLINK_CHAIN_LIMIT else
+                                   f" (a chain of more than {SYMLINK_CHAIN_LIMIT} symlinks)")
+                        if loop:
                             note(path, child_key, EXCLUDED, f"symlink loop -> {text}; not followed",
                                  exempt=True)
                         elif error is not None and error.errno in TARGET_MISSING:
-                            note(path, child_key, EXCLUDED, f"symlink target missing -> {text}; "
+                            note(path, child_key, EXCLUDED, f"symlink target missing -> {text}{via}; "
                                                             f"not followed")
                         elif error is not None:
                             note(path, child_key, DISCOVERY_ERROR,
-                                 f"could not inspect symlink target -> {text}: {_reason(error)}")
+                                 f"could not inspect symlink target -> {text}{via}: {_reason(error)}")
                         elif stat.S_ISDIR(st.st_mode):
-                            issue = note(path, child_key, EXCLUDED, f"symlinked folder not followed -> {text}")
+                            issue = note(path, child_key, EXCLUDED,
+                                         f"symlinked folder not followed -> {text}{via}")
                             if issue is not None:
-                                folder_links.append((issue, os.path.realpath(path)))
+                                target, failed = _realpath(child_key)
+                                if failed is not None:  # stays EXCLUDED: never shown searched
+                                    issue.detail += (f" (whether its target was searched could not be "
+                                                     f"checked: {_reason(failed)})")
+                                else:
+                                    folder_links.append((issue, target))
         for path, key in sorted(found):
             if key not in seen:
                 seen.add(key)
@@ -337,23 +489,39 @@ def _normalize_hash(value) -> Optional[str]:
     return cleaned or None
 
 
+class NotRegularFile(OSError):
+    """What hash_file opened is not a regular file (it changed after it was
+    inspected); nothing was read from it"""
+
+
 def hash_file(path: Path, progress_label: str = "") -> tuple:
-    """One read, both digests. Returns (md5, sha256)."""
+    """One read, both digests. Returns (md5, sha256). Only a regular file is
+    read: it is opened without waiting (an ordinary open of a FIFO can block
+    forever) and checked with fstat before any byte is read; anything else
+    raises NotRegularFile."""
     md5 = hashlib.md5()
     sha256 = hashlib.sha256()
-    total = path.stat().st_size
-    done = 0
-    last_tick = time.time()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
-            md5.update(chunk)
-            sha256.update(chunk)
-            done += len(chunk)
-            if ANSI_ENABLED and total and time.time() - last_tick >= 0.2:
-                last_tick = time.time()
-                pct = done * 100 // total
-                sys.stdout.write(f"\r  hashing {progress_label}: {pct}%   ")
-                sys.stdout.flush()
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:  # the descriptor stays this function's (closefd=False): closed once, here
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise NotRegularFile(f"not a regular file: {path}")
+        os.set_blocking(fd, True)
+        total = st.st_size
+        done = 0
+        last_tick = time.time()
+        with open(fd, "rb", closefd=False) as f:
+            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                md5.update(chunk)
+                sha256.update(chunk)
+                done += len(chunk)
+                if ANSI_ENABLED and total and time.time() - last_tick >= 0.2:
+                    last_tick = time.time()
+                    pct = done * 100 // total
+                    sys.stdout.write(f"\r  hashing {_shown(progress_label)}: {pct}%   ")
+                    sys.stdout.flush()
+    finally:
+        os.close(fd)
     if ANSI_ENABLED:
         sys.stdout.write("\r" + " " * 70 + "\r")
         sys.stdout.flush()
@@ -363,15 +531,22 @@ def hash_file(path: Path, progress_label: str = "") -> tuple:
 def _report_alias(path: Path, report: Optional[Tuple[Path, Tuple[int, int]]]
                   ) -> Tuple[Optional[str], Optional[str]]:
     """Whether path is the --csv report this run reserved. ("proven", None):
-    the same path, or the same file reached through a symlink or another
-    spelling. ("uncertain", reason): what path leads to could not be
-    inspected, so it is not shown to be separate. (None, None): shown to be
-    another file, or nothing is there (no such file, or a path component is
-    a file), so it cannot be the report."""
+    the same path (its folder compared as the system reads it, so
+    '<symlink>/..' is never taken for the link's own folder), or the same
+    file reached through a symlink or another spelling. ("uncertain",
+    reason): what path leads to, or the real folder of path or of the
+    report, could not be inspected, so it is not shown to be separate.
+    (None, None): shown to be another file, or nothing is there (no such
+    file, or a path component is a file), so it cannot be the report."""
     if report is None:
         return None, None
     report_path, identity = report
-    if os.path.abspath(path) == os.path.abspath(report_path):
+    mine, error = _physical(path)
+    theirs, report_error = _physical(report_path)
+    for failed in (error, report_error):
+        if failed is not None and failed.errno not in TARGET_MISSING:
+            return "uncertain", _reason(failed)
+    if mine is not None and mine == theirs:
         return "proven", None
     st, error = _target(path)
     if error is not None:
@@ -396,6 +571,15 @@ def check_manifest(manifest_path: Path,
                          if alias == "proven" else
                          f"could not check whether this is the --csv report this run is "
                          f"writing ({reason}); not read")
+        return result
+    # Classified before it is read: only a regular file is ever opened, so a
+    # FIFO or device handed in directly cannot block the run
+    st, error = _target(manifest_path)
+    if error is not None:
+        result.detail = f"unreadable manifest: {error}"
+        return result
+    if not stat.S_ISREG(st.st_mode):
+        result.detail = "not a regular file (folder, FIFO, device or socket); not opened"
         return result
     try:
         raw = manifest_path.read_bytes()
@@ -480,6 +664,15 @@ def check_manifest(manifest_path: Path,
         return unverifiable("manifest ISO filename is not text")
     if iso_name != Path(iso_name).name or os.path.isabs(iso_name) or iso_name == "..":
         return unverifiable(f"manifest ISO filename is not a plain sibling name: {iso_name!r}")
+    # A name no file can have is a record defect, decided before any
+    # filesystem call (which would raise ValueError on it)
+    try:
+        os.fsencode(iso_name)
+        usable = "\x00" not in iso_name
+    except UnicodeEncodeError:
+        usable = False
+    if not usable:
+        return unverifiable(f"manifest ISO filename is not a usable file name: {iso_name!r}")
     result.iso = manifest_path.parent / iso_name
     alias, reason = _report_alias(result.iso, report)
     if alias:
@@ -492,11 +685,18 @@ def check_manifest(manifest_path: Path,
 
     if dry_run:
         # A dry run makes no master, so its record is a legitimate skip — but
-        # only when no ISO sits under the name it records. Next to an existing
-        # ISO it means a dry run replaced that master's own manifest.
-        if os.path.lexists(result.iso):
+        # only when nothing sits under the name it records (established, not
+        # assumed from an error). Next to an existing ISO it means a dry run
+        # replaced that master's own manifest.
+        _, error = _entry(result.iso)
+        if error is None:
             return unverifiable(f"dry-run record next to an existing ISO ({iso_name}) — "
                                 f"this master's own manifest may have been replaced")
+        if error.errno not in TARGET_MISSING:
+            result.detail = (f"could not check whether an ISO sits beside this dry-run record "
+                             f"({iso_name}): {_reason(error)}; a dry run may have replaced that "
+                             f"master's own manifest")
+            return result
         result.status = "SKIPPED"
         result.detail = "dry-run record — no master was made"
         return result
@@ -528,20 +728,32 @@ def check_manifest(manifest_path: Path,
     if "SHA-256" in algorithms and not sha_present:
         return unverifiable("manifest declares SHA-256 but records no SHA-256 source hash")
 
-    # exists/stat/hash handled as one unit: a file vanishing mid-check maps
-    # to MISSING_ISO, any other filesystem trouble (stale network handle,
-    # permissions) to ERROR — one bad item must never stop the batch
+    # Inspected before it is opened, the same way on every Python version:
+    # only "no such file" (or a dangling link) is MISSING_ISO; any other
+    # inspection error (stale network handle, permissions, too many levels of
+    # symlinks) is ERROR, and anything but a regular file is never opened. A file
+    # vanishing mid-check is MISSING_ISO — one bad item never stops the batch
     started = time.time()
-    try:
-        if not result.iso.exists():
+    st, error = _target(result.iso)
+    if error is not None:
+        if error.errno in TARGET_MISSING:
             result.status = "MISSING_ISO"
             result.detail = f"ISO not found next to manifest: {iso_name}"
-            return result
-        result.size_bytes = result.iso.stat().st_size
+        else:
+            result.detail = f"could not inspect ISO {iso_name}: {_reason(error)}"
+        return result
+    if not stat.S_ISREG(st.st_mode):
+        result.detail = f"ISO {iso_name} is not a regular file (folder, FIFO, device or socket); not opened"
+        return result
+    result.size_bytes = st.st_size
+    try:
         result.md5_actual, result.sha256_actual = hash_file(result.iso, result.iso.name)
     except FileNotFoundError:
         result.status = "MISSING_ISO"
         result.detail = f"ISO disappeared during check: {iso_name}"
+        return result
+    except NotRegularFile:
+        result.detail = f"ISO {iso_name} changed to a non-regular file during the check; not read"
         return result
     except OSError as e:
         result.detail = f"could not read ISO: {e}"
@@ -599,23 +811,23 @@ def reserve_report(path: Path) -> Tuple[int, Tuple[int, int]]:
     return fd, (st.st_dev, st.st_ino)
 
 
+# How _report_lost's answer starts when ownership could not be established
+REPORT_UNCHECKED = "could not be checked"
+
+
 def _report_lost(path: Path, identity: Tuple[int, int]) -> Optional[str]:
     """None while the report path still names the file this run created;
-    otherwise how that is known not to hold, or why it could not be checked"""
+    otherwise how that is known not to hold, or why it could not be checked
+    (then starting with REPORT_UNCHECKED)"""
     try:
         st = os.lstat(path)
     except FileNotFoundError:
         return "was removed"
     except OSError as e:
-        return f"could not be checked ({_reason(e)})"
+        return f"{REPORT_UNCHECKED} ({_reason(e)})"
     if (st.st_dev, st.st_ino) != identity:
         return "was replaced by another file"
     return None
-
-
-def _report_still_ours(path: Path, identity: Tuple[int, int]) -> bool:
-    """True while the report path still names the file this run created"""
-    return _report_lost(path, identity) is None
 
 
 def write_csv(results: List[CheckResult], out, discovery: Optional[List[DiscoveryIssue]] = None):
@@ -654,9 +866,10 @@ def main():
         description="Verify ISO preservation masters against their manifest hashes "
                     "(never changes an existing file)")
     parser.add_argument("paths", nargs="+", type=Path,
-                        help="Collection folders (searched recursively; symlinks inside them are "
-                             "listed, not followed) or manifest files. Give the collection folder "
-                             "rather than a volume root")
+                        help="Collection folders (searched recursively; symlinked folders inside "
+                             "them are listed, not searched through; a symlink named like a "
+                             "manifest, or at a manifest's ISO name, is followed to the file) or "
+                             "manifest files. Give the collection folder rather than a volume root")
     parser.add_argument("--csv", type=Path, metavar="PATH",
                         help="Write a CSV report of every check, and of every part of the search "
                              "that failed, to a NEW file; refused before anything is hashed if PATH "
@@ -678,15 +891,23 @@ def main():
     report_fd = None
     report_identity = None
     report_written = False
+    leave_in_place = False  # a check that decided a message could not be made
+    alias_note = ""         # a manifest names the report path as its ISO
     if report_path:
         try:
             report_fd, report_identity = reserve_report(report_path)
         except ReportError as e:
             print(colorize("red", str(e)))
             sys.exit(1)
-    report = (report_path, report_identity) if report_path else None
+        except KeyboardInterrupt:
+            # Whatever was created has no proven identity, so it is never removed
+            print(colorize("yellow", f"\nInterrupted by operator (Ctrl-C) while reserving the --csv "
+                                     f"report; anything now at {_shown(report_path)} was left in place "
+                                     f"(if this run created it, it is empty)"))
+            sys.exit(130)
 
     try:
+        report = (report_path, report_identity) if report_path else None
         issues: List[DiscoveryIssue] = []
         manifests = find_preservation_manifests(roots, issues)
         never_open = {i.path: i.detail for i in issues if i.status == "ERROR"}
@@ -697,9 +918,11 @@ def main():
         expected = sorted((i for i in issues if i.status != "ERROR" and i.exempt),
                           key=lambda i: str(i.path))
         for issue in incomplete:
-            print(colorize(STATUS_COLOR[issue.status], f"  {issue.status}: {_shown(issue.path)}: {issue.detail}"))
+            print(colorize(STATUS_COLOR[issue.status],
+                           f"  {issue.status}: {_shown(issue.path)}: {_shown(issue.detail)}"))
         for issue in expected:
-            print(colorize("yellow", f"  Not searched (symlink, expected): {_shown(issue.path)}: {issue.detail}"))
+            print(colorize("yellow", f"  Not searched (symlink, expected): {_shown(issue.path)}: "
+                                     f"{_shown(issue.detail)}"))
         if not manifests and not incomplete:
             sys.exit("No manifests (*_manifest.json) found under the given paths.")
 
@@ -712,7 +935,8 @@ def main():
         else:
             print(colorize("red", "No manifests found in the parts of the given paths that could be searched."))
         for i, manifest_path in enumerate(manifests, 1):
-            print(colorize("cyan", f"[{i}/{len(manifests)}] {manifest_path.parent.name}/{manifest_path.name}"))
+            print(colorize("cyan", f"[{i}/{len(manifests)}] "
+                                   f"{_shown(manifest_path.parent.name)}/{_shown(manifest_path.name)}"))
             # One bad item must never stop the batch: anything unexpected
             # becomes an ERROR for this manifest and the next one is checked
             if manifest_path in never_open:
@@ -733,7 +957,7 @@ def main():
                     r = CheckResult(manifest=manifest_path, status="ERROR",
                                     detail=f"could not check this manifest: {type(e).__name__}: {e}")
             results.append(r)
-            line = f"  {r.status}: {r.detail or ''}"
+            line = f"  {r.status}: {_shown(r.detail or '')}"
             if r.status == "PASS" and r.seconds:
                 speed = (r.size_bytes / (1024 * 1024)) / r.seconds if r.seconds else 0
                 line += f" — {r.size_bytes / (1024*1024):.0f} MB in {r.seconds:.1f}s ({speed:.0f} MB/s)"
@@ -750,6 +974,10 @@ def main():
         for status in ("PASS", "FAIL", "MISSING_ISO", "UNVERIFIABLE", "ERROR", "SKIPPED"):
             if counts.get(status):
                 print(colorize(STATUS_COLOR[status], f"  {status}: {counts[status]}"))
+        if results and all(r.status == "SKIPPED" for r in results):
+            # Not a failure (skips never are), but nothing was hashed
+            print(colorize("yellow", f"No master was verified: all {len(results)} manifest(s) "
+                                     f"were skipped"))
         if incomplete:
             searched = {s: sum(1 for i in incomplete if i.status == s) for s in (DISCOVERY_ERROR, EXCLUDED)}
             print(colorize("red", "Search incomplete: " + "; ".join(
@@ -762,9 +990,9 @@ def main():
             print()
             print(colorize("red", "Items needing attention:"))
             for r in bad:
-                print(colorize("red", f"  {r.iso or r.manifest}: {r.status} — {r.detail}"))
+                print(colorize("red", f"  {_shown(r.iso or r.manifest)}: {r.status} — {_shown(r.detail)}"))
             for issue in incomplete:
-                print(colorize("red", f"  {_shown(issue.path)}: {issue.status} — {issue.detail}"))
+                print(colorize("red", f"  {_shown(issue.path)}: {issue.status} — {_shown(issue.detail)}"))
 
         if report_path:
             aliased = [r for r in results if r.report_alias == "proven"]
@@ -775,20 +1003,27 @@ def main():
                 reasons = []
                 if aliased:
                     reasons.append(f"{len(aliased)} manifest(s) name it as their ISO or as "
-                                   f"themselves (first: {aliased[0].manifest})")
+                                   f"themselves (first: {_shown(aliased[0].manifest)})")
                 if uncertain:
                     reasons.append(f"for {len(uncertain)} manifest(s) it could not be checked "
                                    f"whether they or their ISO are the report (first: "
-                                   f"{uncertain[0].manifest})")
-                print(colorize("red", f"\nNot keeping CSV report {report_path}: "
+                                   f"{_shown(uncertain[0].manifest)})")
+                named = [r for r in aliased if r.iso is not None]
+                if named:
+                    alias_note = (f"; {_shown(named[0].manifest)} names that path as its ISO, so "
+                                  f"until it is removed a check of that manifest reads it")
+                print(colorize("red", f"\nNot keeping CSV report {_shown(report_path)}: "
                                       + "; ".join(reasons) + "; choose a --csv path that no "
                                       "manifest names, and resolve any inspection error above"))
                 sys.exit(1)
             # Write only into the file this run reserved; if something else
-            # has taken its place, leave that alone and report the failure
+            # has taken its place, leave that alone and report the failure.
+            # A path whose check could not be made is never removed later,
+            # so the message stays true
             lost = _report_lost(report_path, report_identity)
             if lost:
-                print(colorize("red", f"\nCould not write CSV report: {report_path} {lost} "
+                leave_in_place = lost.startswith(REPORT_UNCHECKED)
+                print(colorize("red", f"\nCould not write CSV report: {_shown(report_path)} {lost} "
                                       f"during the run; nothing was written to it and nothing "
                                       f"there was removed"))
                 sys.exit(1)
@@ -803,7 +1038,8 @@ def main():
                 # it guards one operator's run, not a hostile concurrent writer.
                 lost = _report_lost(report_path, report_identity)
                 if lost:
-                    print(colorize("red", f"\nCould not save CSV report: {report_path} {lost} "
+                    leave_in_place = lost.startswith(REPORT_UNCHECKED)
+                    print(colorize("red", f"\nCould not save CSV report: {_shown(report_path)} {lost} "
                                           f"while the report was being written; nothing there "
                                           f"was removed, and it cannot be shown to hold this "
                                           f"run's report"))
@@ -812,27 +1048,37 @@ def main():
                 os.close(fd)
             except Exception as e:
                 # The report is part of the deliverable for a scheduled audit
-                print(colorize("red", f"\nCould not write CSV report: {e}"))
+                print(colorize("red", f"\nCould not write CSV report: {_shown(e)}"))
                 sys.exit(1)
             report_written = True
-            print(colorize("cyan", f"\nCSV report written to: {report_path}"))
+            print(colorize("cyan", f"\nCSV report written to: {_shown(report_path)}"))
 
         sys.exit(1 if bad or incomplete or not results else 0)
     except KeyboardInterrupt:
         print(colorize("yellow", "\nInterrupted by operator (Ctrl-C)"
                                  + ("" if report_written else " — verification incomplete"
-                                    + (", no report written" if report_path else ""))))
+                                    + ("; the --csv report was not completed" if report_path else ""))))
         sys.exit(130)
     finally:
-        # An unfinished report never survives the run: remove it, but only
-        # while its path still names the file this run created (checked while
-        # the descriptor is still open, so its identity cannot be reused)
+        # An unfinished report is removed only while its path still names the
+        # file this run created (checked while the descriptor is still open,
+        # so its identity cannot be reused), and never after a check that
+        # decided a message could not be made. A removal that fails, or a
+        # check that cannot be made here, is reported with the path
         if report_path and not report_written:
-            if _report_still_ours(report_path, report_identity):
-                try:
-                    os.unlink(report_path)
-                except OSError:
-                    pass
+            if not leave_in_place:  # otherwise already said: nothing there was removed
+                lost = _report_lost(report_path, report_identity)
+                if lost is None:
+                    try:
+                        os.unlink(report_path)
+                    except OSError as e:
+                        print(colorize("red", f"\nCould not remove the unfinished --csv report "
+                                              f"{_shown(report_path)} ({_reason(e)}); it is the file "
+                                              f"this run created: remove it yourself{alias_note}"))
+                elif lost.startswith(REPORT_UNCHECKED):
+                    print(colorize("red", f"\nThe unfinished --csv report was left in place: whether "
+                                          f"{_shown(report_path)} still names the file this run "
+                                          f"created {lost}{alias_note}"))
             if report_fd is not None:
                 try:
                     os.close(report_fd)

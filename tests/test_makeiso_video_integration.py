@@ -351,7 +351,7 @@ class ArchiveAndSelectionTests(Base):
     def test_archive_only_batch_processes_nothing_and_exits_0(self):
         results = video.process_batch(self.isos, self.isos, "T071")
         self.assertEqual(results, {"processed": 0, "success": 0, "skipped": 0,
-                                   "unverified": 0, "failed": 0})
+                                   "unverified": 0, "failed": 0, "discovery_errors": []})
         self.assertEqual(self.main_exit("--batch", str(self.isos)), 0)
         self.assertEqual((self.mounted, self.tools.probes, self.tools.encodes), ([], [], []))
         self.assertEqual(sorted(p.name for p in self.archived.parent.rglob("*")),
@@ -374,9 +374,12 @@ class ArchiveAndSelectionTests(Base):
 
 
 class RecordFailureAfterPromotionTests(Base):
-    """Records are written after promotion: if they cannot be, the run fails
-    and the MP4s it promoted stay (no rollback), beside incomplete or stale
-    records, as the README's qualified guidance says"""
+    """Records are written after promotion, the canonical log and manifest
+    to temporary files renamed into place (T-144). If they cannot be
+    written, the run fails and the MP4s it promoted stay (no rollback); the
+    earlier canonical records stay whole, and this run's failure records
+    say they no longer match. If those cannot be written either, the
+    screen says so"""
 
     def setUp(self):
         super().setUp()
@@ -387,41 +390,65 @@ class RecordFailureAfterPromotionTests(Base):
         self.log = self.out / "JPC_AV_00001.mp4.log.txt"
         self.manifest = self.out / "JPC_AV_00001_access_manifest.json"
 
-    def assert_promoted_without_run_records(self):
+    def assert_promoted_beside_earlier_records(self):
         self.assertEqual(self.mp4.read_bytes(), b"SYNTHETIC ACCESS COPY access_JPC_AV_00001")
         self.assertTrue(any("Could not write run records" in line for line in self.lines))
-        for pattern in ("*_failed-*", "*_aborted-*"):
-            self.assertEqual(self.names(self.out, pattern), [], pattern)
+        self.assertEqual(self.log.read_bytes(), self.earlier[self.log])
+        self.assertEqual(self.manifest.read_bytes(), self.earlier[self.manifest])
+        self.assertEqual(self.names(self.out, "*.writing-*"), [], "a temporary record was left")
+        self.assertEqual(self.names(self.out, "*_aborted-*"), [])
         self.assert_no_attempt_files(self.out)
 
     def test_incomplete_manifest_after_complete_promotion(self):
-        def broken_manifest(converter, result):
-            with open(converter.config.manifest_path, "w") as f:
-                f.write('{"conversion_metadata": {')
-            raise OSError(28, "synthetic: no space left on device")
+        # The canonical manifest's write fails partway (the stub writes part
+        # of it, then fails): it goes to a temporary file, never in place
+        real_dump, fired = json.dump, []
 
-        with mock.patch.object(video.ISOToMP4Converter, "_create_manifest", broken_manifest):
-            result = self.convert(self.iso, self.out)
-        self.assertFalse(result.success or result.unverified or result.skipped)
-        self.assertTrue(result.error_message.startswith("Run records could not be written"),
-                        result.error_message)
-        self.assertEqual(result.canonical_files_changed, [self.mp4])
-        self.assertTrue(result.titles[0].replaced_existing_canonical)
-        self.assert_promoted_without_run_records()
-        self.assertNotEqual(self.log.read_bytes(), self.earlier[self.log], "log not rewritten")
-        self.assertEqual(verify.check_manifest(self.manifest).status, "ERROR")
+        def broken_dump(obj, fp, *args, **kwargs):
+            if not fired:
+                fired.append(fp.name)
+                fp.write('{"conversion_metadata": {')
+                raise OSError(28, "synthetic: no space left on device")
+            return real_dump(obj, fp, *args, **kwargs)
+
+        with mock.patch.object(video.json, "dump", broken_dump):
+            self.assertEqual(self.main_exit("-i", str(self.iso)), 1)
+        self.assertTrue(fired)
+        self.assertTrue(any(line.startswith("Conversion failed: Run records could not be written")
+                            for line in self.lines))
+        self.assert_promoted_beside_earlier_records()
+        self.assertEqual(verify.check_manifest(self.manifest).status, "SKIPPED")
+        failed = self.record(self.out, "JPC_AV_00001_failed-*_manifest.json")
+        status = failed["conversion_status"]
+        self.assertEqual(status["overall_status"], "error")
+        self.assertEqual(status["canonical_files_changed"], [str(self.mp4)])
+        self.assertTrue(failed["titlesets"]["outputs"][0]["replaced_existing_canonical"])
+        self.assertTrue(any("no longer match" in w and self.manifest.name in w and self.log.name in w
+                            for w in status["warnings"]), status["warnings"])
+        self.assertEqual(len(self.names(self.out, "JPC_AV_00001_failed-*.log.txt")), 1)
+        failed_path = next(self.out.glob("JPC_AV_00001_failed-*_manifest.json"))
+        self.assertEqual(verify.check_manifest(failed_path).status, "SKIPPED")
 
     def test_stale_records_after_complete_promotion_exit_1(self):
-        def broken_log(converter, result, dry_run=False, is_error=False, failure_token=None):
+        # Every log write fails, the failure records' too: nothing is
+        # recorded, and the screen says what the records would have
+        calls = []
+
+        def broken_log(converter, result, **kwargs):
+            calls.append(kwargs.get("token"))
             raise OSError(28, "synthetic: no space left on device")
 
         with mock.patch.object(video.ISOToMP4Converter, "_create_log_file", broken_log):
             self.assertEqual(self.main_exit("-i", str(self.iso)), 1)
         self.assertTrue(any(line.startswith("Conversion failed: Run records could not be written")
                             for line in self.lines))
-        self.assert_promoted_without_run_records()
-        self.assertEqual(self.log.read_bytes(), self.earlier[self.log])
-        self.assertEqual(self.manifest.read_bytes(), self.earlier[self.manifest])
+        self.assertTrue(any(line.startswith("Could not write failure records either")
+                            for line in self.lines), self.lines)
+        self.assertTrue(any(line.startswith("Not recorded: this run replaced or created JPC_AV_00001.mp4")
+                            and "no longer match" in line for line in self.lines), self.lines)
+        self.assert_promoted_beside_earlier_records()
+        self.assertEqual(self.names(self.out, "*_failed-*"), [])
+        self.assertEqual(len(calls), 2, "the log write was not attempted for both kinds of records")
 
 
 if __name__ == "__main__":

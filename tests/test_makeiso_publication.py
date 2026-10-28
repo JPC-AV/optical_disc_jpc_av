@@ -6,6 +6,13 @@ change an existing file, a symlink's target or ownership (T-128). Also failed
 runs whose records name where each of their files actually is after failed or
 interrupted renames (T-131), unreadable metadata that is recorded as unknown
 rather than absent, and diskutil or chown that cannot be started (T-133).
+Also prior-bundle and staged files that cannot be checked, never taken as
+absent (T-142); flush and cache controls that fail, classified and recorded
+(T-143); failure records that say whether the copy started from a recorded
+fact, name never-started ISOs and kept staged records truthfully, keep a copy
+error's cause and treat end of input as "no" (T-152, T-153); and copy inputs:
+empty copies, unknown disc sizes, created folders, unmounted discs and the
+log's encoding (T-154).
 
 Standard library only. The drive is fake: disk info, tree listing, unmount,
 copy, isolyzer and eject are synthetic stand-ins writing small byte strings
@@ -54,6 +61,7 @@ support.install()
 imaging = support.load("makeiso_under_test", "makeiso.py")
 verify = support.load("verifyiso_under_test", "verifyiso.py")
 imaging.logger.disabled = True
+REAL_CONFIRM = imaging.OpticalDiscBackup._confirm_overwrite  # the real overwrite prompt
 
 NAME = "disc"
 CANONICAL = (f"{NAME}.iso", f"{NAME}.iso.log.txt", f"{NAME}_manifest.json",
@@ -660,6 +668,28 @@ class DryRunTests(Base):
         self.assert_refused(before, code, lines)
         self.assertEqual(verify_cli(self.dir)[0], 0, "the existing master no longer verifies")
 
+    def test_a_name_that_cannot_be_checked_refuses_the_dry_run(self):
+        # T-142 (R1-D5): never taken as free, whatever else is there; the
+        # refusal names it and its error first, then any taken names
+        for taken in ((), (TREE,)):
+            with self.subTest(also_taken=taken):
+                folder = self.case("unchecked-" + ("and-taken" if taken else "alone"))
+                (folder / f"{NAME}.iso").write_bytes(b"existing master")
+                for name in taken:
+                    (folder / name).write_text("taken")
+                before, fired = state(self.dir), []
+                with unreadable({folder / f"{NAME}.iso"}, fired):
+                    code, lines = self.dry_main(folder)
+                self.assertTrue(fired, "the check never failed")
+                self.assert_refused(before, code, lines)
+                message = self.stop_message(lines)
+                self.assertTrue(message.startswith(f"Dry run refused: could not check {NAME}.iso ("),
+                                message)
+                self.assertIn("Input/output error", message)
+                self.assertNotIn("already holds", message)
+                for name in taken:
+                    self.assertIn(name, message)
+
     def test_live_and_broken_symlinks_refuse_and_their_targets_stay(self):
         targets = self.case("targets")
         for i, name in enumerate(CANONICAL):
@@ -1172,11 +1202,14 @@ class ReceiptTests(Base):
 # --- unreadable metadata (C2 follow-up) ---------------------------------------
 
 @contextlib.contextmanager
-def unreadable(armed: set):
+def unreadable(armed: set, fired: list = None):
     """os.stat, os.lstat, Path.stat and Path.lstat raise EIO for each path the
     caller puts in `armed`, from the moment it does (pathlib on 3.9/3.10 keeps
-    its own reference to os.stat, so both levels are patched)"""
+    its own reference to os.stat, so both levels are patched). Each failed
+    call's path is appended to `fired`, when given."""
     def fail(path):
+        if fired is not None:
+            fired.append(os.fsdecode(path))
         raise OSError(errno.EIO, "synthetic: Input/output error", os.fsdecode(path))
 
     def os_level(real):
@@ -1575,7 +1608,8 @@ def _child_main(scenario: str, folder: Path) -> int:
         p, t = Path(path), Path(target)
         if scenario == "publish_mid" and "attempt-" in p.name and p.name.endswith("_tree.txt"):
             _send_sigint_once(state)
-        if scenario == "rollback_mid" and "attempt-" in p.name and p.name.endswith("_manifest.json"):
+        if scenario in ("rollback_mid", "rollback_unchecked") and "attempt-" in p.name \
+                and p.name.endswith("_manifest.json"):
             raise OSError("synthetic publication failure")
         if scenario == "rollback_mid" and "_overwritten-" in str(p) and p.name.endswith(".iso"):
             _send_sigint_once(state)
@@ -1644,6 +1678,42 @@ def _child_main(scenario: str, folder: Path) -> int:
     dry_run = scenario.startswith("dry_")
     if dry_run:
         drive["real_tree"] = True
+
+    # makeiso's own copy (dd faked): SIGINT as the attempt ISO is created
+    # (copy_open), or while dd is torn down after a write error (dd_teardown)
+    class TeardownDd(FakeDd):
+        class Process(FakeDd.Process):
+            def __exit__(self, *exc):
+                if exc[0] is not None:
+                    _send_sigint_once(state)
+                return False
+
+    dd = (FakeDd(new) if scenario == "copy_open" else
+          TeardownDd(new) if scenario == "dd_teardown" else None)
+    if dd is not None:
+        drive["real_copy"] = True
+
+    def copy_open(file, mode="r", *args, **kwargs):
+        attempt_iso = (mode == "wb" and "_attempt-" in Path(file).name
+                       and Path(file).name.endswith(".iso"))
+        if attempt_iso and scenario == "dd_teardown":
+            return FailingFile(REAL_OPEN(file, mode, *args, **kwargs), "write")
+        opened = REAL_OPEN(file, mode, *args, **kwargs)
+        if attempt_iso:
+            _send_sigint_once(state)
+        return opened
+
+    # rollback_unchecked: SIGINT as the rollback starts, when the archived
+    # master can no longer be checked
+    unchecked = set()
+    real_restore = imaging.OpticalDiscBackup._restore_archived_artifacts
+
+    def restore(self, archived, clear=True):
+        if self._archive_dir is not None and not state.get("sent"):
+            unchecked.add(Path(self._archive_dir) / f"{NAME}.iso")
+            _send_sigint_once(state)
+        return real_restore(self, archived, clear=clear)
+
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.object(Path, "replace", replace))
         stack.enter_context(mock.patch.object(Path, "rename", rename))
@@ -1654,12 +1724,21 @@ def _child_main(scenario: str, folder: Path) -> int:
             stack.enter_context(restore_exit)
         if disk_tools is not None:
             stack.enter_context(mock.patch.object(imaging.subprocess, "run", disk_tools.run))
+        if dd is not None:
+            stack.enter_context(mock.patch.object(imaging.subprocess, "Popen", dd))
+            stack.enter_context(mock.patch.object(imaging, "open", copy_open, create=True))
+        if scenario == "rollback_unchecked":
+            stack.enter_context(unreadable(unchecked))
+            stack.enter_context(mock.patch.object(imaging.OpticalDiscBackup,
+                                                  "_restore_archived_artifacts", restore))
         try:
             code = run_main(folder, new, dry_run=dry_run, **drive)
         finally:
             print("SIGINT_SENT:", bool(state.get("sent")))
             if disk_tools is not None:
                 print("DISK_CALLS:", disk_tools.disk)
+            if dd is not None:
+                print("DD_CALLS:", dd.argv)
     print("HANDLER_RESTORED:", signal.getsignal(signal.SIGINT) is signal.default_int_handler)
     return code
 
@@ -1827,6 +1906,61 @@ class InterruptTests(Base):
         self.assertNotIn("eject error", log_text)
         self.assertIn("Status:  Not started", log_text)
 
+    def assert_prior_bundle_untouched_by_failed_copy(self, output):
+        self.assertNotIn("Traceback", output)
+        self.assertIn("HANDLER_RESTORED: True", output)
+        self.assertEqual(canonical(self.dir)[f"{NAME}.iso"], b"old verified synthetic master")
+        self.assertEqual(sorted(canonical(self.dir)), sorted(CANONICAL))
+        self.assertEqual(archives(self.dir), [])
+        self.assertEqual(sorted(self.dir.glob("*attempt-*")), [], "attempt files left unmarked")
+        record = json.loads(one(self.dir, f"{NAME}_failed-*_manifest.json").read_text())
+        creation = record["operations_performed"]["iso_creation"]
+        self.assertEqual((creation["performed"], creation["command"]), (True, "dd if=/dev/rdisk9 bs=4m"))
+        log_text = one(self.dir, f"{NAME}_failed-*.iso.log.txt").read_text()
+        self.assertIn("  Command: dd if=/dev/rdisk9 bs=4m\n", log_text)
+        self.assertNotIn("Not started", log_text)
+        iso = self.dir / record["output_files"]["iso_filename"]
+        self.assertTrue(iso.name.endswith(".iso.partial") and iso.is_file(), iso.name)
+        return record, iso
+
+    def test_sigint_as_the_copy_creates_its_iso_is_recorded_as_a_started_copy(self):
+        # T-152: the attempt ISO's creation and the fact recorded for it are
+        # one held step; the Ctrl-C is acted on just after, before dd starts
+        code, output = self.child("copy_open")
+        self.assertEqual(code, 1, output)
+        record, iso = self.assert_prior_bundle_untouched_by_failed_copy(output)
+        self.assertEqual(record["backup_status"]["errors"], "Interrupted by operator (Ctrl-C)")
+        self.assertEqual(iso.read_bytes(), b"")
+        self.assertIs(record["backup_status"]["iso_created"], True)
+
+    def test_sigint_in_dd_teardown_after_a_copy_error_keeps_that_error(self):
+        # O2: the write fails (disk full), then Ctrl-C lands while dd is torn down
+        code, output = self.child("dd_teardown")
+        self.assertEqual(code, 1, output)
+        record, _ = self.assert_prior_bundle_untouched_by_failed_copy(output)
+        errors = record["backup_status"]["errors"]
+        self.assertTrue(errors.startswith("Interrupted by operator (Ctrl-C)"), errors)
+        self.assertIn("no space left on device", errors)
+
+    def test_sigint_during_a_rollback_that_cannot_check_the_archived_master(self):
+        # T-142 (R1-D3) under a real, held SIGINT: nothing is restored past the
+        # archived master that cannot be checked; the prior bundle stays whole
+        code, output = self.child("rollback_unchecked")
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("Traceback", output)
+        self.assertIn("HANDLER_RESTORED: True", output)
+        self.assertEqual(canonical(self.dir), {}, "a prior file was restored")
+        folders = archives(self.dir)
+        self.assertEqual(len(folders), 1)
+        self.assertEqual(sorted(p.name for p in folders[0].iterdir()), sorted(CANONICAL))
+        self.assertEqual((folders[0] / f"{NAME}.iso").read_bytes(), b"old verified synthetic master")
+        self.assertEqual(verify.check_manifest(folders[0] / f"{NAME}_manifest.json").status, "PASS")
+        record = json.loads(one(self.dir, f"{NAME}_failed-*_manifest.json").read_text())
+        status = record["backup_status"]
+        self.assertTrue(any(folders[0].name in w and "nothing was restored" in w
+                            for w in status["warnings"]), status["warnings"])
+        self.assertEqual(manifests_claiming_success(self.dir, "*_failed-*_manifest.json"), [])
+
 
 # --- the verified ISO at publication (T-136) ----------------------------------
 
@@ -1892,8 +2026,8 @@ class VerifiedIsoTests(Base):
         self.assertFalse(os.path.lexists(folder / files["iso_filename"]))
 
     def test_an_uninspectable_verified_iso_fails_before_anything_is_archived(self):
-        # Path.exists raises EIO on 3.9-3.13 and returns False on 3.14: the
-        # outcome must be the same failure either way
+        # Path.exists raises EIO on 3.9-3.13 and returns False on 3.14; makeiso
+        # checks with os.lstat on both, so the outcome is the same failure
         folder = self.subfolder("unreadable")
         old = canonical(folder)
         armed = set()
@@ -1984,16 +2118,20 @@ class FakeDd:
 
 
 @contextlib.contextmanager
-def fcntl_controls(unavailable=()):
-    """fcntl.fcntl with F_FULLFSYNC and/or F_NOCACHE failing as unsupported;
+def fcntl_controls(unavailable=(), errors=None):
+    """fcntl.fcntl with F_FULLFSYNC and/or F_NOCACHE failing as unsupported
+    (ENOTSUP), or raising the exception `errors` maps the control to;
     every other call, and a control that is available, reaches the real
-    fcntl. Yields the controls makeiso requested, in order."""
-    real, requested = imaging.fcntl.fcntl, []
+    fcntl. A constant missing from makeiso's fcntl is never requested.
+    Yields the controls makeiso requested, in order."""
+    real, requested, errors = imaging.fcntl.fcntl, [], errors or {}
 
     def call(fd, cmd, *args):
         for name in ("F_FULLFSYNC", "F_NOCACHE"):
-            if cmd == getattr(imaging.fcntl, name):
+            if cmd == getattr(imaging.fcntl, name, None):
                 requested.append(name)
+                if name in errors:
+                    raise errors[name]
                 if name in unavailable:
                     raise OSError(errno.ENOTSUP, f"synthetic: {name} is not supported here")
         return real(fd, cmd, *args)
@@ -2003,19 +2141,22 @@ def fcntl_controls(unavailable=()):
 
 
 def image(folder: Path, name=NAME, mount_point="/Volumes/SYNTHETIC", unavailable=(),
-          real_copy=True, **drive):
+          real_copy=True, errors=None, payload=NEW, dd=None, **drive):
     """One run with makeiso's own tree listing and (unless real_copy is
     False) its own copy and verification: tree, dd and the fcntl controls
-    are faked. Returns (result, tree argv list, dd argv list, console lines,
-    fcntl controls requested)"""
-    tools, dd, lines = FakeTools(), FakeDd(NEW), []
+    are faked (errors: see fcntl_controls). payload sets the disc's
+    reported size (TotalSize); dd (default FakeDd(NEW)) streams the copy.
+    Returns (result, tree argv list, dd argv list, console lines, fcntl
+    controls requested)"""
+    tools, dd, lines = FakeTools(), dd or FakeDd(NEW), []
     cfg = imaging.BackupConfig("disk9", "SYNTHETIC", name, "review", folder)
-    with synthetic_drive(NEW, real_tree=True, real_copy=real_copy, mount_point=mount_point, **drive), \
+    with synthetic_drive(payload, real_tree=True, real_copy=real_copy, mount_point=mount_point,
+                         **drive), \
             mock.patch.object(imaging.subprocess, "run", tools.run), \
             mock.patch.object(imaging.subprocess, "Popen", dd), \
             mock.patch.object(imaging, "ANSI_ENABLED", False), \
             mock.patch.object(imaging, "log", lines.append), \
-            fcntl_controls(unavailable) as requested:
+            fcntl_controls(unavailable, errors) as requested:
         result = imaging.OpticalDiscBackup(cfg).create_backup()
     return result, tools.trees, dd.argv, [str(line) for line in lines], requested
 
@@ -2144,8 +2285,1303 @@ class VerificationWordingTests(Base):
                         self.assertNotIn(claim, text)
 
 
+# --- prior bundle and staged files that cannot be checked (T-142) -------------
+
+class PriorBundleInspectionTests(Base):
+    """T-142 (N1, N5): only "no such file" means absent. A bundle file that
+    cannot be checked (EIO here) refuses the run before anything starts; one
+    that becomes uncheckable by publication is neither archived nor
+    replaced, and the verified copy is kept as a failed .iso.partial. A
+    staged file of this run that cannot be checked, or a missing staged log
+    or manifest, fails publication instead of being skipped. Rollback never
+    restores over or past an entry it cannot check. A refusal before any
+    file moved says nothing was archived or replaced; a failure after files
+    moved says where they are instead"""
+
+    subfolder = ReceiptTests.subfolder
+    fault = PublicationTests.fault
+    run_hooked = VerifiedIsoTests.run_hooked
+    run_with = UnreadableMetadataTests.run_with
+
+    def failed_record(self, folder):
+        return json.loads(one(folder, f"{NAME}_failed-*_manifest.json").read_text())
+
+    def assert_kept_unpublished(self, folder, old, code, lines):
+        """Publication failed with nothing archived or replaced: the prior
+        bundle (if any) is untouched and still verifies, the verified copy is
+        the failed .iso.partial, and no record claims success"""
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(canonical(folder), old, "the prior bundle changed")
+        self.assertEqual(archives(folder), [], "something was archived")
+        for pattern in ("*_attempt-*_manifest.json", "*_failed-*_manifest.json"):
+            self.assertEqual(manifests_claiming_success(folder, pattern), [])
+        record = self.failed_record(folder)
+        status = record["backup_status"]
+        self.assertEqual(status["overall_status"], "failed")
+        partial = one(folder, f"{NAME}_failed-*.iso.partial")
+        self.assertEqual(partial.read_bytes(), NEW)
+        self.assertEqual((record["output_files"]["iso_filename"], status["iso_created"]),
+                         (partial.name, True))
+        self.assertFalse(any("Published verified artifact" in line for line in lines), lines)
+        code, output = verify_cli(folder)
+        self.assertEqual(code, 0, output)
+        self.assertIn("  PASS: 1\n" if old else "  SKIPPED: 1\n", output)
+        self.assertNotIn("MISSING_ISO", output)
+        return record
+
+    @contextlib.contextmanager
+    def lstat_fails(self, armed, fired):
+        """Only os.lstat raises EIO for the armed paths, so os.path.lexists
+        (which looks it up at call time) sees it on every interpreter, while
+        3.9's pathlib keeps its own reference and does not"""
+        real = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if not isinstance(path, int) and Path(os.fsdecode(path)) in armed:
+                fired.append(os.fsdecode(path))
+                raise OSError(errno.EIO, "synthetic: Input/output error", os.fsdecode(path))
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(imaging.os, "lstat", lstat):
+            yield
+
+    # before anything starts (R1-D1, D2, D6)
+
+    def test_a_bundle_file_that_cannot_be_checked_refuses_the_run_at_the_start(self):
+        for name in CANONICAL:
+            with self.subTest(name=name):
+                folder = self.subfolder(name.replace(".", "-"))
+                old, before, entries = canonical(folder), snapshot(folder), sorted(os.listdir(folder))
+                prompts, started, fired = [], [], []
+                with unreadable({folder / name}, fired):
+                    code, tools, lines = self.run_with(
+                        folder, [], confirm=lambda obj, paths: prompts.append(paths) or True,
+                        tree=lambda obj: started.append("tree"), copy=lambda obj: started.append("copy"))
+                self.assertTrue(fired, "the check never failed")
+                self.assertEqual(code, 1, lines)
+                self.assertEqual((prompts, started), ([], []), "the run started")
+                self.assertEqual((sorted(os.listdir(folder)), snapshot(folder)), (entries, before))
+                self.assertEqual(canonical(folder), old)
+                shown = [line for line in lines if line.startswith("Backup failed: Could not check "
+                                                                   "existing artifact")]
+                self.assertEqual(len(shown), 1, lines)
+                for text in (name, "Input/output error", "nothing was changed"):
+                    self.assertIn(text, shown[0])
+                code, output = verify_cli(folder)
+                self.assertEqual(code, 0, output)
+                self.assertIn("  PASS: 1\n", output)
+
+    def test_an_output_folder_that_cannot_be_checked_refuses_the_run(self):
+        folder = self.subfolder("folder")
+        old, entries, fired = canonical(folder), sorted(os.listdir(folder)), []
+        with unreadable({folder}, fired):
+            code, tools, lines = self.run_with(folder, [])
+        self.assertTrue(fired, "the check never failed")
+        self.assertEqual(code, 1, lines)
+        shown = [line for line in lines if f"Could not check output folder {folder} (" in line]
+        self.assertEqual(len(shown), 1, lines)
+        self.assertIn("Input/output error", shown[0])
+        self.assertEqual((sorted(os.listdir(folder)), canonical(folder)), (entries, old))
+
+    # at publication (R1-D1 backstop): nothing archived or replaced
+
+    def test_a_bundle_file_that_becomes_uncheckable_is_neither_archived_nor_replaced(self):
+        for name in CANONICAL:
+            with self.subTest(name=name):
+                folder = self.subfolder(name.replace(".", "-"))
+                old, armed, fired = canonical(folder), set(), []
+                with unreadable(armed, fired):
+                    code, lines = self.run_hooked(folder, "_promote_successful_attempt",
+                                                  before=lambda obj, path=folder / name: armed.add(path))
+                self.assertTrue(fired, "the check never failed")
+                record = self.assert_kept_unpublished(folder, old, code, lines)
+                self.assertIn(name, record["backup_status"]["errors"])
+                self.assertIn("Input/output error", record["backup_status"]["errors"])
+
+    def test_a_master_only_lstat_cannot_check_is_never_lost(self):
+        # os.path.lexists swallowed the error on every interpreter
+        for when in ("from the start", "at publication"):
+            with self.subTest(when):
+                folder = self.subfolder(when.replace(" ", "-"))
+                old, fired = canonical(folder), []
+                armed = {folder / ISO} if when == "from the start" else set()
+                with self.lstat_fails(armed, fired):
+                    if when == "from the start":
+                        code, tools, lines = self.run_with(folder, [])
+                    else:
+                        code, lines = self.run_hooked(folder, "_promote_successful_attempt",
+                                                      before=lambda obj, path=folder / ISO: armed.add(path))
+                self.assertTrue(fired, "the check never failed")
+                if when == "from the start":
+                    self.assertEqual(code, 1, lines)
+                    self.assertEqual(canonical(folder), old)
+                    self.assertEqual(sorted(p.name for p in folder.iterdir()), sorted(old))
+                    self.assertEqual(verify_cli(folder)[0], 0)
+                else:
+                    self.assert_kept_unpublished(folder, old, code, lines)
+
+    def test_a_staged_file_that_cannot_be_checked_fails_publication(self):
+        # N5: never skipped as absent; only while publishing (transient)
+        suffixes = {"manifest": "_manifest.json", "log": ".iso.log.txt",
+                    "tree": "_tree.txt", "isolyzer": "_isolyzer.xml"}
+        cases = [(role, True) for role in suffixes] + [("manifest", False)]
+        real = imaging.OpticalDiscBackup._promote_successful_attempt
+        for role, seeded in cases:
+            with self.subTest(role=role, seeded=seeded):
+                folder = self.subfolder(f"{role}-{'seeded' if seeded else 'fresh'}", seed=seeded)
+                old, armed, fired = canonical(folder), set(), []
+
+                def promote(obj, result, attempt, role=role, armed=armed):
+                    armed.add(getattr(attempt, role))
+                    try:
+                        return real(obj, result, attempt)
+                    finally:
+                        armed.clear()
+
+                with unreadable(armed, fired):
+                    code, tools, lines = self.run_with(folder, [mock.patch.object(
+                        imaging.OpticalDiscBackup, "_promote_successful_attempt", promote)])
+                self.assertTrue(fired, "the check never failed")
+                record = self.assert_kept_unpublished(folder, old, code, lines)
+                errors = record["backup_status"]["errors"]
+                self.assertIn("Input/output error", errors)
+                self.assertRegex(errors, rf"{NAME}_attempt-\S+{re.escape(suffixes[role])}")
+
+    def test_a_staged_manifest_uncheckable_after_archiving_is_rolled_back_and_located(self):
+        folder = self.subfolder("after-archiving")
+        old, armed, fired = canonical(folder), set(), []
+        with unreadable(armed, fired):
+            code, lines = self.run_hooked(folder, "_archive_existing_artifacts",
+                                          after=lambda obj: armed.add(obj.config.artifacts.manifest))
+        self.assertTrue(fired, "the check never failed")
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(canonical(folder), old, "the prior bundle was not restored")
+        self.assertEqual(archives(folder), [])
+        self.assertEqual(verify.check_manifest(folder / f"{NAME}_manifest.json").status, "PASS")
+        self.assertEqual(manifests_claiming_success(folder, "*_failed-*_manifest.json"), [])
+        staged = one(folder, f"{NAME}_attempt-*_manifest.json")  # it could not be checked
+        status = self.failed_record(folder)["backup_status"]
+        self.assertIn(staged.name, status["errors"])
+        self.assertNotIn("nothing was archived", status["errors"])
+        self.assertTrue(status["errors"].endswith(
+            "; publication had begun and was rolled back: the prior bundle is back at its "
+            "canonical names"), status["errors"])
+        self.assertTrue(any(staged.name in w and "does not describe a successful run" in w
+                            for w in status["warnings"]), status["warnings"])
+        self.assertEqual(one(folder, f"{NAME}_failed-*.iso.partial").read_bytes(), NEW)
+
+    def test_a_missing_staged_log_or_manifest_fails_publication_before_archiving(self):
+        # R1-D4: tree and isolyzer output stay optional (control below)
+        for role in ("manifest", "log"):
+            with self.subTest(role):
+                folder = self.subfolder(f"missing-{role}")
+                old, gone = canonical(folder), []
+
+                def remove(obj, role=role, gone=gone):
+                    path = getattr(obj.config.artifacts, role)
+                    path.unlink()
+                    gone.append(path.name)
+
+                code, lines = self.run_hooked(folder, "_promote_successful_attempt", before=remove)
+                record = self.assert_kept_unpublished(folder, old, code, lines)
+                self.assertIn(f"{gone[0]} is missing", record["backup_status"]["errors"])
+
+    # rollback (R1-D3) and what the records say once files have moved
+
+    def test_rollback_restores_nothing_past_an_archived_file_it_cannot_check(self):
+        folder = self.subfolder("rollback")
+        armed, fired = set(), []
+        with unreadable(armed, fired), \
+                self.fault(lambda src, dst: "attempt-" in src.name and src.name.endswith("_manifest.json")):
+            code, lines = self.run_hooked(folder, "_restore_archived_artifacts",
+                                          before=lambda obj: armed.add(Path(obj._archive_dir) / ISO))
+        self.assertTrue(fired, "the check never failed")
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(canonical(folder), {}, "a prior file was restored")
+        folders = archives(folder)
+        self.assertEqual(len(folders), 1)
+        self.assertEqual(sorted(p.name for p in folders[0].iterdir()), sorted(CANONICAL))
+        self.assertEqual((folders[0] / ISO).read_bytes(), OLD)
+        self.assertEqual(verify.check_manifest(folders[0] / f"{NAME}_manifest.json").status, "PASS")
+        status = self.failed_record(folder)["backup_status"]
+        left = [w for w in status["warnings"] if folders[0].name in w and ISO in w
+                and "Input/output error" in w and "nothing was restored" in w]
+        self.assertEqual(len(left), 1, status["warnings"])
+        self.assertFalse(any("not found" in w for w in status["warnings"]), status["warnings"])
+        self.assertNotIn("nothing was archived", status["errors"])
+        for text in ("publication had begun and its rollback could not finish", "verifyiso.py"):
+            self.assertIn(text, status["errors"])
+        self.assertTrue(any(line.startswith("Warning: ") and folders[0].name in line
+                            for line in lines), lines)
+        self.assertEqual(manifests_claiming_success(folder, "*_failed-*_manifest.json"), [])
+
+    def test_a_refusal_before_anything_moved_says_nothing_was_archived(self):
+        folder = self.subfolder("wording")
+        old, armed, fired = canonical(folder), set(), []
+        with unreadable(armed, fired):
+            code, lines = self.run_hooked(folder, "_promote_successful_attempt",
+                                          before=lambda obj: armed.add(folder / ISO))
+        self.assertTrue(fired, "the check never failed")
+        errors = self.assert_kept_unpublished(folder, old, code, lines)["backup_status"]["errors"]
+        self.assertTrue(errors.startswith("Could not publish verified attempt artifacts: could not "
+                                          f"check existing artifact {ISO} ("), errors)
+        self.assertTrue(errors.endswith("; nothing was archived or replaced"), errors)
+        self.assertIn(f"Backup failed: {errors}", lines)
+
+    def test_a_failure_after_files_moved_says_where_they_are(self):
+        cases = (("archiving", True, "rename",
+                  lambda src, dst: src.name == LOGNAME and "_overwritten-" in str(dst),
+                  "the prior bundle is back at its canonical names"),
+                 ("publishing", False, "replace",
+                  lambda src, dst: "attempt-" in src.name and src.name.endswith("_manifest.json"),
+                  "none of this run's files is left at a canonical name"))
+        for label, seeded, method, predicate, where in cases:
+            with self.subTest(label):
+                folder = self.subfolder(label, seed=seeded)
+                old = canonical(folder)
+                with self.fault(predicate, method=method):
+                    code, tools, lines = self.run_with(folder, [])
+                self.assertEqual(code, 1, lines)
+                self.assertEqual((canonical(folder), archives(folder)), (old, []))
+                errors = self.failed_record(folder)["backup_status"]["errors"]
+                self.assertNotIn("nothing was archived", errors)
+                self.assertTrue(errors.endswith(f"; publication had begun and was rolled back: {where}"),
+                                errors)
+                self.assertIn(f"Backup failed: {errors}", lines)
+
+    def test_an_interrupt_that_escapes_into_the_moves_is_rolled_back(self):
+        # Ctrl-C is held there, so only an injected KeyboardInterrupt can
+        # escape; it still gets the rollback and a truthful record
+        folder = self.subfolder("interrupt")
+        old, real_rename, fired = canonical(folder), Path.rename, []
+
+        def rename(path, target):
+            if not fired and Path(path).name == LOGNAME and "_overwritten-" in str(target):
+                fired.append(Path(path).name)
+                raise KeyboardInterrupt
+            return real_rename(path, target)
+
+        try:
+            with mock.patch.object(Path, "rename", rename):
+                code, tools, lines = self.run_with(folder, [])
+        except KeyboardInterrupt:
+            self.fail("KeyboardInterrupt escaped the run")
+        self.assertTrue(fired, "the interrupt never fired")
+        self.assertEqual(code, 1, lines)
+        self.assertEqual((canonical(folder), archives(folder)), (old, []))
+        errors = self.failed_record(folder)["backup_status"]["errors"]
+        self.assertTrue(errors.startswith("Interrupted by operator (Ctrl-C) before the verified "
+                                          "bundle was published"), errors)
+        self.assertTrue(errors.endswith("the prior bundle is back at its canonical names"), errors)
+
+    # after the prior bundle was archived: never replaced or restored over an unknown
+
+    def assert_left_whole_in_its_archive(self, folder, code, lines, name):
+        """Nothing was restored, the prior bundle is whole and verifies in its
+        archive folder, and the records name that folder and the canonical
+        name that could not be checked, never saying nothing moved"""
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(canonical(folder), {}, "a prior file was restored")
+        archive = one(folder, f"{NAME}_overwritten-*")
+        self.assertEqual({p.name: p.read_bytes() for p in archive.iterdir()}[ISO], OLD)
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), sorted(CANONICAL))
+        self.assertEqual(verify.check_manifest(archive / f"{NAME}_manifest.json").status, "PASS")
+        self.assertEqual(manifests_claiming_success(folder, "*_failed-*_manifest.json"), [])
+        status = self.failed_record(folder)["backup_status"]
+        left = [w for w in status["warnings"] if w.startswith(f"prior bundle left in {archive.name}, where "
+                                                               f"this run archived it (could not check {name} (")
+                and "Input/output error" in w and w.endswith("nothing was restored over this run's files")]
+        self.assertEqual(len(left), 1, status["warnings"])
+        self.assertNotIn("nothing was archived", status["errors"])
+        for text in ("publication had begun and its rollback could not finish", "verifyiso.py"):
+            self.assertIn(text, status["errors"])
+        self.assertIn(f"Warning: {left[0]}", lines)
+        self.assertEqual(one(folder, f"{NAME}_failed-*.iso.partial").read_bytes(), NEW)
+        return status
+
+    def test_a_canonical_name_uncheckable_after_archiving_is_never_replaced_or_restored_over(self):
+        # The publish destination (this run's ISO already published, so it is
+        # moved back), and a canonical slot as the rollback starts
+        for case in ("publish destination", "slot at rollback"):
+            with self.subTest(case):
+                folder = self.subfolder(case.replace(" ", "-"))
+                armed, fired = set(), []
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(unreadable(armed, fired))
+                    if case == "publish destination":
+                        name = TREENAME
+                        code, lines = self.run_hooked(folder, "_archive_existing_artifacts",
+                                                      after=lambda obj, p=folder / name: armed.add(p))
+                    else:
+                        name = ISO
+                        stack.enter_context(self.fault(lambda src, dst: "attempt-" in src.name
+                                                       and src.name.endswith("_manifest.json")))
+                        code, lines = self.run_hooked(folder, "_restore_archived_artifacts",
+                                                      before=lambda obj, p=folder / name: armed.add(p))
+                self.assertTrue(fired, "the check never failed")
+                status = self.assert_left_whole_in_its_archive(folder, code, lines, name)
+                if case == "publish destination":
+                    self.assertIn(f"could not check {name} (", status["errors"])
+                    self.assertIn("not replacing it", status["errors"])
+                    self.assertTrue(any("Moved failed publish back to attempt path" in line
+                                        for line in lines), lines)
+
+    def test_an_archived_file_gone_before_the_rollback_is_named_not_claimed_restored(self):
+        folder = self.subfolder("gone")
+        old, removed = canonical(folder), []
+
+        def remove(obj):
+            path = Path(obj._archive_dir) / ISOLYZER
+            path.unlink()
+            removed.append(Path(obj._archive_dir).name)
+
+        with self.fault(lambda src, dst: "attempt-" in src.name and src.name.endswith("_manifest.json")):
+            code, lines = self.run_hooked(folder, "_restore_archived_artifacts", before=remove)
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(canonical(folder), {n: b for n, b in old.items() if n != ISOLYZER})
+        self.assertEqual(archives(folder), [], "the emptied archive folder was left")
+        status = self.failed_record(folder)["backup_status"]
+        self.assertIn(f"{ISOLYZER} is no longer in {removed[0]}; it was not restored", status["warnings"])
+        self.assertIn("publication had begun and its rollback could not finish", status["errors"])
+        self.assertNotIn("back at its canonical names", status["errors"])
+
+    def test_a_stopped_rollback_names_its_real_cause_and_any_file_it_cannot_check(self):
+        # Restoring the archived master fails (and, in one case, it then
+        # cannot be checked): the warning gives that cause, and where each
+        # prior file is, or that it could not be checked
+        for unchecked in (False, True):
+            with self.subTest(unchecked=unchecked):
+                folder = self.subfolder(f"stopped-{unchecked}")
+                armed, fired = set(), []
+                real_replace = Path.replace
+
+                def replace(path, target, armed=armed):
+                    p = Path(path)
+                    if "attempt-" in p.name and p.name.endswith("_manifest.json"):
+                        raise OSError("synthetic publication failure")
+                    if "_overwritten-" in str(p) and p.name == ISO:
+                        if unchecked:
+                            armed.add(p)
+                        fired.append(p.parent.name)
+                        raise OSError("synthetic restoration failure")
+                    return real_replace(path, target)
+
+                with unreadable(armed), mock.patch.object(Path, "replace", replace):
+                    code, tools, lines = self.run_with(folder, [])
+                self.assertTrue(fired, "the restore fault never fired")
+                self.assertEqual(code, 1, lines)
+                self.assertEqual(canonical(folder), {}, "a split prior bundle was left at canonical names")
+                status = self.failed_record(folder)["backup_status"]
+                stopped = [w for w in status["warnings"] if w.startswith("rollback stopped (")]
+                self.assertEqual(len(stopped), 1, status["warnings"])
+                self.assertTrue(stopped[0].startswith(f"rollback stopped (could not restore {ISO}: "
+                                                      f"synthetic restoration failure); "), stopped[0])
+                others = ", ".join(n for n in (LOGNAME, f"{NAME}_manifest.json", TREENAME, ISOLYZER))
+                if unchecked:
+                    self.assertIn(f"the prior files may be split: in {fired[0]}: {others}; could not "
+                                  f"check: {ISO} ({fired[0]}/{ISO}: ", stopped[0])
+                    self.assertNotIn("not found", stopped[0])
+                else:
+                    self.assertIn(f"they are all in {fired[0]} ({ISO}, {others})", stopped[0])
+
+    def test_an_interrupt_during_a_publish_rename_is_rolled_back(self):
+        # The ISO is already published when the interrupt escapes (only an
+        # injected one can, Ctrl-C being held): it is moved back and the
+        # prior bundle restored before the failure is recorded
+        folder = self.subfolder("publish-interrupt")
+        old, real_replace, fired = canonical(folder), Path.replace, []
+
+        def replace(path, target):
+            if not fired and "attempt-" in Path(path).name and Path(path).name.endswith("_tree.txt"):
+                fired.append(Path(path).name)
+                raise KeyboardInterrupt
+            return real_replace(path, target)
+
+        try:
+            with mock.patch.object(Path, "replace", replace):
+                code, tools, lines = self.run_with(folder, [])
+        except KeyboardInterrupt:
+            self.fail("KeyboardInterrupt escaped the run")
+        self.assertTrue(fired, "the interrupt never fired")
+        self.assertEqual(code, 1, lines)
+        self.assertEqual((canonical(folder), archives(folder)), (old, []))
+        self.assertEqual(one(folder, f"{NAME}_failed-*.iso.partial").read_bytes(), NEW)
+        errors = self.failed_record(folder)["backup_status"]["errors"]
+        self.assertTrue(errors.startswith("Interrupted by operator (Ctrl-C) before the verified "
+                                          "bundle was published"), errors)
+        self.assertTrue(errors.endswith("; publication had begun and was rolled back: the prior bundle "
+                                        "is back at its canonical names"), errors)
+
+    def test_a_staged_log_or_manifest_gone_after_archiving_fails_and_is_rolled_back(self):
+        # The publish loop's own check, behind the one before archiving
+        for role in ("log", "manifest"):
+            with self.subTest(role):
+                folder = self.subfolder(f"gone-{role}")
+                old, gone = canonical(folder), []
+
+                def remove(obj, role=role, gone=gone):
+                    path = getattr(obj.config.artifacts, role)
+                    path.unlink()
+                    gone.append(path.name)
+
+                code, lines = self.run_hooked(folder, "_archive_existing_artifacts", after=remove)
+                self.assertEqual(code, 1, lines)
+                self.assertEqual((canonical(folder), archives(folder)), (old, []))
+                self.assertEqual(one(folder, f"{NAME}_failed-*.iso.partial").read_bytes(), NEW)
+                for pattern in ("*_attempt-*_manifest.json", "*_failed-*_manifest.json"):
+                    self.assertEqual(manifests_claiming_success(folder, pattern), [])
+                errors = self.failed_record(folder)["backup_status"]["errors"]
+                self.assertIn(f"this run's {gone[0]} is missing", errors)
+                self.assertTrue(errors.endswith("; publication had begun and was rolled back: the prior "
+                                                "bundle is back at its canonical names"), errors)
+                self.assertEqual(verify_cli(folder)[0], 0)
+
+    # controls: green on released code too
+
+    def test_control_a_confirmed_absent_prior_file_is_simply_not_archived(self):
+        folder = self.subfolder("absent")
+        (folder / ISOLYZER).unlink()
+        old, prompts = canonical(folder), []
+        code, tools, lines = self.run_with(
+            folder, [], confirm=lambda obj, paths: prompts.append(sorted(p.name for p in paths)) or True)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(prompts, [sorted(old)])
+        archive = one(folder, f"{NAME}_overwritten-*")
+        self.assertEqual({p.name: p.read_bytes() for p in archive.iterdir()}, old)
+        self.assertEqual(canonical(folder)[ISO], NEW)
+        code, output = verify_cli(folder)
+        self.assertEqual(code, 0, output)
+        self.assertIn("  PASS: 2\n", output)
+
+    def test_control_a_symlink_at_a_bundle_name_keeps_its_refusal(self):
+        folder = self.subfolder("link", seed=False)
+        target = self.dir / "elsewhere.txt"
+        target.write_text("not this run's file")
+        (folder / TREENAME).symlink_to(target)
+        prompts = []
+        code, tools, lines = self.run_with(folder, [],
+                                           confirm=lambda obj, paths: prompts.append(paths) or True)
+        self.assertEqual(code, 1, lines)
+        self.assertEqual(prompts, [])
+        self.assertIn(f"Backup failed: Symlink at planned output path(s): {TREENAME}", lines)
+        self.assertEqual(os.listdir(folder), [TREENAME])
+        self.assertEqual(target.read_text(), "not this run's file")
+
+    def test_control_a_missing_staged_tree_is_still_published_without_it(self):
+        folder = self.subfolder("no-tree")
+        old = canonical(folder)
+        code, lines = self.run_hooked(folder, "_promote_successful_attempt",
+                                      before=lambda obj: obj.config.artifacts.tree.unlink())
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(sorted(canonical(folder)), sorted(n for n in CANONICAL if n != TREENAME))
+        self.assertEqual(canonical(folder)[ISO], NEW)
+        self.assertEqual({p.name: p.read_bytes() for p in one(folder, f"{NAME}_overwritten-*").iterdir()},
+                         old)
+        self.assertEqual(verify_cli(folder)[0], 0)
+
+
+# --- flush and cache controls (T-143) ------------------------------------------
+
+@contextlib.contextmanager
+def fsync_calls(error=None):
+    """os.fsync recorded; it really runs on the private temp file unless
+    error is given, which it raises instead"""
+    real, calls = os.fsync, []
+
+    def fsync(fd):
+        calls.append(fd)
+        if error is not None:
+            raise error
+        return real(fd)
+
+    with mock.patch.object(imaging.os, "fsync", fsync):
+        yield calls
+
+
+def synthetic_error(code):
+    return OSError(code, f"synthetic: {os.strerror(code)}")
+
+
+def control_record(code, treated_as):
+    """The control_errors entry expected for synthetic_error(code)"""
+    return {"errno": code, "name": errno.errorcode[code], "message": f"synthetic: {os.strerror(code)}",
+            "treated_as": treated_as}
+
+
+NOT_PROVIDED = {"errno": None, "name": None, "message": "not provided by this Python's fcntl module",
+                "treated_as": "unsupported"}
+FALLBACK_PREFIX = "F_FULLFSYNC unavailable; fell back to fsync"
+
+
+class FlushControlTests(Base):
+    """T-143 (N2): only an F_FULLFSYNC that is not supported (a missing
+    constant, ENOTSUP or EOPNOTSUPP) falls back to fsync, with its errno
+    recorded; any other F_FULLFSYNC error, or a failing fsync, fails the
+    run unverified and unpublished, recording every error. F_NOCACHE is a
+    hint: an error is recorded truthfully and never fails the run. makeiso's
+    own copy and verification run, with dd and fcntl faked"""
+
+    subfolder = ReceiptTests.subfolder
+
+    def records(self, folder, pattern):
+        record = json.loads(one(folder, f"{NAME}{pattern}_manifest.json").read_text())
+        log_text = one(folder, f"{NAME}{pattern}.iso.log.txt").read_text()
+        return record, log_text
+
+    def assert_failed_unverified(self, folder, old, result, requested, lines):
+        """The flush failed: nothing re-read or published, the prior bundle
+        untouched and verifying, the copy kept as the failed .iso.partial"""
+        self.assertEqual(requested, ["F_FULLFSYNC"], "the copy was re-read after a failed flush")
+        self.assertFalse(result.success)
+        self.assertIsNone(result.checksum_match)  # so main exits 1, never 2
+        self.assertEqual((canonical(folder), archives(folder)), (old, []))
+        self.assertEqual(one(folder, f"{NAME}_failed-*.iso.partial").read_bytes(), NEW)
+        record, log_text = self.records(folder, "_failed-*")
+        status, integrity = record["backup_status"], record["integrity_verification"]
+        self.assertEqual(status["overall_status"], "failed")
+        self.assertIsNone(integrity["flush_before_verification"])
+        self.assertEqual(integrity["integrity_status"], "not_performed")
+        self.assertFalse(any(w.startswith(FALLBACK_PREFIX) for w in status["warnings"]))
+        creation = record["operations_performed"]["iso_creation"]
+        self.assertEqual((creation["performed"], creation["command"]), (True, "dd if=/dev/rdisk9 bs=4m"))
+        self.assertIn("  Command: dd if=/dev/rdisk9 bs=4m\n", log_text)
+        self.assertNotIn("Not started", log_text)
+        self.assertIn(f"Status:  FAILED ({status['errors']})", log_text)
+        self.assertIn(f"Backup failed: {status['errors']}", lines)
+        self.assertFalse(any("Published verified artifact" in line for line in lines), lines)
+        self.assertEqual(manifests_claiming_success(folder, "*_failed-*_manifest.json"), [])
+        code, output = verify_cli(folder)
+        self.assertEqual(code, 0, output)
+        self.assertIn("  PASS: 1\n", output)
+        return record
+
+    def test_a_failed_full_flush_fails_the_run_unverified_and_unpublished(self):
+        # EIO, ENOSPC; and EINVAL, ENOTTY, which the conservative policy
+        # does not take as "not supported"
+        for code in (errno.EIO, errno.ENOSPC, errno.EINVAL, errno.ENOTTY):
+            name = errno.errorcode[code]
+            with self.subTest(name):
+                folder = self.subfolder(name)
+                old = canonical(folder)
+                with fsync_calls() as fsyncs:
+                    result, _, _, lines, requested = image(
+                        folder, errors={"F_FULLFSYNC": synthetic_error(code)})
+                self.assertEqual(fsyncs, [], "fell back to fsync")
+                record = self.assert_failed_unverified(folder, old, result, requested, lines)
+                errors, integrity = record["backup_status"]["errors"], record["integrity_verification"]
+                self.assertTrue(errors.startswith("F_FULLFSYNC failed on disc_attempt-"), errors)
+                self.assertTrue(errors.endswith(f": {name} (errno {code}: synthetic: {os.strerror(code)}); "
+                                                f"the copy was not verified"), errors)
+                self.assertEqual(integrity["control_errors"],
+                                 {"F_FULLFSYNC": control_record(code, "failure")})
+                self.assertEqual(integrity["flush_note"],
+                                 f"no flush completed (F_FULLFSYNC returned {name} (errno {code}: "
+                                 f"synthetic: {os.strerror(code)})); the copy was not verified")
+
+    def test_a_failing_fsync_fallback_fails_the_run_and_keeps_both_errors(self):
+        folder = self.subfolder("fsync")
+        old = canonical(folder)
+        with fsync_calls(synthetic_error(errno.EIO)) as fsyncs:
+            result, _, _, lines, requested = image(
+                folder, errors={"F_FULLFSYNC": synthetic_error(errno.ENOTSUP)})
+        self.assertEqual(len(fsyncs), 1, "fsync was never tried")
+        record = self.assert_failed_unverified(folder, old, result, requested, lines)
+        errors, integrity = record["backup_status"]["errors"], record["integrity_verification"]
+        self.assertTrue(errors.startswith("fsync failed on disc_attempt-"), errors)
+        for text in ("EIO (errno 5: synthetic: Input/output error)",
+                     f"after F_FULLFSYNC was not supported (ENOTSUP (errno {errno.ENOTSUP}: "):
+            self.assertIn(text, errors)
+        self.assertEqual(integrity["control_errors"],
+                         {"F_FULLFSYNC": control_record(errno.ENOTSUP, "unsupported"),
+                          "fsync": control_record(errno.EIO, "failure")})
+        self.assertTrue(integrity["flush_note"].startswith("no flush completed (F_FULLFSYNC returned "
+                                                           "ENOTSUP"), integrity["flush_note"])
+        self.assertIn("; fsync returned EIO (errno 5: ", integrity["flush_note"])
+
+    def test_a_flush_failure_is_recorded_even_when_its_iso_cannot_be_checked(self):
+        # K1 independence: the records say the copy started from the fact
+        # recorded at its creation, never from an inspection of the ISO
+        folder = self.subfolder("unreadable")
+        old, armed, fired = canonical(folder), set(), []
+        real_build = imaging.OpticalDiscBackup._build_backup_result
+
+        def build(obj, phase, disk_size, attempt):
+            armed.add(Path(attempt.iso))
+            return real_build(obj, phase, disk_size, attempt)
+
+        with unreadable(armed, fired), \
+                mock.patch.object(imaging.OpticalDiscBackup, "_build_backup_result", build):
+            result, _, _, lines, _ = image(folder, errors={"F_FULLFSYNC": synthetic_error(errno.EIO)})
+        self.assertTrue(fired, "the check never failed")
+        self.assertFalse(result.success)
+        self.assertEqual(canonical(folder), old)
+        iso = one(folder, f"{NAME}_attempt-*.iso")  # it could not be checked, so it kept its name
+        self.assertEqual(iso.read_bytes(), NEW)
+        record, log_text = self.records(folder, "_failed-*")
+        status = record["backup_status"]
+        self.assertTrue(status["errors"].startswith("F_FULLFSYNC failed on"), status["errors"])
+        self.assertIn("EIO (errno 5:", status["errors"])
+        self.assertEqual((record["output_files"]["iso_filename"], status["iso_created"]), (iso.name, None))
+        self.assertTrue(record["operations_performed"]["iso_creation"]["performed"])
+        self.assertIn("  Command: dd if=/dev/rdisk9 bs=4m\n", log_text)
+        self.assertNotIn("Not started", log_text)
+        notes = [w for w in status["warnings"] if "could not verify where this run's iso is" in w
+                 and "Input/output error" in w]
+        self.assertEqual(len(notes), 1, status["warnings"])
+
+    def test_an_f_nocache_error_is_reported_as_not_set_and_never_fails_the_run(self):
+        folder = self.subfolder("nocache")
+        old = canonical(folder)
+        result, _, _, lines, requested = image(folder, errors={"F_NOCACHE": synthetic_error(errno.EIO)})
+        self.assertEqual(requested, ["F_FULLFSYNC", "F_NOCACHE"])
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(canonical(folder)[ISO], NEW)
+        self.assertEqual({p.name: p.read_bytes() for p in one(folder, f"{NAME}_overwritten-*").iterdir()},
+                         old)
+        record, log_text = self.records(folder, "")
+        status, integrity = record["backup_status"], record["integrity_verification"]
+        self.assertEqual(status["overall_status"], "success_with_warnings")
+        expected = ("F_NOCACHE could not be set (F_NOCACHE returned EIO (errno 5: synthetic: "
+                    "Input/output error)); the verification read may have been served from the "
+                    "page cache")
+        self.assertEqual(len([w for w in status["warnings"] if w.startswith(expected)]), 1,
+                         status["warnings"])
+        self.assertFalse(any(w.startswith("F_NOCACHE unavailable") for w in status["warnings"]))
+        self.assertIs(integrity["verification_read_cache_bypass"], False)
+        self.assertEqual(integrity["flush_before_verification"], "F_FULLFSYNC")
+        self.assertEqual(integrity["control_errors"], {"F_NOCACHE": control_record(errno.EIO, "failure")})
+        reread = ("written ISO re-read without F_NOCACHE (it could not be set: F_NOCACHE returned EIO "
+                  "(errno 5: synthetic: Input/output error); the read may have been served from the "
+                  "page cache)")
+        self.assertIn(reread, integrity["verification_method"])
+        self.assertIn(f"Method:         {reread}, compared", log_text)
+        match = [line for line in lines if line.startswith("Checksum match:")]
+        self.assertEqual(len(match), 1, lines)
+        self.assertTrue(match[0].endswith("(see the warning above about how it was flushed or re-read)."))
+        for text in (json.dumps(record), log_text, "\n".join(lines)):
+            for claim in ("cache bypassed", "bit-for-bit", "bit-perfect", "physical", "unavailable"):
+                self.assertNotIn(claim, text)
+
+    def test_unsupported_controls_fall_back_and_name_their_errno(self):
+        missing = types.SimpleNamespace(fcntl=imaging.fcntl.fcntl, F_NOCACHE=imaging.fcntl.F_NOCACHE)
+        no_nocache = types.SimpleNamespace(fcntl=imaging.fcntl.fcntl, F_FULLFSYNC=imaging.fcntl.F_FULLFSYNC)
+        cases = (("F_FULLFSYNC", "ENOTSUP", {"F_FULLFSYNC": synthetic_error(errno.ENOTSUP)}, None,
+                  control_record(errno.ENOTSUP, "unsupported")),
+                 ("F_FULLFSYNC", "EOPNOTSUPP", {"F_FULLFSYNC": synthetic_error(errno.EOPNOTSUPP)}, None,
+                  control_record(errno.EOPNOTSUPP, "unsupported")),
+                 ("F_FULLFSYNC", "missing", None, missing, NOT_PROVIDED),
+                 ("F_NOCACHE", "ENOTSUP", {"F_NOCACHE": synthetic_error(errno.ENOTSUP)}, None,
+                  control_record(errno.ENOTSUP, "unsupported")),
+                 ("F_NOCACHE", "missing", None, no_nocache, NOT_PROVIDED))
+        for control, label, errors, module, expected in cases:
+            with self.subTest(control=control, error=label):
+                folder = self.subfolder(f"{control}-{label}")
+                with contextlib.ExitStack() as stack:
+                    if module is not None:
+                        stack.enter_context(mock.patch.object(imaging, "fcntl", module))
+                    fsyncs = stack.enter_context(fsync_calls())
+                    result, _, _, lines, requested = image(folder, errors=errors)
+                self.assertTrue(result.success, result.error_message)
+                self.assertEqual(canonical(folder)[ISO], NEW)
+                record, log_text = self.records(folder, "")
+                status, integrity = record["backup_status"], record["integrity_verification"]
+                self.assertEqual(status["overall_status"], "success_with_warnings")
+                self.assertEqual(integrity["control_errors"], {control: expected})
+                suffix = (f"({control} not provided by this Python's fcntl module)" if label == "missing"
+                          else f"({control} returned {label} (errno {expected['errno']}: "
+                               f"{expected['message']}))")
+                prefix = (FALLBACK_PREFIX if control == "F_FULLFSYNC"
+                          else VerificationWordingTests.FALLBACK_WARNINGS["F_NOCACHE"])
+                shown = [w for w in status["warnings"] if w.startswith(prefix)]
+                self.assertEqual(len(shown), 1, status["warnings"])
+                self.assertTrue(shown[0].endswith(suffix), shown[0])
+                if control == "F_FULLFSYNC":
+                    self.assertEqual(len(fsyncs), 1)
+                    self.assertEqual(integrity["flush_before_verification"], "fsync")
+                    self.assertEqual(integrity["flush_note"].split(" ")[0], "fsync")
+                    self.assertIn(suffix[1:-1], integrity["flush_note"])
+                    self.assertIn("Flush:          fsync only (F_FULLFSYNC unavailable", log_text)
+                else:
+                    self.assertEqual(fsyncs, [])
+                    self.assertIs(integrity["verification_read_cache_bypass"], False)
+                    self.assertIn("re-read without F_NOCACHE (unavailable", integrity["verification_method"])
+                    self.assertIn(suffix[1:-1], integrity["verification_method"])
+
+    def test_a_healthy_copy_records_empty_control_errors_and_no_warnings(self):
+        folder = self.subfolder("healthy")
+        with fsync_calls() as fsyncs:
+            result, _, _, lines, requested = image(folder)
+        self.assertEqual((requested, fsyncs), (["F_FULLFSYNC", "F_NOCACHE"], []))
+        self.assertTrue(result.success, result.error_message)
+        record, log_text = self.records(folder, "")
+        integrity = record["integrity_verification"]
+        self.assertEqual(record["backup_status"]["warnings"], [])
+        self.assertIn("control_errors", integrity)  # always recorded: {} when every control returned
+        self.assertEqual(integrity["control_errors"], {})
+        self.assertEqual(integrity["flush_note"], "F_FULLFSYNC (asks the drive to write its cache to "
+                                                  "the media; a drive or network volume may not honour it)")
+        self.assertEqual(integrity["verification_method"],
+                         "Source hashed in-stream during creation; written ISO re-read with F_NOCACHE "
+                         "set (macOS is asked not to cache the read; data the write left cached may "
+                         "still be served) and hashed")
+
+
+# --- failure records (T-152, T-153) -------------------------------------------
+
+class FailingDd(FakeDd):
+    """dd that streams payload, then exits 1"""
+
+    class Process(FakeDd.Process):
+        def communicate(self):
+            self.returncode = 1
+            return b"", b"synthetic read error"
+
+
+@contextlib.contextmanager
+def attempt_iso_inspections(mode):
+    """From the moment _build_backup_result starts, os.stat/os.lstat and
+    Path.stat/Path.lstat of this run's attempt ISO fail: "persistent" (EIO
+    for the rest of the run), "build" (EIO only while _build_backup_result
+    runs, where 35bb77d inspected it) or "interrupt" (KeyboardInterrupt,
+    once, standing in for Ctrl-C during a stat that blocks). Yields a dict:
+    entered (the result was built), in_build (inspections while building)
+    and fired (failed inspections)."""
+    state, armed = {"entered": False, "building": False, "in_build": 0, "fired": 0}, set()
+    real_build = imaging.OpticalDiscBackup._build_backup_result
+
+    def build(obj, phase, disk_size, attempt):
+        armed.add(Path(attempt.iso))
+        state["entered"] = state["building"] = True
+        try:
+            return real_build(obj, phase, disk_size, attempt)
+        finally:
+            state["building"] = False
+            if mode == "build":
+                armed.clear()
+
+    def check(path):
+        if isinstance(path, int) or Path(os.fsdecode(path)) not in armed:
+            return
+        if state["building"]:
+            state["in_build"] += 1
+        if mode == "interrupt":
+            if not state["fired"]:
+                state["fired"] += 1
+                raise KeyboardInterrupt
+            return
+        state["fired"] += 1
+        raise OSError(errno.EIO, "synthetic: Input/output error", os.fsdecode(path))
+
+    def wrap(real):
+        def call(path, *args, **kwargs):
+            check(path)
+            return real(path, *args, **kwargs)
+        return call
+
+    with mock.patch.object(os, "stat", wrap(os.stat)), mock.patch.object(os, "lstat", wrap(os.lstat)), \
+            mock.patch.object(Path, "stat", wrap(Path.stat)), \
+            mock.patch.object(Path, "lstat", wrap(Path.lstat)), \
+            mock.patch.object(imaging.OpticalDiscBackup, "_build_backup_result", build):
+        yield state
+
+
+def opening_attempt_iso(action):
+    """makeiso's open() of this run's attempt ISO for writing goes through
+    action(file, mode, args, kwargs); everything else opens normally"""
+    def hooked(file, mode="r", *args, **kwargs):
+        if mode == "wb" and "_attempt-" in Path(file).name and Path(file).name.endswith(".iso"):
+            return action(file, mode, args, kwargs)
+        return REAL_OPEN(file, mode, *args, **kwargs)
+    return mock.patch.object(imaging, "open", hooked, create=True)
+
+
+class FailureRecordTests(Base):
+    """T-152 (report K1, O2, O4, prompt EOF) and T-153 (N6): a failed copy's
+    records say whether it started from the fact recorded as its ISO was
+    created, never from a later inspection; a never-started copy names its
+    ISO under the failure token; a copy error survives a Ctrl-C in dd's
+    teardown; a staged success record that cannot be removed keeps its
+    attempt-* name and is named there truthfully; end of input at a prompt
+    means no"""
+
+    subfolder = ReceiptTests.subfolder
+    fault = PublicationTests.fault
+    run_with = UnreadableMetadataTests.run_with
+
+    def failed_records(self, folder):
+        record = json.loads(one(folder, f"{NAME}_failed-*_manifest.json").read_text())
+        log_text = one(folder, f"{NAME}_failed-*.iso.log.txt").read_text()
+        self.assertIn("Log generated:", log_text, "the failure log is incomplete")
+        for pattern in ("*_failed-*_manifest.json", "*_attempt-*_manifest.json"):
+            self.assertEqual(manifests_claiming_success(folder, pattern), [])
+        return record, log_text
+
+    def assert_recorded_as_started(self, record, log_text, error_start):
+        status = record["backup_status"]
+        self.assertEqual(status["overall_status"], "failed")
+        self.assertTrue(status["errors"].startswith(error_start), status["errors"])
+        creation = record["operations_performed"]["iso_creation"]
+        self.assertEqual((creation["performed"], creation["command"]), (True, "dd if=/dev/rdisk9 bs=4m"))
+        self.assertIn("  Command: dd if=/dev/rdisk9 bs=4m\n", log_text)
+        self.assertIn(f"  Status:  FAILED ({error_start}", log_text)
+        self.assertNotIn("Not started", log_text)
+
+    def k1_run(self, folder, mode, dd=None):
+        """image() with a failing dd (or dd), and the attempt ISO's
+        inspections faulted per attempt_iso_inspections(mode); mode None:
+        no inspection fault"""
+        with contextlib.ExitStack() as stack:
+            fault = stack.enter_context(attempt_iso_inspections(mode)) if mode else {"entered": True}
+            try:
+                result, _, _, lines, _ = image(folder, dd=dd or FailingDd(NEW))
+            except KeyboardInterrupt:
+                self.fail("KeyboardInterrupt escaped create_backup")
+        self.assertTrue(fault["entered"], "the result was never built")
+        return result, fault, lines
+
+    # K1: whether the copy started
+
+    def test_k1_a_failed_copy_is_recorded_as_started_while_its_iso_cannot_be_checked(self):
+        folder = self.subfolder("persistent")
+        old = canonical(folder)
+        result, fault, lines = self.k1_run(folder, "persistent")
+        self.assertTrue(fault["fired"], "the check never failed")
+        self.assertFalse(result.success)
+        self.assertEqual(canonical(folder), old)
+        iso = one(folder, f"{NAME}_attempt-*.iso")  # it could not be checked, so it kept its name
+        self.assertEqual(iso.read_bytes(), NEW)
+        record, log_text = self.failed_records(folder)
+        self.assert_recorded_as_started(record, log_text, "dd failed: synthetic read error")
+        status = record["backup_status"]
+        self.assertEqual((record["output_files"]["iso_filename"], status["iso_created"]), (iso.name, None))
+        notes = [w for w in status["warnings"] if iso.name in w and "Input/output error" in w]
+        self.assertEqual(len(notes), 1, status["warnings"])
+
+    def test_k1_building_the_result_never_inspects_the_attempt_iso(self):
+        # The window where 35bb77d inspected it: armed, but nothing may look
+        folder = self.subfolder("build")
+        old = canonical(folder)
+        result, fault, lines = self.k1_run(folder, "build")
+        self.assertEqual(fault["in_build"], 0, "the result builder inspected the attempt ISO")
+        self.assertFalse(result.success)
+        self.assertEqual(canonical(folder), old)
+        partial = one(folder, f"{NAME}_failed-*.iso.partial")
+        self.assertEqual(partial.read_bytes(), NEW)
+        record, log_text = self.failed_records(folder)
+        self.assert_recorded_as_started(record, log_text, "dd failed: synthetic read error")
+        self.assertEqual((record["output_files"]["iso_filename"], record["backup_status"]["iso_created"]),
+                         (partial.name, True))
+
+    def test_k1_ctrl_c_while_the_attempt_iso_is_checked_never_escapes(self):
+        folder = self.subfolder("interrupt")
+        old = canonical(folder)
+        result, fault, lines = self.k1_run(folder, "interrupt")
+        self.assertEqual(fault["fired"], 1, "the interrupt never fired")
+        self.assertFalse(result.success)
+        self.assertEqual(canonical(folder), old)
+        self.assertEqual(sorted(folder.glob("*attempt-*")), [], "attempt files left unmarked")
+        partial = one(folder, f"{NAME}_failed-*.iso.partial")
+        self.assertEqual(partial.read_bytes(), NEW)
+        record, log_text = self.failed_records(folder)
+        self.assert_recorded_as_started(record, log_text, "dd failed: synthetic read error")
+
+    def test_k1_an_interrupt_as_the_iso_is_created_is_recorded_as_a_started_copy(self):
+        # Ctrl-C is held across the creation, so only an injected interrupt
+        # lands between open() and the recorded fact: the records follow the
+        # ISO actually found, or count one that cannot be checked as started
+        for checkable in (True, False):
+            with self.subTest(checkable=checkable):
+                folder = self.subfolder(f"open-{'checkable' if checkable else 'unreadable'}")
+                old, fired = canonical(folder), []
+
+                def interrupt(file, mode, args, kwargs, fired=fired):
+                    REAL_OPEN(file, mode, *args, **kwargs).close()
+                    fired.append(Path(file).name)
+                    raise KeyboardInterrupt
+
+                with opening_attempt_iso(interrupt):
+                    result, fault, lines = self.k1_run(folder, None if checkable else "persistent",
+                                                       dd=FakeDd(NEW))
+                self.assertTrue(fired, "the interrupt never fired")
+                self.assertFalse(result.success)
+                self.assertEqual(canonical(folder), old)
+                record, log_text = self.failed_records(folder)
+                self.assert_recorded_as_started(record, log_text, "Interrupted by operator (Ctrl-C)")
+                iso = folder / record["output_files"]["iso_filename"]
+                self.assertTrue(iso.is_file())
+                self.assertEqual(iso.read_bytes(), b"")
+                if checkable:
+                    self.assertTrue(iso.name.endswith(".iso.partial"), iso.name)
+                    self.assertIs(record["backup_status"]["iso_created"], True)
+                else:
+                    self.assertIn("_attempt-", iso.name)
+                    self.assertIsNone(record["backup_status"]["iso_created"])
+
+    def test_control_a_failed_dd_without_inspection_faults(self):
+        folder = self.subfolder("control")
+        old = canonical(folder)
+        result, _, _, lines, _ = image(folder, dd=FailingDd(NEW))
+        self.assertFalse(result.success)
+        self.assertEqual(canonical(folder), old)
+        self.assertEqual(one(folder, f"{NAME}_failed-*.iso.partial").read_bytes(), NEW)
+        record, log_text = self.failed_records(folder)
+        self.assert_recorded_as_started(record, log_text, "dd failed: synthetic read error")
+
+    # O4: a copy that never started
+
+    def test_a_copy_that_never_started_names_its_iso_under_the_failure_token(self):
+        folder = self.subfolder("never", seed=False)
+        obj, result = backup(folder, NEW, create_fails=True)
+        self.assertFalse(result.success)
+        self.assertEqual(sorted(folder.glob("*attempt-*")), [])
+        manifest = one(folder, f"{NAME}_failed-*_manifest.json")
+        token = re.match(rf"{NAME}_(failed-\d{{8}}T\d{{6}}-[0-9a-f]{{6}})_manifest\.json$",
+                         manifest.name).group(1)
+        record = json.loads(manifest.read_text())
+        self.assertEqual(record["output_files"]["iso_filename"], f"{NAME}_{token}.iso.partial")
+        self.assertFalse(os.path.lexists(folder / f"{NAME}_{token}.iso.partial"))
+        self.assertIs(record["backup_status"]["iso_created"], False)
+        creation = record["operations_performed"]["iso_creation"]
+        self.assertEqual((creation["performed"], creation["command"], creation["publish_method"]),
+                         (False, None, "not applicable: this run wrote no ISO"))
+        log_text = one(folder, f"{NAME}_failed-*.iso.log.txt").read_text()
+        self.assertIn(f"ISO File:         {NAME}_{token}.iso.partial\n", log_text)
+        self.assertIn("Status:  Not started", log_text)
+
+    def test_a_copy_never_attempted_is_named_from_the_recorded_fact_not_an_inspection(self):
+        # The unmount failed, so the copy never tried to create its ISO; the
+        # attempt ISO's name cannot be checked, which must not matter
+        folder = self.subfolder("unmount-failed")
+        old, armed, fired = canonical(folder), set(), []
+        real_mark = imaging.OpticalDiscBackup._mark_failed_attempt
+
+        def mark(obj, result, attempt):
+            armed.add(Path(attempt.iso))
+            return real_mark(obj, result, attempt)
+
+        with unreadable(armed, fired), \
+                mock.patch.object(imaging.OpticalDiscBackup, "_mark_failed_attempt", mark):
+            obj, result = backup(folder, NEW, unmount=lambda self: False)
+        self.assertTrue(armed, "failure marking never ran")
+        self.assertEqual(fired, [], "the attempt ISO the copy never created was inspected")
+        self.assertFalse(result.success)
+        self.assertEqual(canonical(folder), old)
+        manifest = one(folder, f"{NAME}_failed-*_manifest.json")
+        token = re.match(rf"{NAME}_(failed-[0-9T]+-[0-9a-f]{{6}})_manifest\.json$", manifest.name).group(1)
+        record = json.loads(manifest.read_text())
+        status = record["backup_status"]
+        self.assertEqual((record["output_files"]["iso_filename"], status["iso_created"]),
+                         (f"{NAME}_{token}.iso.partial", False))
+        self.assertFalse(any("could not verify where" in w for w in status["warnings"]), status["warnings"])
+        self.assertEqual(record["operations_performed"]["iso_creation"]["publish_method"],
+                         "not applicable: this run wrote no ISO")
+        self.assertIn("Status:  Not started", one(folder, f"{NAME}_failed-*.iso.log.txt").read_text())
+
+    def test_a_dry_run_records_that_it_wrote_no_iso(self):
+        folder = self.subfolder("dry", seed=False)
+        tools = FakeTools()
+        with mock.patch.object(imaging.subprocess, "run", tools.run), \
+                mock.patch.object(imaging, "log", lambda message: None):
+            self.assertEqual(run_main(folder, b"", dry_run=True, real_tree=True), 0)
+        record = json.loads((folder / f"{NAME}_manifest.json").read_text())
+        self.assertEqual(record["operations_performed"]["iso_creation"]["publish_method"],
+                         "not applicable: this run wrote no ISO")
+
+    # O2: a copy error, then Ctrl-C while dd is torn down
+
+    def test_a_copy_error_keeps_its_cause_when_ctrl_c_lands_in_dd_teardown(self):
+        folder = self.subfolder("teardown")
+        old, fired = canonical(folder), []
+
+        class InterruptedDd(FakeDd):
+            class Process(FakeDd.Process):
+                def __exit__(self, *exc):
+                    if exc[0] is not None and not fired:
+                        fired.append(exc[0].__name__)
+                        raise KeyboardInterrupt
+                    return False
+
+        disk_full = lambda file, mode, args, kwargs: FailingFile(REAL_OPEN(file, mode, *args, **kwargs),
+                                                                 "write")
+        with opening_attempt_iso(disk_full):
+            result, _, _, lines, _ = image(folder, dd=InterruptedDd(NEW))
+        self.assertEqual(fired, ["OSError"], "the interrupt never fired during the teardown")
+        self.assertFalse(result.success)
+        self.assertEqual(canonical(folder), old)
+        record, log_text = self.failed_records(folder)
+        self.assert_recorded_as_started(record, log_text, "Interrupted by operator (Ctrl-C)")
+        self.assertIn("no space left on device", record["backup_status"]["errors"])
+        self.assertTrue(record["output_files"]["iso_filename"].endswith(".iso.partial"))
+
+    # N6: a staged success record that cannot be removed
+
+    def unremovable_staged_records(self, folder, records_fail=False):
+        """Publication fails at the ISO (the prior bundle is restored), then
+        the staged success log and manifest cannot be removed (EIO); with
+        records_fail, the failure records cannot be written either"""
+        tools, denied, log_calls, refused = FakeTools(), [], [], []
+        real_unlink, real_log = Path.unlink, imaging.create_formatted_log
+
+        def unlink(path, *args, **kwargs):
+            p = Path(path)
+            if "attempt-" in p.name and p.name.endswith((".iso.log.txt", "_manifest.json")):
+                denied.append(p.name)
+                raise OSError(errno.EIO, "synthetic: Input/output error", str(p))
+            return real_unlink(path, *args, **kwargs)
+
+        def formatted_log(*args, **kwargs):
+            log_calls.append(1)
+            if records_fail and len(log_calls) > 1:
+                refused.append(Path(args[0]).name)
+                raise OSError("synthetic: failure records cannot be written")
+            return real_log(*args, **kwargs)
+
+        with self.fault(lambda src, dst: "attempt-" in src.name and src.name.endswith(".iso")), \
+                mock.patch.object(Path, "unlink", unlink), \
+                mock.patch.object(imaging, "create_formatted_log", formatted_log), \
+                mock.patch.object(imaging.subprocess, "run", tools.run):
+            obj, result = backup(folder, NEW, sudo_user="synthetic-operator")
+        self.assertEqual(len(set(denied)), 2, f"the unlink fault fired for {denied}")
+        if records_fail:
+            self.assertTrue(refused, "the failure-records write fault never fired")
+            self.assertTrue(all("_failed-" in name for name in refused), refused)
+        self.assertFalse(result.success)
+        return result, tools
+
+    def test_n6_an_unremovable_staged_record_keeps_its_name_and_is_named_there(self):
+        folder = self.subfolder("records-written")
+        old = canonical(folder)
+        result, tools = self.unremovable_staged_records(folder)
+        self.assertEqual(canonical(folder), old)
+        log_path = one(folder, f"{NAME}_attempt-*.iso.log.txt")
+        manifest = one(folder, f"{NAME}_attempt-*_manifest.json")
+        staged = json.loads(manifest.read_text())  # the staged success record, unchanged
+        self.assertEqual(staged["output_files"]["iso_filename"], ISO)
+        self.assertIn("Status:           SUCCESS", log_path.read_text())
+        record = json.loads(one(folder, f"{NAME}_failed-*_manifest.json").read_text())
+        status = record["backup_status"]
+        self.assertEqual(status["overall_status"], "failed")
+        self.assertNotIn("Status:           SUCCESS", one(folder, f"{NAME}_failed-*.iso.log.txt").read_text())
+        named = [w.split("could not remove ")[1].split(" ")[0] for w in status["warnings"]
+                 if "could not remove " in w]
+        self.assertEqual(sorted(named), sorted([log_path.name, manifest.name]), status["warnings"])
+        for warning in (w for w in status["warnings"] if "could not remove " in w):
+            self.assertIn("kept at that name, and does not describe a successful run", warning)
+        chowned = chowned_paths(tools)
+        for path in (log_path, manifest):
+            self.assertIn(str(path), chowned)
+
+    def test_n6_a_staged_record_never_becomes_a_failure_record_claiming_success(self):
+        folder = self.subfolder("records-fail")
+        old = canonical(folder)
+        self.unremovable_staged_records(folder, records_fail=True)
+        self.assertEqual(canonical(folder), old)
+        self.assertEqual(manifests_claiming_success(folder, "*_failed-*_manifest.json"), [])
+        for log_file in folder.glob(f"{NAME}_failed-*.iso.log.txt"):
+            self.assertNotIn("Status:           SUCCESS", log_file.read_text())
+        self.assertEqual(len(manifests_claiming_success(folder, "*_attempt-*_manifest.json")), 1,
+                         "the staged record is not the documented attempt-* leftover")
+
+    # end of input at a prompt
+
+    def test_end_of_input_at_a_prompt_means_no_and_changes_nothing(self):
+        folder = self.subfolder("eof")
+        before, entries, prompts, copies = snapshot(folder), sorted(os.listdir(folder)), [], []
+
+        def no_more_input(prompt=""):
+            prompts.append(prompt)
+            raise EOFError
+
+        with mock.patch.object(imaging, "input", no_more_input, create=True):
+            code, tools, lines = self.run_with(folder, [], confirm=REAL_CONFIRM,
+                                               copy=lambda obj: copies.append(1))
+            self.assertEqual(code, 1, lines)
+            self.assertEqual(len(prompts), 1, "the overwrite prompt was not asked")
+            self.assertEqual(copies, [])
+            self.assertEqual((sorted(os.listdir(folder)), snapshot(folder)), (entries, before))
+            self.assertTrue(any("end of input" in line and "nothing was changed" in line for line in lines))
+            args = argparse.Namespace(dry_run=False, force=False, filename=None, dir=None, operator=None)
+            with mock.patch.object(imaging, "log", lambda message: None), \
+                    self.assertRaises(SystemExit) as stopped:
+                imaging.gather_user_inputs(args)
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertEqual(len(prompts), 2, "the disk ID prompt was not asked")
+
+
+# --- copy inputs (T-154) -------------------------------------------------------
+
+class CopyInputTests(Base):
+    """T-154 (N12, N18, N20, O6): an empty copy is never certified, and an
+    unknown disc size is a warning; the folders a run creates, parents
+    included, are exactly the ones whose owner changes (normal runs) or that
+    its warning names (dry runs); an unmounted disc never gets a guessed tree
+    listing; the log is UTF-8 whatever the locale"""
+
+    subfolder = ReceiptTests.subfolder
+
+    def test_an_empty_copy_is_never_certified(self):
+        folder = self.subfolder("empty", seed=False)
+        result, _, dds, lines, _ = image(folder, payload=b"", dd=FakeDd(b""))  # size not reported
+        self.assertEqual(len(dds), 1)
+        self.assertFalse(result.success)
+        self.assertTrue(result.error_message.startswith("dd produced no data"), result.error_message)
+        self.assertEqual(canonical(folder), {})
+        self.assertEqual(one(folder, f"{NAME}_failed-*.iso.partial").read_bytes(), b"")
+        record = json.loads(one(folder, f"{NAME}_failed-*_manifest.json").read_text())
+        self.assertEqual(record["backup_status"]["overall_status"], "failed")
+        self.assertEqual(record["integrity_verification"]["integrity_status"], "not_performed")
+        code, output = verify_cli(folder)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("PASS: verified", output)
+        self.assertIn("  SKIPPED: 1\n", output)
+        self.assertIn("No master was verified", output)
+
+    def test_an_unknown_disc_size_is_a_warning_on_a_verified_copy(self):
+        folder = self.subfolder("unknown-size", seed=False)
+        result, _, _, lines, _ = image(folder, payload=b"", dd=FakeDd(NEW))
+        self.assertTrue(result.success, result.error_message)
+        record = json.loads((folder / f"{NAME}_manifest.json").read_text())
+        self.assertEqual(record["backup_status"]["overall_status"], "success_with_warnings")
+        self.assertEqual(record["backup_status"]["warnings"],
+                         ["the disc's size was not reported (diskutil TotalSize missing or 0), so the "
+                          "copy's completeness was not checked against it"])
+        self.assertEqual(canonical(folder)[ISO], NEW)
+
+    def test_control_a_short_copy_of_a_known_size_keeps_its_failure(self):
+        folder = self.subfolder("short", seed=False)
+        result, _, _, _, _ = image(folder, dd=FakeDd(b""))
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_message,
+                         f"Short read: copied 0 of {len(NEW)} bytes ({len(NEW)} bytes missing). The disc "
+                         f"may have a read error; the ISO is incomplete and will not be certified.")
+
+    def test_a_normal_run_hands_over_every_folder_it_created_and_no_other(self):
+        for label, parent_exists in (("new-parent", False), ("existing-parent", True)):
+            with self.subTest(label):
+                parent = self.dir / label
+                if parent_exists:
+                    parent.mkdir()
+                leaf = parent / "leaf"
+                tools = FakeTools()
+                with mock.patch.object(imaging.subprocess, "run", tools.run):
+                    obj, result = backup(leaf, NEW, sudo_user="synthetic-operator")
+                self.assertTrue(result.success, result.error_message)
+                chowned = chowned_paths(tools)
+                self.assertIn(str(leaf), chowned)
+                for name in CANONICAL:
+                    self.assertIn(str(leaf / name), chowned)
+                self.assertEqual(str(parent) in chowned, not parent_exists, chowned)
+                self.assertNotIn(str(self.dir), chowned)
+
+    def test_a_dry_run_names_every_folder_it_created_and_changes_no_owner(self):
+        parent = self.dir / "new-parent"
+        leaf = parent / "leaf"
+        tools, lines = FakeTools(), []
+        with mock.patch.object(imaging.subprocess, "run", tools.run), \
+                mock.patch.object(imaging, "log", lines.append), fake_ownership() as calls:
+            code = run_main(leaf, b"", dry_run=True, real_tree=True, sudo_user="synthetic-operator")
+        self.assertEqual(code, 0, lines)
+        warned = [line for line in lines if "keeps its owner (root)" in line]
+        self.assertEqual(len(warned), 1, lines)
+        self.assertIn(f"{parent}, {leaf}", warned[0])
+        self.assertEqual([c[0] for c in calls], [ident(leaf / n) for n in DRY_RUN_FILES])
+        self.assertEqual(tools.chowned, [], "ownership changed by name")
+
+    def test_a_folder_that_cannot_be_created_is_refused_cleanly(self):
+        # --dir is a dangling symlink: the output folder cannot be made below it
+        link = self.dir / "gone"
+        link.symlink_to(self.dir / "missing-target")
+        leaf = link / "leaf"
+        before = sorted(os.listdir(self.dir))
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                tools, lines = FakeTools(), []
+                with mock.patch.object(imaging.subprocess, "run", tools.run), \
+                        mock.patch.object(imaging, "log", lines.append):
+                    code = run_main(leaf, b"" if dry_run else NEW, dry_run=dry_run, real_tree=True)
+                self.assertEqual(code, 1, lines)
+                self.assertEqual(tools.trees, [])
+                self.assertEqual(sorted(os.listdir(self.dir)), before, "something was created")
+                prefix = ("Dry run stopped: could not create " if dry_run
+                          else "Backup failed: Could not create ")
+                shown = [line for line in lines if line.startswith(prefix)]
+                self.assertEqual(len(shown), 1, lines)
+                for text in (str(leaf), "No such file or directory", "nothing was changed"):
+                    self.assertIn(text, shown[0])
+
+    def test_an_unmounted_disc_gets_no_guessed_tree_listing(self):
+        for mount_point in ("", None):
+            with self.subTest(mount_point=mount_point):
+                folder = self.subfolder(f"unmounted-{mount_point!r}", seed=False)
+                result, trees, _, lines, _ = image(folder, mount_point=mount_point)
+                self.assertEqual(trees, [], "tree listed a guessed mount point")
+                self.assertTrue(result.success, result.error_message)
+                record = json.loads((folder / f"{NAME}_manifest.json").read_text())
+                self.assertEqual(record["backup_status"]["overall_status"], "success_with_warnings")
+                self.assertEqual(record["backup_status"]["warnings"],
+                                 ["tree listing not made: the disc was not mounted (diskutil reported "
+                                  "no mount point)"])
+                self.assertIsNone(record["operations_performed"]["tree_listing"]["command"])
+                self.assertIsNone(record["volume_information"]["mount_point"])
+                log_text = (folder / LOGNAME).read_text()
+                self.assertIn("Tree Listing Generation\n  Status:  Not run (the disc was not mounted",
+                              log_text)
+                for text in (log_text, json.dumps(record)):
+                    self.assertNotIn("/Volumes/", text)
+                self.assertEqual(canonical(folder)[ISO], NEW)
+
+    def test_a_dry_run_on_an_unmounted_disc_stops_before_creating_anything(self):
+        folder = self.dir / "dry-unmounted"
+        tools, lines = FakeTools(), []
+        with mock.patch.object(imaging.subprocess, "run", tools.run), \
+                mock.patch.object(imaging, "log", lines.append):
+            code = run_main(folder, b"", dry_run=True, real_tree=True, mount_point="")
+        self.assertEqual(code, 1, lines)
+        stopped = [line for line in lines if line.startswith(("Dry run stopped:", "Dry run refused:"))]
+        self.assertEqual(len(stopped), 1, lines)
+        self.assertIn("the disc is not mounted", stopped[0])
+        self.assertTrue(stopped[0].startswith("Dry run stopped:"), stopped[0])
+        self.assertTrue(stopped[0].endswith("It created no files."), stopped[0])
+        self.assertEqual(tools.trees, [])
+        self.assertFalse(os.path.lexists(folder), "the dry run created its folder")
+
+    def test_the_log_is_utf8_whatever_the_locale(self):
+        # A log opened without an explicit encoding gets ASCII, as under a
+        # non-UTF-8 locale; the eject's message and the operator's name are not ASCII
+        opened = []
+
+        def ascii_by_default(file, mode="r", *args, **kwargs):
+            if str(file).endswith(".iso.log.txt") and "b" not in mode and len(args) < 2:
+                opened.append(kwargs.get("encoding"))
+                if kwargs.get("encoding") is None:
+                    kwargs["encoding"] = "ascii"
+            return REAL_OPEN(file, mode, *args, **kwargs)
+
+        folder = self.subfolder("normal", seed=False)
+        with mock.patch.object(imaging, "open", ascii_by_default, create=True):
+            code = run_main(folder, NEW, finalize=lambda obj: False)
+        self.assertTrue(opened, "the log was never opened")
+        self.assertEqual(code, 0)
+        log_text = (folder / LOGNAME).read_bytes().decode("utf-8")
+        self.assertIn("FAILED (eject error — see console output)", log_text)
+        record = json.loads((folder / f"{NAME}_manifest.json").read_text())
+        self.assertEqual(record["backup_status"]["overall_status"], "success_with_warnings")
+
+        dry = self.subfolder("dry", seed=False)
+        cfg = imaging.BackupConfig("disk9", "SYNTHETIC", NAME, "Zoë", dry, dry_run=True)
+        with synthetic_drive(b"", real_tree=True), \
+                mock.patch.object(imaging.subprocess, "run", FakeTools().run), \
+                mock.patch.object(imaging, "open", ascii_by_default, create=True):
+            result = imaging.OpticalDiscBackup(cfg).create_backup()
+        self.assertTrue(result.success, result.error_message)
+        self.assertIn("Operator:         Zoë\n", (dry / LOGNAME).read_bytes().decode("utf-8"))
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--sigint-child":
+        # A real SIGINT must raise KeyboardInterrupt here even if the runner
+        # started this interpreter with SIGINT ignored (Python then keeps SIG_IGN)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         try:
             exit_code = _child_main(sys.argv[2], Path(sys.argv[3]))
         finally:

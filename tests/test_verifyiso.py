@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Synthetic tests for verifyiso.py: CSV report safety, manifest families and
 statuses, malformed items, and the eight fixture scenarios (T-122, T-125,
-T-126); and discovery that reports every part of the search it could not
-complete (T-134).
+T-126); discovery that reports every part of the search it could not
+complete (T-134); masters and manifests classified before they are opened,
+one inspection table on every Python version, spellings that never hide a
+different bundle and symlink chains told apart from loops (T-147, T-148);
+and report cleanup that is reported when it fails, Ctrl-C while the report
+is reserved, and escaped console text (T-149).
 
 Standard library only. Every file is synthetic and private (TMPDIR); the
 guards in synthetic_support.py block child processes, sockets, devices and
-writes outside the private directory. These tests check verifyiso's
-decisions, files and exit codes - not real collection media. Discovery faults
-are injected through os.scandir and os.stat fakes that delegate everything
-else, with DirEntry stand-ins; symlinks and FIFOs are real files in the
-private directory, and a tripwire (installed before the product is loaded)
-stops any open of a FIFO or device before it can block.
+writes outside the private directory; the only child is this interpreter
+re-running this file with --sigint-child, so that a REAL SIGINT can be
+delivered mid-run without disturbing the test runner. These tests check
+verifyiso's decisions, files and exit codes - not real collection media.
+Discovery faults are injected through os.scandir and os.stat fakes that
+delegate everything else, with DirEntry stand-ins; symlinks, symlink chains
+and FIFOs are real files in the private directory, and a tripwire (installed
+before the product is loaded) stops any open of a FIFO or device before it
+can block.
 
 Run:  python3 tests/test_verifyiso.py
 OPTICAL_UNDER_TEST=/dir runs the same tests against another copy.
@@ -27,7 +34,9 @@ import io
 import json
 import os
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -93,6 +102,74 @@ def status_of(manifest_path: Path) -> str:
         return verify.check_manifest(manifest_path).status
     except Exception as e:
         return f"raised {type(e).__name__}"
+
+
+@contextlib.contextmanager
+def unlink_denied(path: Path):
+    """os.unlink refuses path (EACCES), delegating everything else; yields
+    the attempts it refused"""
+    real, refused = os.unlink, []
+
+    def unlink(name, *args, **kwargs):
+        if not isinstance(name, int) and Path(os.fsdecode(name)) == path:
+            refused.append(path)
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real(name, *args, **kwargs)
+
+    with mock.patch.object(os, "unlink", unlink):
+        yield refused
+
+
+@contextlib.contextmanager
+def lstat_fails(path: Path, error: OSError):
+    """os.lstat raises error for path, delegating everything else; yields the
+    calls it failed"""
+    real, fired = os.lstat, []
+
+    def lstat(name, *args, **kwargs):
+        if not isinstance(name, int) and Path(os.fsdecode(name)) == path:
+            fired.append(path)
+            raise error
+        return real(name, *args, **kwargs)
+
+    with mock.patch.object(os, "lstat", lstat):
+        yield fired
+
+
+@contextlib.contextmanager
+def resolution_fails(path: Path, error: OSError, under=None):
+    """os.lstat raises error for path (as spelled, or under its folder's real
+    path), but only when verifyiso resolves a path's identity - its own
+    _realpath, or os.path.realpath called by a verifyiso function (the
+    released form) - and, if under is given, only beneath that verifyiso
+    function; everything else (the harness included) is delegated. Yields
+    the verifyiso function each fault fired for, so a test shows the fault
+    reached the product's resolution logic"""
+    real, fired = os.lstat, []
+    spellings = {str(path), os.path.join(os.path.realpath(path.parent), path.name)}
+    resolvers = ("_realpath", "resolve")
+
+    def lstat(name, *args, **kwargs):
+        if not isinstance(name, int) and os.fsdecode(name) in spellings:
+            frame, between = sys._getframe(1), []
+            while frame is not None and frame.f_globals is not vars(verify):
+                between.append((frame.f_globals.get("__name__"), frame.f_code.co_name))
+                frame = frame.f_back
+            product = []
+            while frame is not None:
+                if frame.f_globals is vars(verify):
+                    product.append(frame.f_code.co_name)
+                frame = frame.f_back
+            via_realpath = (bool(between) and ("posixpath", "realpath") in between
+                            and all(m in ("posixpath", "genericpath") for m, _ in between))
+            resolving = bool(product) and (product[0] in resolvers or via_realpath)
+            if resolving and (under is None or under in product):
+                fired.append(next(n for n in product if n not in resolvers))
+                raise error
+        return real(name, *args, **kwargs)
+
+    with mock.patch.object(os, "lstat", lstat):
+        yield fired
 
 
 class Base(unittest.TestCase):
@@ -273,6 +350,44 @@ class CsvReportTests(Base):
         self.assertEqual(len(self.hashed), 1, "the run went on after Ctrl-C")
         self.assertFalse(os.path.lexists(report))
 
+    def interrupted_run(self, report, unlink_fails):
+        """Two bundles, Ctrl-C while the first is hashed; with unlink_fails,
+        removing the unfinished report is refused (EACCES)"""
+        self.master("a")
+        self.master("b")
+
+        def interrupt(path, label=""):
+            self.hashed.append(Path(path))
+            raise KeyboardInterrupt
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(verify, "hash_file", interrupt))
+            refused = stack.enter_context(unlink_denied(report)) if unlink_fails else None
+            code, output = self.cli(self.dir, report=report)
+        self.assertEqual(code, 130, output)
+        self.assertEqual(len(self.hashed), 1, "the run went on after Ctrl-C")
+        self.assertNotIn("no report written", output)  # a removal that can fail is never promised
+        self.assertIn("Interrupted by operator (Ctrl-C) — verification incomplete; the --csv report "
+                      "was not completed", output)
+        return output, refused
+
+    def test_ctrl_c_with_a_failed_removal_names_what_was_left(self):
+        # T-149 (F5b): the unfinished report is this run's own file, but it
+        # could not be removed; the run says so instead of staying silent
+        report = self.dir / "report.csv"
+        output, refused = self.interrupted_run(report, unlink_fails=True)
+        self.assertEqual(refused, [report], "the removal was never attempted")
+        self.assertIn(f"Could not remove the unfinished --csv report {report} ([Errno 13] Permission "
+                      f"denied); it is the file this run created: remove it yourself", output)
+        self.assertEqual(report.read_bytes(), b"")
+
+    def test_control_ctrl_c_with_a_working_removal_warns_of_nothing(self):
+        report = self.dir / "report.csv"
+        output, _ = self.interrupted_run(report, unlink_fails=False)
+        self.assertNotIn("Could not remove", output)
+        self.assertNotIn("left in place", output)
+        self.assertFalse(os.path.lexists(report))
+
     def test_a_file_that_replaced_the_reservation_is_left_alone(self):
         self.master()
         report = self.dir / "report.csv"
@@ -381,6 +496,54 @@ class ReportAliasTests(Base):
         self.assertEqual(code, 0, output)
         self.assertEqual([r[0] for r in list(csv.reader(report2.open(encoding="utf-8")))[1:]], ["PASS"])
 
+    def test_a_failed_removal_after_an_alias_refusal_names_the_leftover(self):
+        # T-149 (F5a): the refused report sits at the name a manifest expects
+        # for its master; if it cannot be removed, the run says where and why
+        folder = self.dir / "alias"
+        manifest = self.empty_master_record(folder)
+        report = folder / "master.payload"
+        with unlink_denied(report) as refused:
+            code, output = self.cli(folder, report=report)
+        self.assertEqual(refused, [report], "the removal was never attempted")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [], "the reservation was hashed")
+        self.assertIn("ERROR: the ISO name master.payload is the --csv report", output)
+        self.assertIn("Not keeping CSV report", output)
+        self.assertIn(f"Could not remove the unfinished --csv report {report} ([Errno 13] Permission "
+                      f"denied); it is the file this run created: remove it yourself; {manifest} names "
+                      f"that path as its ISO", output)
+        self.assertEqual(report.read_bytes(), b"")  # left, and reported
+
+    def test_control_an_alias_refusal_with_a_working_removal_warns_of_nothing(self):
+        folder = self.dir / "alias"
+        manifest = self.empty_master_record(folder)
+        report = folder / "master.payload"
+        code, output = self.cli(folder, report=report)
+        self.assert_alias_refused(folder, report, manifest, output, code,
+                                  "ERROR: the ISO name master.payload is the --csv report")
+        self.assertNotIn("Could not remove", output)
+        self.assertNotIn("left in place", output)
+
+    def test_a_report_spelled_through_a_symlink_and_dotdot_is_not_taken_for_another_file(self):
+        # T-148 (N9): coll/link/../report.csv is other/report.csv to the
+        # system, so a manifest in coll naming report.csv names another
+        # (missing) file, not the report
+        coll, other = self.dir / "coll", self.dir / "other"
+        (other / "deep").mkdir(parents=True)
+        coll.mkdir()
+        (coll / "disc_manifest.json").write_text(json.dumps(record("report.csv")))
+        os.symlink(other / "deep", coll / "link")
+        report = coll / "link" / ".." / "report.csv"
+        code, output = self.cli(coll, other / "deep", report=report)
+        self.assertEqual(code, 1, output)
+        self.assertIn("MISSING_ISO: ISO not found next to manifest: report.csv", output)
+        self.assertNotIn("is the --csv report", output)
+        self.assertNotIn("Not keeping CSV report", output)
+        self.assertIn(f"CSV report written to: {report}", output)
+        self.assertFalse(os.path.lexists(coll / "report.csv"))
+        rows = list(csv.reader(io.StringIO((other / "report.csv").read_text(encoding="utf-8"))))
+        self.assertEqual([r[0] for r in rows[1:]], ["MISSING_ISO"])
+
 
 class ReportAliasInspectionTests(Base):
     """T-137 repair: when it cannot be inspected whether a manifest, or the
@@ -388,7 +551,8 @@ class ReportAliasInspectionTests(Base):
     file"), that input is an ERROR naming the path and the error, it is not
     read or hashed, healthy siblings are still checked, and the report is not
     kept. Each fault fires once, armed when check_manifest starts on that
-    manifest, so discovery is untouched. Controls: absence that is
+    manifest, or (T-148 repair) only while the alias check resolves a path,
+    so discovery is untouched. Controls: absence that is
     established keeps its outcome and the report; no --csv, no change"""
 
     @contextlib.contextmanager
@@ -523,6 +687,55 @@ class ReportAliasInspectionTests(Base):
         self.master(folder=healthy)
         self.assertEqual(self.cli(healthy)[0], 0)
 
+    def unresolvable_alias(self, inject):
+        """T-148 repair: coll/link points at other/deep; other's manifest,
+        given as coll/link/../disc_manifest.json, names report.csv (missing
+        beside it), and the report is coll/report.csv - a different file
+        that a guessed coll/link/.. (coll) would name. With inject,
+        inspecting coll/link fails (EIO) whenever the alias check resolves a
+        path through it; discovery is untouched. A healthy bundle is given too"""
+        coll, other, healthy = self.dir / "coll", self.dir / "other", self.dir / "healthy"
+        (other / "deep").mkdir(parents=True)
+        coll.mkdir()
+        (other / "disc_manifest.json").write_text(json.dumps(record("report.csv")))
+        os.symlink(other / "deep", coll / "link")
+        self.master(folder=healthy)
+        self.hashed.clear()
+        given, report = coll / "link" / ".." / "disc_manifest.json", coll / "report.csv"
+        if not inject:
+            return given, healthy, report, [], self.cli(given, healthy, report=report)
+        with resolution_fails(coll / "link", io_error(), under="_report_alias") as fired:
+            result = self.cli(given, healthy, report=report)
+        return given, healthy, report, fired, result
+
+    def test_an_alias_check_whose_path_cannot_be_resolved_stays_uncertain(self):
+        # Never a false proven alias, never a bypass: the manifest is an
+        # ERROR (not read), the healthy bundle is still checked, and the
+        # report is not kept
+        given, healthy, report, fired, (code, output) = self.unresolvable_alias(inject=True)
+        self.assertIn("_physical", fired, "the fault never reached the alias check's resolution")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [healthy / "disc.iso"])
+        self.assertEqual(output.count("PASS: verified"), 1, output)
+        self.assertIn(f"{given}: ERROR — could not check whether this is the --csv report this run "
+                      f"is writing ([Errno 5] Input/output error); not read", output)
+        self.assertIn("for 1 manifest(s) it could not be checked whether they or their ISO "
+                      "are the report", output)
+        self.assertNotIn("name it as their ISO or as themselves", output)  # not a proven alias
+        self.assertNotIn("CSV report written to", output)
+        self.assertFalse(os.path.lexists(report), "a report that may be an input was kept")
+
+    def test_control_the_same_alias_check_without_a_fault_keeps_the_report(self):
+        given, healthy, report, _, (code, output) = self.unresolvable_alias(inject=False)
+        self.assertEqual(code, 1, output)
+        self.assertIn("MISSING_ISO: ISO not found next to manifest: report.csv", output)
+        self.assertEqual(self.hashed, [healthy / "disc.iso"])
+        self.assertNotIn("is the --csv report", output)
+        self.assertNotIn("Not keeping CSV report", output)
+        self.assertIn(f"CSV report written to: {report}", output)
+        rows = list(csv.reader(io.StringIO(report.read_text(encoding="utf-8"))))
+        self.assertEqual(sorted(r[0] for r in rows[1:]), ["MISSING_ISO", "PASS"])
+
 
 class ReportOwnershipTests(Base):
     """T-138: a report path that stops naming this run's file while the
@@ -611,6 +824,92 @@ class ReportOwnershipTests(Base):
         self.assertIn(f"CSV report written to: {report}", output)
         self.assertEqual([r[0] for r in list(csv.reader(report.open(encoding="utf-8")))[1:]], ["PASS"])
 
+    UNCHECKED = "could not be checked ([Errno 5] Input/output error)"
+
+    @contextlib.contextmanager
+    def ownership_unchecked(self, stage):
+        """The ownership check (_report_lost) cannot be made, once: before
+        the report is written ("pre": the reservation is still empty) or
+        after ("post": it holds the report). Every other call is the real
+        check; yields the stages it fired at"""
+        real, fired = verify._report_lost, []
+
+        def report_lost(path, identity):
+            if not fired and (stage == "pre" or os.path.getsize(path) > 0):
+                fired.append(stage)
+                return self.UNCHECKED
+            return real(path, identity)
+
+        with mock.patch.object(verify, "_report_lost", report_lost):
+            yield fired
+
+    def test_a_report_whose_ownership_could_not_be_checked_is_left_in_place(self):
+        # T-149 (F5c): "nothing there was removed" stays true - a later check
+        # that would succeed never removes it
+        for stage, said in (("pre", "Could not write CSV report"), ("post", "Could not save CSV report")):
+            with self.subTest(stage):
+                folder = self.dir / stage
+                self.master(folder=folder)
+                report = folder / "report.csv"
+                with self.ownership_unchecked(stage) as fired:
+                    code, output = self.cli(folder, report=report)
+                self.assertEqual(fired, [stage], "the fault never fired")
+                self.assertEqual(code, 1, output)
+                self.assertIn(f"{said}: {report} {self.UNCHECKED}", output)
+                self.assertIn("nothing there was removed", output)
+                self.assertNotIn("CSV report written to", output)
+                self.assertTrue(os.path.lexists(report), "a path whose ownership was not established was removed")
+                with open(report, newline="", encoding="utf-8") as f:
+                    rows = list(csv.reader(f))
+                self.assertEqual([r[0] for r in rows[1:]] if rows else None,
+                                 None if stage == "pre" else ["PASS"])
+
+    def test_cleanup_that_cannot_check_ownership_leaves_the_file_and_says_so(self):
+        # T-149: Ctrl-C, and the cleanup's own ownership check cannot be made
+        self.master("a")
+        self.master("b")
+        report = self.dir / "report.csv"
+        checks = []
+
+        def report_lost(path, identity):
+            checks.append(Path(path))
+            return self.UNCHECKED
+
+        def interrupt(path, label=""):
+            self.hashed.append(Path(path))
+            raise KeyboardInterrupt
+
+        with mock.patch.object(verify, "hash_file", interrupt), \
+                mock.patch.object(verify, "_report_lost", report_lost):
+            code, output = self.cli(self.dir, report=report)
+        self.assertEqual(checks, [report], "the cleanup check never ran")
+        self.assertEqual(code, 130, output)
+        self.assertIn(f"The unfinished --csv report was left in place: whether {report} still names "
+                      f"the file this run created {self.UNCHECKED}", output)
+        self.assertEqual(report.read_bytes(), b"")
+
+    def test_ctrl_c_while_the_report_is_reserved_exits_130_and_names_the_path(self):
+        # T-149 (F6), injected: the interrupt lands in the reservation's own
+        # fstat; the file's identity is unproven, so it is left and named
+        self.master()
+        report = self.dir / "report.csv"
+        real_fstat, fired = os.fstat, []
+
+        def fstat(fd):
+            if not fired and os.path.lexists(report):
+                fired.append(fd)
+                raise KeyboardInterrupt
+            return real_fstat(fd)
+
+        with mock.patch.object(os, "fstat", fstat):
+            code, output = self.cli(self.dir, report=report)
+        self.assertEqual(len(fired), 1, "the interrupt never fired")
+        self.assertEqual(code, 130, output)
+        self.assertIn(f"Interrupted by operator (Ctrl-C) while reserving the --csv report; anything now "
+                      f"at {report} was left in place (if this run created it, it is empty)", output)
+        self.assertEqual(report.read_bytes(), b"")
+        self.assertEqual(self.hashed, [])
+
 
 class ClassificationTests(Base):
     """T-125: families by content, status whitelist, dry-run and integrity rules"""
@@ -657,6 +956,49 @@ class ClassificationTests(Base):
                 self.assertEqual(self.check(m, folder=folder), "SKIPPED")
                 (folder / "disc.iso").write_bytes(b"the real master")
                 self.assertEqual(self.check(m, folder=folder), "UNVERIFIABLE")
+
+    def test_dry_run_record_beside_an_uninspectable_iso_is_an_error(self):
+        # T-147 (N13): an inspection error is never taken for "no ISO here"
+        audit_fix_style = record(backup_status={"overall_status": "dry_run"})
+        main_style = record(backup_metadata={"run_id": "x", "dry_run": True})
+        main_style["integrity_verification"] = {"source_hash": "dry_run_hash"}
+        for label, m in (("dry_run status", audit_fix_style), ("main-era dry_run flag", main_style)):
+            with self.subTest(case=label):
+                folder = self.dir / label.replace(" ", "_")
+                folder.mkdir()
+                manifest = self.write_manifest("disc_manifest.json", m, folder)
+                iso = folder / "disc.iso"
+                iso.write_bytes(b"the real master")
+                with lstat_fails(iso, io_error()) as fired:
+                    result = verify.check_manifest(manifest)
+                    code, output = self.cli(folder)
+                self.assertEqual(fired, [iso, iso], "the fault did not reach both checks")
+                self.assertEqual(result.status, "ERROR", result.detail)
+                self.assertIn("could not check whether an ISO sits beside this dry-run record (disc.iso): "
+                              "[Errno 5] Input/output error", result.detail)
+                self.assertEqual(code, 1, output)
+                self.assertNotIn("SKIPPED", output)
+
+    def test_iso_names_no_file_can_have_are_unverifiable(self):
+        # T-147 (F9): an embedded NUL or an unencodable character, with or
+        # without --csv; the report is kept
+        for label, name in (("nul", "disc\x00.iso"), ("surrogate", "\ud800.iso")):
+            for with_csv in (False, True):
+                with self.subTest(name=label, csv=with_csv):
+                    self.hashed.clear()
+                    folder = self.dir / f"{label}-{with_csv}"
+                    folder.mkdir()
+                    self.write_manifest("disc_manifest.json", record(name), folder)
+                    report = self.dir / f"{label}-{with_csv}.csv" if with_csv else None
+                    code, output = self.cli(folder, report=report)
+                    self.assertEqual(code, 1, output)
+                    self.assertIn(f"UNVERIFIABLE: manifest ISO filename is not a usable file name: "
+                                  f"{name!r}", output)
+                    self.assertEqual(self.hashed, [])
+                    if with_csv:
+                        self.assertIn(f"CSV report written to: {report}", output)
+                        rows = list(csv.reader(io.StringIO(report.read_text(encoding="utf-8"))))
+                        self.assertEqual([r[0] for r in rows[1:]], ["UNVERIFIABLE"])
 
     def test_declared_sha256_without_its_hash_is_unverifiable(self):
         data = b"healthy synthetic master"
@@ -814,6 +1156,365 @@ class FixtureScenarioTests(Base):
                 self.assertEqual(status_of(self.dir / name / f"{name}_manifest.json"), expected)
 
 
+class MasterInspectionTests(Base):
+    """T-147: the ISO a manifest names is inspected before it is opened, the
+    same way on every Python version - no such file is MISSING_ISO, any other
+    inspection error is ERROR with its errno, and anything but a regular
+    file is ERROR and never opened; a descriptor that is not a regular file
+    once opened is never read; check_manifest classifies its manifest too.
+    Every case asserts that the tripwire saw no open of a special file"""
+
+    def setUp(self):
+        super().setUp()
+        self._tripwire_before = len(TRIPWIRE_OPENS)
+        self.addCleanup(self._no_special_file_opens)
+        patcher = mock.patch.object(verify, "ANSI_ENABLED", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _no_special_file_opens(self):
+        self.assertEqual(TRIPWIRE_OPENS[self._tripwire_before:], [],
+                         "the product tried to open a FIFO or device (the tripwire stopped it)")
+
+    @staticmethod
+    def bundle(folder, iso_name="disc.iso", data=b"healthy synthetic master"):
+        """A success record in folder for data; nothing is put at the ISO name"""
+        folder.mkdir(parents=True, exist_ok=True)
+        manifest = folder / "disc_manifest.json"
+        manifest.write_text(json.dumps(record(iso_name, data)))
+        return manifest, folder / iso_name
+
+    def test_anything_but_a_regular_file_at_the_iso_name_is_never_opened(self):
+        for label in ("fifo", "link-to-fifo", "folder"):
+            with self.subTest(label):
+                root = self.dir / label
+                self.master(folder=root / "sibling")
+                _, iso = self.bundle(root / "bundle")
+                if label == "fifo":
+                    os.mkfifo(iso)
+                elif label == "link-to-fifo":
+                    os.mkfifo(root / "bundle" / "pipe")
+                    os.symlink(root / "bundle" / "pipe", iso)
+                else:
+                    iso.mkdir()
+                self.hashed.clear()
+                before = len(TRIPWIRE_OPENS)
+                code, output = self.cli(root)
+                self.assertEqual(TRIPWIRE_OPENS[before:], [], "the product tried to open a FIFO")
+                self.assertEqual(code, 1, output)
+                self.assertEqual(self.hashed, [root / "sibling" / "disc.iso"])
+                self.assertIn(f"{iso}: ERROR — ISO disc.iso is not a regular file (folder, FIFO, device "
+                              f"or socket); not opened", output)
+
+    def test_a_master_that_is_not_a_regular_file_once_opened_is_never_read(self):
+        # The descriptor's own fstat decides: a file swapped for a FIFO after
+        # it was inspected is never read (here fstat reports a FIFO)
+        iso, manifest = self.master()
+        st = os.stat(iso)
+        identity, real_fstat, fired = (st.st_dev, st.st_ino), os.fstat, []
+
+        def fstat(fd):
+            result = real_fstat(fd)
+            if (result.st_dev, result.st_ino) == identity:
+                fired.append(fd)
+                return os.stat_result((stat.S_IFIFO | 0o600,) + tuple(result)[1:])
+            return result
+
+        with mock.patch.object(os, "fstat", fstat):
+            code, output = self.cli(self.dir)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(len(fired), 1, "the fault never fired")
+        self.assertIn("ERROR: ISO disc.iso changed to a non-regular file during the check; not read", output)
+        self.assertNotIn("PASS", output)
+
+    @contextlib.contextmanager
+    def descriptor_events(self, path, fault=None):
+        """Records, in order, what happens to the descriptor os.open returns
+        for path: ("os.open", flags), ("fstat",), ("set_blocking", flag),
+        ("file",) for the file object made from it, ("read",) and ("close",).
+        fault: "fifo" - its fstat reports a FIFO; "made" - Ctrl-C lands just
+        as the file object is made (the object exists, then is dropped);
+        "read" - Ctrl-C lands in its first read. Yields (events, fds)"""
+        real_open, real_fstat = os.open, os.fstat
+        real_set_blocking, real_close = os.set_blocking, os.close
+        events, fds = [], []
+
+        def os_open(name, flags, *args, **kwargs):
+            fd = real_open(name, flags, *args, **kwargs)
+            if not isinstance(name, int) and Path(os.fsdecode(name)) == path:
+                fds.append(fd)
+                events.append(("os.open", flags))
+            return fd
+
+        def fstat(fd):
+            result = real_fstat(fd)
+            if fd in fds:
+                events.append(("fstat",))
+                if fault == "fifo":
+                    return os.stat_result((stat.S_IFIFO | 0o600,) + tuple(result)[1:])
+            return result
+
+        def set_blocking(fd, blocking):
+            if fd in fds:
+                events.append(("set_blocking", blocking))
+            return real_set_blocking(fd, blocking)
+
+        class Interrupting:
+            """The file object, except that its first read is a Ctrl-C"""
+            def __init__(self, f):
+                self.f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.f.close()
+                return False
+
+            def read(self, *args):
+                events.append(("read",))
+                raise KeyboardInterrupt
+
+        def file_open(file, *args, **kwargs):
+            f = io.open(file, *args, **kwargs)
+            if isinstance(file, int) and file in fds:
+                events.append(("file",))
+                if fault == "made":
+                    del f  # dropped as the interrupt unwinds
+                    raise KeyboardInterrupt
+                if fault == "read":
+                    return Interrupting(f)
+            return f
+
+        def close(fd):
+            if fd in fds:
+                events.append(("close",))
+            return real_close(fd)
+
+        with mock.patch.object(os, "open", os_open), mock.patch.object(os, "fstat", fstat), \
+                mock.patch.object(os, "set_blocking", set_blocking), mock.patch.object(os, "close", close), \
+                mock.patch.object(verify, "open", file_open, create=True):
+            yield events, fds
+
+    def assert_closed(self, fd):
+        """fd no longer names an open descriptor (nothing was opened since)"""
+        with self.assertRaises(OSError) as caught:
+            os.fstat(fd)
+        self.assertEqual(caught.exception.errno, errno.EBADF)
+
+    def test_a_master_is_opened_without_waiting_then_read_with_blocking_reads(self):
+        # The protocol: open O_RDONLY|O_NONBLOCK (a FIFO cannot block the
+        # open), fstat, only then blocking reads; the descriptor closed once
+        data = b"healthy synthetic master"
+        iso, _ = self.master(data=data)
+        with self.descriptor_events(iso) as (events, fds):
+            digests = verify.hash_file(iso, iso.name)
+        self.assertEqual(digests, hashes(data))
+        self.assertEqual(len(fds), 1, "the master was not opened through os.open")
+        self.assert_closed(fds[0])
+        self.assertEqual([e[0] for e in events], ["os.open", "fstat", "set_blocking", "file", "close"])
+        flags = events[0][1]
+        self.assertTrue(flags & os.O_NONBLOCK, "opened without O_NONBLOCK")
+        self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+        self.assertEqual(events[2], ("set_blocking", True))
+
+    def test_a_descriptor_that_is_not_a_regular_file_is_closed_unread(self):
+        iso, _ = self.master()
+        with self.descriptor_events(iso, fault="fifo") as (events, fds):
+            with self.assertRaises(OSError) as caught:
+                verify.hash_file(iso, iso.name)
+        self.assertIn(("fstat",), events, "the fault never fired")
+        self.assertEqual(type(caught.exception).__name__, "NotRegularFile")
+        # never made blocking, no file object (so nothing read), closed once
+        self.assertEqual([e[0] for e in events], ["os.open", "fstat", "close"])
+        self.assert_closed(fds[0])
+
+    def test_ctrl_c_while_a_master_is_opened_or_read_stays_a_ctrl_c(self):
+        # T-149 review: the interrupt is never turned into an ERROR for this
+        # item (a second close raising EBADF), and the descriptor is closed once
+        for fault in ("made", "read"):
+            with self.subTest(fault):
+                iso, _ = self.master(fault)
+                with self.descriptor_events(iso, fault=fault) as (events, fds):
+                    with self.assertRaises(KeyboardInterrupt):
+                        verify.hash_file(iso, iso.name)
+                self.assertIn(("file",) if fault == "made" else ("read",), events, "the fault never fired")
+                self.assertEqual(events.count(("close",)), 1, events)
+                self.assertEqual(events[-1], ("close",))
+                self.assert_closed(fds[0])
+        # Through a run: Ctrl-C stops it (exit 130), no item becomes an ERROR
+        self.hashed.clear()
+        iso_a, _ = self.master("made")
+        with self.descriptor_events(iso_a, fault="made") as (events, _):
+            code, output = self.cli(self.dir)
+        self.assertIn(("file",), events, "the fault never fired")
+        self.assertEqual(code, 130, output)
+        self.assertEqual(self.hashed, [iso_a], "the run went on after Ctrl-C")
+        self.assertNotIn("ERROR", output)
+
+    @contextlib.contextmanager
+    def iso_stat_fails(self, iso, error):
+        """os.stat and Path.stat (following links) raise error for iso. Path.stat
+        too: Python 3.9's pathlib reaches os.stat through an accessor bound at
+        import, which an os.stat fake never reaches. Yields what fired"""
+        real_stat, real_path_stat, fired = os.stat, Path.stat, []
+
+        def os_stat(path, *args, **kwargs):
+            if not isinstance(path, int) and Path(os.fsdecode(path)) == iso \
+                    and kwargs.get("follow_symlinks", True):
+                fired.append("os.stat")
+                raise error
+            return real_stat(path, *args, **kwargs)
+
+        def path_stat(path, *args, **kwargs):
+            if path == iso and kwargs.get("follow_symlinks", True):
+                fired.append("Path.stat")
+                raise error
+            return real_path_stat(path, *args, **kwargs)
+
+        with mock.patch.object(os, "stat", os_stat), mock.patch.object(Path, "stat", path_stat):
+            yield fired
+
+    def test_iso_inspection_errors_are_errors_on_every_python(self):
+        # T-147 (N13): never "ISO not found" for a master that may be there
+        for error in (io_error(), denied(), OSError(errno.ELOOP, "Too many levels of symbolic links")):
+            with self.subTest(errno.errorcode[error.errno]):
+                iso, manifest = self.master(folder=self.dir / errno.errorcode[error.errno])
+                with self.iso_stat_fails(iso, error) as fired:
+                    result = verify.check_manifest(manifest)
+                self.assertTrue(fired, "the fault never fired")
+                self.assertEqual(result.status, "ERROR", result.detail)
+                self.assertIn(f"[Errno {error.errno}]", result.detail)
+                self.assertNotIn("not found", result.detail)
+                self.assertEqual(self.hashed, [])
+
+    def test_a_real_master_behind_a_folder_that_cannot_be_read_is_an_error(self):
+        root = self.dir / "collection"
+        _, link = self.bundle(root / "bundle")
+        locked = self.dir / "locked"
+        locked.mkdir()
+        (locked / "disc.iso").write_bytes(b"healthy synthetic master")
+        os.symlink(locked / "disc.iso", link)
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        try:
+            os.stat(link)
+        except PermissionError:
+            pass
+        else:
+            self.fail("the master stayed inspectable (running as root?), so this check cannot run")
+        code, output = self.cli(root)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [])
+        self.assertNotIn("MISSING_ISO", output)
+        lines = [line for line in output.splitlines() if line.startswith(f"  {link}: ERROR — ")]
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("[Errno 13]", lines[0])
+
+    def test_a_symlink_chain_too_long_to_follow_at_the_iso_name_is_an_error(self):
+        # The system gives up on it (ELOOP), so what it leads to is unknown:
+        # ERROR, never MISSING_ISO and never a pass
+        root = self.dir / "collection"
+        _, iso = self.bundle(root / "bundle")
+        target = self.dir / "elsewhere" / "disc.iso"
+        target.parent.mkdir()
+        target.write_bytes(b"CORRUPTED synthetic master")
+        symlink_chain(iso, self.dir / "chain", 41, target)
+        assert_beyond_the_system_limit(self, iso)
+        code, output = self.cli(root)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [])
+        self.assertNotIn("MISSING_ISO", output)
+        self.assertIn(f"{iso}: ERROR — could not inspect ISO disc.iso: [Errno {errno.ELOOP}] ", output)
+
+    def test_check_manifest_never_opens_a_special_file_handed_to_it(self):
+        # T-147 (F14): a library call, with no discovery in front of it
+        fifo = self.dir / "pipe_manifest.json"
+        os.mkfifo(fifo)
+        link = self.dir / "link_manifest.json"
+        os.symlink(fifo, link)
+        for path in (fifo, link):
+            with self.subTest(path.name):
+                before = len(TRIPWIRE_OPENS)
+                try:
+                    result = verify.check_manifest(path)
+                    outcome = (result.status, result.detail)
+                except Exception as e:
+                    outcome = (f"raised {type(e).__name__}", str(e))
+                self.assertEqual(TRIPWIRE_OPENS[before:], [], "check_manifest tried to open a FIFO")
+                self.assertEqual(outcome, ("ERROR", "not a regular file (folder, FIFO, device or socket); "
+                                                    "not opened"))
+
+    def test_a_manifest_whose_classification_fails_is_never_read(self):
+        # Owner rule: a failed classification never falls through to an open
+        # (a library call, with no discovery in front): an inspection error
+        # (injected), or a folder named like a manifest (real)
+        _, manifest = self.master()
+        folder = self.dir / "folder_manifest.json"
+        folder.mkdir()
+        reads, real_read = [], Path.read_bytes
+
+        def read_bytes(path):
+            reads.append(Path(path))
+            return real_read(path)
+
+        for path, fault, detail in (
+                (manifest, target_stat_fails({manifest}, io_error(), "manifest"),
+                 "unreadable manifest: [Errno 5] Input/output error"),
+                (folder, contextlib.nullcontext(None),
+                 "not a regular file (folder, FIFO, device or socket); not opened")):
+            with self.subTest(path.name):
+                with fault as calls, mock.patch.object(Path, "read_bytes", read_bytes):
+                    result = verify.check_manifest(path)
+                self.assertNotIn(path, reads, "the manifest was read after its classification failed")
+                self.assertEqual((result.status, result.detail), ("ERROR", detail))
+                if calls is not None:
+                    self.assertEqual(calls, [("manifest", manifest)], "the fault never fired")
+                self.assertEqual(self.hashed, [])
+
+    def test_control_a_master_larger_than_one_read_passes(self):
+        data = bytes(range(256)) * (8 * 1024 * 4) + b"!"  # 8 MiB + 1 byte
+        iso, manifest = self.master(data=data)
+        code, output = self.cli(self.dir)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.hashed, [iso])
+        self.assertIn("PASS: verified (MD5+SHA-256)", output)
+        result = verify.check_manifest(manifest)
+        self.assertEqual((result.status, result.size_bytes), ("PASS", len(data)))
+        self.assertEqual((result.md5_actual, result.sha256_actual), hashes(data))
+
+    def test_manifest_text_cannot_rewrite_console_lines(self):
+        # T-149 (F8): control characters from a manifest are shown escaped on
+        # the console; the CSV keeps exactly what was recorded
+        name = "gone\r  PASS: verified (MD5+SHA-256)\x1b[2K"
+        self.bundle(self.dir / "bundle", iso_name=name)
+        report = self.dir / "report.csv"
+        code, output = self.cli(self.dir / "bundle", report=report)
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("\r", output)
+        self.assertNotIn("\x1b", output)
+        shown = "gone\\r  PASS: verified (MD5+SHA-256)\\x1b[2K"
+        self.assertIn(f"MISSING_ISO: ISO not found next to manifest: {shown}", output)
+        self.assertIn(f"{self.dir / 'bundle'}/{shown}: MISSING_ISO", output)
+        with open(report, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[1][0], "MISSING_ISO")
+        self.assertEqual(rows[1][9], f"ISO not found next to manifest: {name}")
+
+    def test_an_iso_name_cannot_rewrite_the_progress_line(self):
+        # T-149 (F8): on a terminal, the hashing progress names the ISO; a
+        # name recorded with control characters is shown escaped there too
+        iso, _ = self.master("disc\x1b[2K")
+        clock = iter(range(0, 10 ** 6))
+        with mock.patch.object(verify, "ANSI_ENABLED", True), \
+                mock.patch.object(verify.time, "time", lambda: float(next(clock))):
+            code, output = self.cli(self.dir)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.hashed, [iso])
+        self.assertIn("\r  hashing disc\\x1b[2K.iso: 100%", output)  # the progress line was shown
+        self.assertNotIn("\x1b[2K", output)
+
+
 # --- discovery (T-134) ---------------------------------------------------------
 
 class FakeEntry:
@@ -925,11 +1626,24 @@ def target_stat_fails(links, error, label="loop"):
         yield calls
 
 
+@contextlib.contextmanager
 def looping(*links):
-    """os.stat reports a symlink loop (ELOOP) for these existing links. A real
-    loop link cannot be used: the guard's Path.resolve() raises on it in 3.9,
-    so it could not even be removed afterwards"""
-    return target_stat_fails(links, OSError(errno.ELOOP, "Too many levels of symbolic links"))
+    """os.stat reports a symlink loop (ELOOP) for these existing links, and
+    os.readlink says each points at itself, so following it a link at a
+    time reaches the same link again. A real loop link cannot simply be
+    used: the guard's Path.resolve() raises on it in 3.9, so it could not
+    even be removed afterwards (test_a_real_symlink_loop_holds_nothing
+    breaks one before cleanup). Yields the os.stat calls it intercepted"""
+    real_readlink = os.readlink
+
+    def readlink(path, *args, **kwargs):
+        if not isinstance(path, int) and Path(os.fsdecode(path)) in links:
+            return os.path.abspath(os.fsdecode(path))
+        return real_readlink(path, *args, **kwargs)
+
+    with target_stat_fails(links, OSError(errno.ELOOP, "Too many levels of symbolic links")) as calls, \
+            mock.patch.object(os, "readlink", readlink):
+        yield calls
 
 
 def denied():
@@ -938,6 +1652,29 @@ def denied():
 
 def io_error():
     return OSError(errno.EIO, "Input/output error")
+
+
+def symlink_chain(head: Path, folder: Path, n: int, end: Path):
+    """head -> folder/l1 -> l2 -> ... -> folder/l{n} -> end: n + 1 real
+    symlinks, made from the end backwards (none of them ever loops). The
+    synthetic guard's Path.resolve follows a chain of any length on 3.9 and
+    3.14, so cleanup can remove it"""
+    folder.mkdir(parents=True, exist_ok=True)
+    os.symlink(end, folder / f"l{n}")
+    for i in range(n - 1, 0, -1):
+        os.symlink(folder / f"l{i + 1}", folder / f"l{i}")
+    os.symlink(folder / "l1", head)
+
+
+def assert_beyond_the_system_limit(test, head: Path):
+    """The premise of a chain test: os.stat itself gives up on head (ELOOP).
+    Fails, never skips, when the system follows the whole chain"""
+    try:
+        _REAL_STAT(head)
+    except OSError as e:
+        test.assertEqual(e.errno, errno.ELOOP, f"os.stat({head}) failed otherwise: {e}")
+    else:
+        test.fail(f"the system followed the whole chain at {head}, so this check cannot run")
 
 
 class DiscoveryTests(Base):
@@ -1477,6 +2214,328 @@ class DiscoveryTests(Base):
         self.assertIn(("open", broken / "b"), calls, "the fault never reached the search")
         self.assertEqual([(i.status, i.path) for i in issues], [("DISCOVERY_ERROR", broken / "b")])
 
+    # --- T-148: spellings, symlink chains and loops ---
+
+    def dotdot_layout(self, base):
+        """The audit's F1 shape: base/coll holds a corrupt master, and
+        base/coll/link points at base/other/deep, so coll/link/.. is other
+        (a healthy bundle of the same names) to the system, not coll"""
+        other, coll = base / "other", base / "coll"
+        self.master(folder=other)
+        (other / "deep").mkdir()
+        iso, _ = self.master(folder=coll)
+        iso.write_bytes(b"CORRUPTED synthetic master")
+        os.symlink(other / "deep", coll / "link")
+        self.hashed.clear()
+        return other, coll, coll / "link" / ".." / "disc_manifest.json"
+
+    def test_a_symlink_and_dotdot_spelling_never_hides_another_bundle(self):
+        # T-148 (N9): given as a file beside coll's own manifest, or beside
+        # coll as a folder: coll's corrupt master is still checked
+        for variant in ("file", "folder"):
+            with self.subTest(variant):
+                other, coll, weird = self.dotdot_layout(self.dir / variant)
+                paths = ((weird, coll / "disc_manifest.json") if variant == "file"
+                         else (weird, coll, other / "deep"))
+                code, output = self.cli(*paths)
+                self.assertEqual(code, 1, output)
+                self.assertIn("FAIL: hash mismatch", output)
+                self.assertEqual(sorted(self.hashed),
+                                 sorted([coll / "link" / ".." / "disc.iso", coll / "disc.iso"]))
+
+    def test_control_a_real_folder_and_dotdot_spelling_is_checked_once(self):
+        coll = self.dir / "coll"
+        self.masters(coll, ".")
+        (coll / "sub").mkdir()
+        code, output = self.cli(coll / "sub" / ".." / "disc_manifest.json", coll / "disc_manifest.json")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Found 1 manifest(s) to examine", output)
+        self.assertEqual(len(self.hashed), 1)
+
+    def identity_case(self, variant, inject):
+        """The review's shape: coll/link/.. given before coll, as a manifest
+        file ("file") or as a folder ("folder"); with inject, inspecting
+        coll/link fails (EIO) whenever verifyiso resolves a path through it"""
+        other, coll, weird = self.dotdot_layout(self.dir / variant)
+        paths = ((weird, coll / "disc_manifest.json") if variant == "file" else (weird.parent, coll))
+        if not inject:
+            return other, coll, weird, [], self.cli(*paths)
+        with resolution_fails(coll / "link", io_error()) as fired:
+            result = self.cli(*paths)
+        return other, coll, weird, fired, result
+
+    def test_a_manifest_whose_folder_cannot_be_resolved_never_hides_another_bundle(self):
+        # T-148 repair: the given manifest's folder cannot be resolved, so it
+        # is never taken for coll's manifest: it is a DISCOVERY_ERROR (not
+        # checked), and coll's corrupt master is still checked and fails
+        other, coll, weird, fired, (code, output) = self.identity_case("file", inject=True)
+        self.assertIn("_physical", fired, "the fault never reached the given manifest's identity")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [coll / "disc.iso"])
+        self.assertIn("FAIL: hash mismatch", output)
+        self.assertNotIn("PASS", output)
+        self.assertIn(f"DISCOVERY_ERROR: {weird}: could not resolve its folder's real path: "
+                      f"[Errno 5] Input/output error; not checked", output)
+
+    def test_a_folder_that_cannot_be_resolved_never_hides_another_bundle(self):
+        # The same with coll/link/.. given as a folder: never searched under a
+        # guessed identity, and the link inside coll, whose target cannot be
+        # resolved either, is never counted as searched
+        other, coll, weird, fired, (code, output) = self.identity_case("folder", inject=True)
+        self.assertIn("find_preservation_manifests", fired, "the fault never reached the given folder's identity")
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.hashed, [coll / "disc.iso"])
+        self.assertIn("FAIL: hash mismatch", output)
+        self.assertIn(f"DISCOVERY_ERROR: {weird.parent}: could not resolve its real path: "
+                      f"[Errno 5] Input/output error; nothing was checked for it", output)
+        self.assertIn(f"EXCLUDED: {coll / 'link'}: symlinked folder not followed -> {other / 'deep'} "
+                      f"(whether its target was searched could not be checked: [Errno 5] "
+                      f"Input/output error)", output)
+        self.assertNotIn("Not searched (symlink, expected)", output)
+
+    def test_control_the_same_spellings_without_a_fault_check_both_bundles(self):
+        for variant in ("file", "folder"):
+            with self.subTest(variant):
+                other, coll, weird, _, (code, output) = self.identity_case(variant, inject=False)
+                self.assertEqual(code, 1, output)
+                self.assertEqual(sorted(self.hashed),
+                                 sorted([coll / "link" / ".." / "disc.iso", coll / "disc.iso"]))
+                self.assertEqual(output.count("PASS: verified"), 1, output)  # other's healthy master
+                self.assertIn("FAIL: hash mismatch", output)
+                self.assertNotIn("could not resolve", output)
+                self.assertNotIn("DISCOVERY_ERROR", output)
+                if variant == "folder":
+                    self.assertIn(f"Not searched (symlink, expected): {coll / 'link'}", output)
+                    self.assertNotIn("EXCLUDED", output)
+
+    def chain_to(self, label, target, n=41):
+        """root (a healthy bundle in root/own) whose entry root/l0 starts a
+        chain of n + 1 symlinks to target: more than the system follows"""
+        root = self.dir / label / "root"
+        self.masters(root, "own")
+        symlink_chain(root / "l0", self.dir / label / "chain", n, target)
+        assert_beyond_the_system_limit(self, root / "l0")
+        return root, self.dir / label / "chain" / "l1"
+
+    def test_a_symlink_chain_too_long_for_the_system_is_judged_by_its_end(self):
+        # T-148 (A2): the audit's F11 shape - 42 links, no loop, to a folder
+        # holding a corrupt bundle. ELOOP is no proof of a loop: the chain
+        # leads to a folder that was not searched, so it is EXCLUDED
+        target = self.dir / "target"
+        self.masters(target, "bad")
+        (target / "bad" / "disc.iso").write_bytes(b"CORRUPTED synthetic master")
+        root, first = self.chain_to("alone", target)
+        code, output = self.cli(root)
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("symlink loop", output)
+        self.assertIn(f"EXCLUDED: {root / 'l0'}: symlinked folder not followed -> {first} "
+                      f"(a chain of 42 symlink(s))", output)
+        self.assertEqual(self.hashed, [root / "own" / "disc.iso"])
+        # Its target given as well: searched there, so the corrupt master is
+        # checked and fails, and the chain hides nothing
+        self.hashed.clear()
+        code, output = self.cli(root, target)
+        self.assertEqual(code, 1, output)
+        self.assertIn("FAIL: hash mismatch", output)
+        self.assertIn(target / "bad" / "disc.iso", self.hashed)
+        self.assertIn(f"Not searched (symlink, expected): {root / 'l0'}: symlinked folder not followed -> "
+                      f"{first} (a chain of 42 symlink(s)) (its target was searched as {target})", output)
+        self.assertNotIn("EXCLUDED", output)
+
+    def test_control_a_long_chain_whose_target_was_searched_hides_nothing(self):
+        target = self.dir / "target"
+        self.masters(target, "good")
+        root, _ = self.chain_to("covered", target)
+        code, output = self.cli(root, target)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(sorted(self.hashed), sorted([root / "own" / "disc.iso", target / "good" / "disc.iso"]))
+        self.assertIn(f"(its target was searched as {target})", output)
+
+    def test_a_long_chain_to_nothing_is_a_missing_target_not_a_loop(self):
+        root, first = self.chain_to("dangling", self.dir / "unmounted" / "disk")
+        code, output = self.cli(root)
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("symlink loop", output)
+        self.assertIn(f"EXCLUDED: {root / 'l0'}: symlink target missing -> {first} "
+                      f"(a chain of 42 symlink(s)); not followed", output)
+
+    def test_a_chain_that_cannot_be_followed_to_its_end_is_a_discovery_error(self):
+        # Longer than the verifier follows one link at a time (256): never
+        # taken for a loop, even though its target is searched as well
+        limit = getattr(verify, "SYMLINK_CHAIN_LIMIT", 256)
+        target = self.dir / "target"
+        self.masters(target, "good")
+        root, first = self.chain_to("endless", target, n=299)
+        self.assertGreater(300, limit)
+        code, output = self.cli(root, target)
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("symlink loop", output)
+        self.assertIn(f"DISCOVERY_ERROR: {root / 'l0'}: could not inspect symlink target -> {first} "
+                      f"(a chain of more than {limit} symlinks): [Errno {errno.ELOOP}] ", output)
+        self.assertEqual(sorted(self.hashed), sorted([root / "own" / "disc.iso", target / "good" / "disc.iso"]))
+
+    def test_a_chain_link_that_cannot_be_inspected_is_a_discovery_error(self):
+        target = self.dir / "target"
+        self.masters(target, "good")
+        root, first = self.chain_to("eio", target)
+        broken = self.dir / "eio" / "chain" / "l20"
+        with lstat_fails(broken, io_error()) as fired:
+            code, output = self.cli(root, target)
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("symlink loop", output)
+        self.assertIn(f"DISCOVERY_ERROR: {root / 'l0'}: could not inspect symlink target -> {first} "
+                      f"(a chain of 20 symlink(s)): [Errno 5] Input/output error", output)
+        self.assertEqual(fired, [broken], "the fault never fired")
+
+    def test_a_real_symlink_loop_holds_nothing(self):
+        # Control: a genuine cycle (loop -> via/back -> loop, via being a
+        # link to hub outside the search) is still exempt
+        r = self.dir / "loopy"
+        self.masters(r, "own")
+        hub, via = self.dir / "hub", self.dir / "via"
+        hub.mkdir()
+        os.symlink(hub, via)
+        # Removing via breaks the cycle before cleanup, whose guard resolves
+        # each removed path (Path.resolve raises on a loop in 3.9)
+        self.addCleanup(os.unlink, via)
+        os.symlink(via / "back", r / "loop")
+        os.symlink(r / "loop", hub / "back")
+        assert_beyond_the_system_limit(self, r / "loop")
+        code, output = self.cli(r)
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"Not searched (symlink, expected): {r / 'loop'}: symlink loop -> {via / 'back'}; "
+                      f"not followed", output)
+        self.assertEqual(self.hashed, [r / "own" / "disc.iso"])
+
+    # --- T-149: a run with nothing verified ---
+
+    def test_a_run_where_every_manifest_was_skipped_says_no_master_was_verified(self):
+        folder = self.dir / "access"
+        folder.mkdir()
+        self.write_manifest("x_access_manifest.json",
+                            {"conversion_metadata": {}, "conversion_status": {"overall_status": "success"}},
+                            folder)
+        code, output = self.cli(folder)
+        self.assertEqual(code, 0, output)  # skips are not failures
+        self.assertIn("No master was verified: all 1 manifest(s) were skipped", output)
+        # Control: a master checked beside the skip - no such line
+        self.master(folder=folder)
+        code, output = self.cli(folder)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("No master was verified", output)
+
+
+# --- the child that receives a real SIGINT (T-149) -----------------------------
+
+def _send_sigint_once(state):
+    if not state.get("sent"):
+        state["sent"] = True
+        os.kill(os.getpid(), signal.SIGINT)
+        # Give the default handler every chance to raise right here
+        for _ in range(1000):
+            pass
+
+
+def _child_main(scenario: str, folder: Path) -> int:
+    """verifyiso's main() on folder with --csv folder/report.csv; a REAL
+    SIGINT is sent to this process while the report is reserved
+    ("reservation", at its fstat) or as the first master is hashed
+    ("hashing"; "hashing_unlink_fails" also refuses removing the report)"""
+    # Python's own Ctrl-C handler, even if this process inherited SIGINT ignored
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    report = folder / "report.csv"
+    state = {}
+    real_fstat, real_hash = os.fstat, verify.hash_file
+
+    def fstat(fd):
+        if scenario == "reservation" and os.path.lexists(report):
+            _send_sigint_once(state)
+        return real_fstat(fd)
+
+    def hash_file(path, label=""):
+        if scenario.startswith("hashing"):
+            _send_sigint_once(state)
+        return real_hash(path, label)
+
+    argv = ["verifyiso.py", str(folder), "--csv", str(report)]
+    try:
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(os, "fstat", fstat))
+            stack.enter_context(mock.patch.object(verify, "hash_file", hash_file))
+            stack.enter_context(mock.patch.object(sys, "argv", argv))
+            if scenario == "hashing_unlink_fails":
+                stack.enter_context(unlink_denied(report))
+            verify.main()
+        return 0
+    except SystemExit as e:
+        if isinstance(e.code, int):
+            return e.code
+        print(e.code)
+        return 1
+    finally:
+        print("SIGINT_SENT:", bool(state.get("sent")), flush=True)
+
+
+def run_child(scenario: str, folder: Path):
+    env = {"HOME": os.environ.get("HOME", str(folder)), "TMPDIR": tempfile.gettempdir(),
+           "PATH": "/nonexistent", "OPTICAL_UNDER_TEST": str(support.ROOT)}
+    proc = subprocess.run([sys.executable, "-I", "-S", "-B", str(Path(__file__).resolve()),
+                           "--sigint-child", scenario, str(folder)],
+                          env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, timeout=60)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+class InterruptTests(Base):
+    """T-149: a REAL SIGINT, delivered inside a guarded child (this file
+    re-run with --sigint-child, bounded by a timeout) while the --csv report
+    is reserved or a master is hashed"""
+
+    def child(self, scenario):
+        code, output = run_child(scenario, self.dir)
+        self.assertNotIn("VIOLATION", output)
+        self.assertIn("SIGINT_SENT: True", output, "the scenario never delivered its SIGINT")
+        self.assertNotIn("Traceback", output)
+        return code, output
+
+    def test_sigint_while_the_report_is_reserved_exits_130_and_names_the_path(self):
+        self.master()
+        report = self.dir / "report.csv"
+        code, output = self.child("reservation")
+        self.assertEqual(code, 130, output)
+        self.assertIn(f"Interrupted by operator (Ctrl-C) while reserving the --csv report; anything now "
+                      f"at {report} was left in place (if this run created it, it is empty)", output)
+        self.assertNotIn("PASS", output)
+        self.assertEqual(report.read_bytes(), b"")
+
+    def test_sigint_while_hashing_removes_the_unfinished_report(self):
+        self.master("a")
+        self.master("b")
+        report = self.dir / "report.csv"
+        code, output = self.child("hashing")
+        self.assertEqual(code, 130, output)
+        self.assertIn("Interrupted by operator (Ctrl-C) — verification incomplete; the --csv report "
+                      "was not completed", output)
+        self.assertNotIn("Could not remove", output)
+        self.assertFalse(os.path.lexists(report))
+
+    def test_sigint_while_hashing_with_a_failed_removal_names_the_leftover(self):
+        self.master("a")
+        self.master("b")
+        report = self.dir / "report.csv"
+        code, output = self.child("hashing_unlink_fails")
+        self.assertEqual(code, 130, output)
+        self.assertIn(f"Could not remove the unfinished --csv report {report} ([Errno 13] Permission "
+                      f"denied); it is the file this run created: remove it yourself", output)
+        self.assertEqual(report.read_bytes(), b"")
+
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--sigint-child":
+        try:
+            exit_code = _child_main(sys.argv[2], Path(sys.argv[3]))
+        finally:
+            if support.VIOLATIONS:
+                print("VIOLATIONS:", support.VIOLATIONS, flush=True)
+        sys.exit(exit_code)
     unittest.main()

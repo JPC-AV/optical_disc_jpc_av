@@ -4,7 +4,14 @@ deferred promotion (T-071), and for ffmpeg's lifetime and truthful retention
 records (T-129, T-130, T-132): ffmpeg is always stopped and reaped before its
 output is kept, an ffmpeg that cannot be confirmed stopped stops the run and
 batch and leaves the source attached, and an interrupted or repeated
-retention records where the output really is.
+retention records where the output really is. Also how a run ends (T-144,
+T-145, T-146): a Ctrl-C anywhere in a run still leaves truthful records, the
+canonical log and manifest are never left half-written, promotion holds
+Ctrl-C, and a batch stops with a summary. And (T-150, T-155) that a check
+which fails is never taken as absence - of the ISO, a VIDEO_TS file, an
+output or a final name - that a VIDEO_TS without VOB files is a truthful
+skip, that a gap in VOB numbering is a warning, and that ffmpeg gets no
+terminal input and its shown command is quoted.
 
 Standard library only, and synthetic throughout: placeholder IFO, VOB and MP4
 bytes, a fake encoder and controlled ffprobe answers patched in at the
@@ -16,7 +23,11 @@ connections are refused.
 The shared guards in synthetic_support.py are installed before the script
 is loaded. EncoderLifetimeTests send real SIGINTs to this process at the fake
 boundaries (no child process); the script holds or handles each one, and the
-tests stop rather than let one escape.
+tests stop rather than let one escape. The run-ending boundaries are tested
+with a real SIGINT in a child instead: this interpreter re-running this file
+with --sigint-child (the only child the guards allow), so that a Ctrl-C an
+earlier version lets escape reaches only that child, never the test runner.
+Each of those also runs with KeyboardInterrupt raised directly.
 
 These tests check the script's decisions, files and records. They do not
 establish media fidelity, FFmpeg compatibility or how real discs are authored.
@@ -30,11 +41,14 @@ CentralRegressions uses only interfaces the earlier version also has.
 import contextlib
 import datetime
 import errno
+import hashlib
 import importlib.util
 import io
 import json
 import os
+import plistlib
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -70,6 +84,10 @@ def load_script():
 
 
 mv = load_script()
+# Before any test patches them: the real mount class, and the only way a
+# scenario child is started
+REAL_ISOMOUNT = mv.ISOMount
+REAL_POPEN = subprocess.Popen
 
 ### === GUARDS: native tools and the network must never be reached ===
 
@@ -574,6 +592,132 @@ class Scenario(unittest.TestCase):
         logs, manifests = self.records(disc, kind)
         self.assertEqual((len(logs), len(manifests)), (1, 1), f"{kind} records")
         return json.loads(manifests[0].read_text()), logs[0].read_text()
+
+### === RUN-ENDING SCENARIOS: a real SIGINT in a child, or raised directly ===
+
+CHILD_TIMEOUT = 120   # seconds one scenario child may take
+CHILD_SCENARIOS = {}  # name -> function(case, interrupt) -> outcome (plain data)
+REAL, RAISED = "real SIGINT, in a child", "KeyboardInterrupt raised directly"
+
+
+def child_scenario(function):
+    """Register a scenario. It builds its disc on the Scenario harness it is
+    given, calls interrupt() at its boundary, and returns its outcome as
+    plain data, with "fired" counting the faults it delivered. Its files
+    stay in the harness's folder for the test to check."""
+    CHILD_SCENARIOS[function.__name__] = function
+    return function
+
+
+def raise_interrupt():
+    """KeyboardInterrupt raised directly, as no hold can defer it (one off
+    the main thread, for instance)"""
+    raise KeyboardInterrupt
+
+
+def scenario_case(root):
+    """A fresh Scenario harness outside the test runner, its files in root"""
+    case = Scenario()
+    case.setUp()
+    case.root = root
+    return case
+
+
+def result_data(result):
+    return {"success": result.success, "interrupted": result.interrupted,
+            "skipped": result.skipped, "unverified": result.unverified,
+            "aborted": result.aborted, "error": result.error_message,
+            "warnings": list(result.warnings),
+            "changed": [str(p) for p in result.canonical_files_changed],
+            "titles": [{"status": t.status, "promoted": t.promoted_this_run, "error": t.error,
+                        "retained_path": str(t.retained_path) if t.retained_path else None,
+                        "retained_as": t.retained_as, "location_unverified": t.location_unverified,
+                        "retention_error": t.retention_error} for t in result.titles]}
+
+
+def capture(case, run):
+    """Run a conversion or main() and return its outcome as plain data: a
+    Ctrl-C (or anything else) that escapes is reported, never raised.
+    handler_restored: the SIGINT handler is the one in place before (in a
+    child, Python's own; in this process, whatever the runner has)"""
+    before = signal.getsignal(signal.SIGINT)
+    try:
+        value = run()
+    except BaseException as e:
+        outcome = {"escaped": type(e).__name__, "escaped_detail": str(e)}
+    else:
+        outcome = result_data(value) if isinstance(value, mv.ConversionResult) else {"exit": value}
+    outcome["handler_restored"] = signal.getsignal(signal.SIGINT) is before
+    outcome["lines"] = list(case.lines)
+    return outcome
+
+
+def run_child(name, folder):
+    """Run one scenario with a real SIGINT in a child process: this
+    interpreter re-running this file with --sigint-child. Bounded; returns
+    the child's outcome"""
+    env = {"HOME": os.environ.get("HOME", str(folder)), "TMPDIR": tempfile.gettempdir(),
+           "PATH": "/nonexistent", "OPTICAL_UNDER_TEST": str(support.ROOT),
+           "MAKEISO_VIDEO_UNDER_TEST": str(SCRIPT)}
+    for key in ("LANG", "LC_ALL", "LC_CTYPE"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    with REAL_POPEN([sys.executable, "-I", "-S", "-B", str(Path(__file__).resolve()),
+                     "--sigint-child", name, str(folder)], env=env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
+        try:
+            output, _ = child.communicate(timeout=CHILD_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            output, _ = child.communicate()
+            raise AssertionError(f"the {name} child did not finish within {CHILD_TIMEOUT} s:\n{output}")
+    found = [line[len("OUTCOME: "):] for line in output.splitlines() if line.startswith("OUTCOME: ")]
+    if child.returncode != 0 or len(found) != 1:
+        raise AssertionError(f"the {name} child failed (exit {child.returncode}):\n{output}")
+    return json.loads(found[0])
+
+
+def _child_main(name, folder):
+    """In the child: Python's own Ctrl-C handling, the guards and tripwires,
+    one scenario with a real SIGINT, its outcome on one line"""
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    setUpModule()
+    case = scenario_case(folder)
+    try:
+        outcome = CHILD_SCENARIOS[name](case, send_sigint)
+    finally:
+        clean = case.doCleanups()
+    outcome["clean"] = clean
+    print("OUTCOME: " + json.dumps(outcome, default=str), flush=True)
+    tearDownModule()  # fails the child if a native tool or guarded operation was attempted
+    return 0
+
+
+class ScenarioRunner:
+    """Runs a registered scenario in either mode and checks that it ran
+    cleanly and that its fault fired"""
+
+    def run_scenario(self, name, mode, folder):
+        folder.mkdir(parents=True)
+        if mode == REAL:
+            outcome = run_child(name, folder)
+        else:
+            case = scenario_case(folder)
+            try:
+                outcome = CHILD_SCENARIOS[name](case, raise_interrupt)
+            finally:
+                clean = case.doCleanups()
+            outcome["clean"] = clean
+        self.assertTrue(outcome.get("clean"), f"the {name} harness found a problem: {outcome}")
+        self.assertTrue(outcome.get("fired"), f"the {name} fault never fired: {outcome}")
+        return outcome
+
+    @staticmethod
+    def disc_at(folder, stem):
+        """The disc a scenario built under folder (see Scenario.make_disc)"""
+        return types.SimpleNamespace(iso=folder / "isos" / f"{stem}.iso",
+                                     video_ts=folder / "mounts" / stem / "VIDEO_TS", stem=stem,
+                                     out=folder / "isos" / f"access_{stem}")
 
 ### === CENTRAL REGRESSIONS (shared interfaces only) ===
 
@@ -1455,7 +1599,8 @@ class EncoderLifetimeTests(Scenario):
         self.vob_durations(1, 600.0)
         self.output(first, 1, 600.0, live=True, sigint_at_launch=True)
         self.output(second, 1, 600.0)
-        self.assertEqual(self.run_main("--batch", str(self.root / "isos")), 1)
+        # A Ctrl-C that stopped the batch exits 130 (T-144, decision G2-D2)
+        self.assertEqual(self.run_main("--batch", str(self.root / "isos")), 130)
         self.assertEqual(self.tools.launched, ["JPC_AV_00001.mp4"])
         self.assert_unchanged(seeded)
         self.assertEqual(sorted(p.name for p in second.out.iterdir()),
@@ -1698,7 +1843,7 @@ def interrupt_after_rename_returns(real_signal=False):
             sys.settrace(previous)
 
 
-class RetentionTests(Scenario):
+class RetentionTests(ScenarioRunner, Scenario):
     """Non-clobbering .partial / .mp4.unverified names and failed moves"""
 
     def unverified_case(self, stem=STEM):
@@ -2178,6 +2323,46 @@ class RetentionTests(Scenario):
                         result.warnings)
         self.assert_unchanged(seeded)
 
+    # --- MV-13 (T-145): a Ctrl-C while a kept name is reserved ---
+
+    def test_ctrl_c_during_the_reservation_leaves_no_placeholder(self):
+        # A real SIGINT in a child, held while the name is reserved: the
+        # empty placeholder is removed before the Ctrl-C is acted on, and
+        # the attempt is kept under that name
+        folder = self.root / "reservation-real"
+        outcome = self.run_scenario("reservation", REAL, folder)
+        self.assertNotIn("escaped", outcome)
+        disc = self.disc_at(folder, outcome["stem"])
+        partials = self.partials(disc)
+        self.assertEqual([p.stat().st_size > 0 for p in partials], [True],
+                         "an empty placeholder was left beside the kept file")
+        self.assertEqual(partials[0].read_bytes(), self.encoded_bytes(disc, 1))
+        self.assertTrue(outcome["interrupted"])
+        title = outcome["titles"][0]
+        self.assertEqual((title["retained_path"], title["retained_as"]), (str(partials[0]), "partial"))
+        manifest, _ = self.tokened_manifest(disc, "failed")
+        self.assertEqual(manifest["titlesets"]["outputs"][0]["partial_renamed_to"], str(partials[0]))
+        self.assertEqual(self.temps(disc), [])
+
+
+    def test_ctrl_c_during_the_reservation_names_a_placeholder_it_cannot_remove(self):
+        # A real SIGINT in a child, held while the name is reserved; the
+        # placeholder then cannot be removed: the records say so
+        folder = self.root / "reservation-unremovable-real"
+        outcome = self.run_scenario("reservation_unremovable", REAL, folder)
+        self.assertNotIn("escaped", outcome)
+        disc = self.disc_at(folder, outcome["stem"])
+        partials = self.partials(disc)
+        empty = [p for p in partials if p.stat().st_size == 0]
+        kept = [p for p in partials if p.stat().st_size > 0]
+        self.assertEqual((len(empty), len(kept)), (1, 1), partials)
+        manifest, _ = self.tokened_manifest(disc, "failed")
+        warnings = manifest["conversion_status"]["warnings"]
+        self.assertTrue(any("after a Ctrl-C while its kept name was reserved" in w and empty[0].name in w
+                            and "could not be removed" in w for w in warnings), warnings)
+        self.assertEqual(manifest["titlesets"]["outputs"][0]["partial_renamed_to"], str(kept[0]))
+        self.assertIn("unlink refused", outcome["fired"])
+
 
 class PromotionTests(Scenario):
     """Deferred promotion: all-pass, and failure or interruption partway"""
@@ -2623,11 +2808,107 @@ class SkipRecordTests(Scenario):
         self.assertEqual(manifest["output_files"].get("earlier_skip_records", []), [])
         self.assertNotIn("Earlier record:", (disc.out / f"{disc.stem}.mp4.log.txt").read_text())
 
+    def test_a_half_written_skip_or_dry_run_record_leaves_no_orphan(self):
+        # N16 (T-145): a skip or dry-run record is all or nothing; when it
+        # cannot be completed, failure records describe the run instead
+        enospc = OSError(errno.ENOSPC, "synthetic: No space left on device")
+        cases = (("skip log", False, "log"), ("skip manifest", False, "manifest"),
+                 ("dry-run manifest", True, "manifest"))
+        for n, (label, dry, fault) in enumerate(cases, 4):
+            with self.subTest(label):
+                disc = self.make_disc({1: [4]} if dry else {}, stem=f"JPC_AV_0000{n}")
+                fired = []
+                if fault == "log":
+                    real_log = mv.ISOToMP4Converter._create_log_file
 
-class SourceMountTests(unittest.TestCase):
+                    def create_log(converter, result, *args, **kwargs):
+                        if not fired and str(kwargs.get("token")).startswith("skipped"):
+                            fired.append("log")
+                            raise enospc
+                        return real_log(converter, result, *args, **kwargs)
+
+                    patch = mock.patch.object(mv.ISOToMP4Converter, "_create_log_file", create_log)
+                else:
+                    real_dump = json.dump
+
+                    def dump(obj, fp, *args, **kwargs):
+                        if not fired:
+                            fired.append("manifest")
+                            fp.write('{"conversion_metadata": {')
+                            raise enospc
+                        return real_dump(obj, fp, *args, **kwargs)
+
+                    patch = mock.patch.object(mv.json, "dump", dump)
+                with patch:
+                    result = self.dry_run(disc) if dry else self.convert(disc)
+                kind = "dryrun" if dry else "skipped"
+                self.assertEqual(self.glob(disc, f"*_{kind}-*"), [], "half a record pair was left")
+                self.assertFalse(result.success or result.skipped)
+                self.assertTrue(result.error_message.startswith("Run records could not be written"),
+                                result.error_message)
+                self.assertIn("No space left on device", result.error_message)
+                manifest, _ = self.tokened_manifest(disc, "failed")
+                self.assertEqual(manifest["conversion_status"]["overall_status"], "error")
+                self.assertTrue(fired)
+
+
+class SourceMountTests(ScenarioRunner, unittest.TestCase):
     """C1: a source image kept attached is never detached - no forced
     detach, device fallback or leak sweep. Controls: an ordinary exit still
-    detaches. hdiutil is faked at run_cmd and only recorded."""
+    detaches. hdiutil is faked at run_cmd and only recorded. A Ctrl-C during
+    a detach is recorded, not raised (T-144), and a mount point that cannot
+    be checked is still detached."""
+
+    def test_ctrl_c_during_a_detach_is_recorded_not_raised(self):
+        root = Path(tempfile.mkdtemp(prefix="t144-mount-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome = self.run_scenario("detach_command", mode,
+                                            root / ("real" if mode == REAL else "raised"))
+                self.assertNotIn("escaped", outcome)
+                self.assertEqual(len(outcome["calls"]), 1, "detaching went on after the Ctrl-C")
+                self.assertTrue(outcome["detach_interrupted"])
+                errors = outcome["detach_errors"]
+                self.assertEqual(len(errors), 1, errors)
+                for part in ("JPC_AV_00131.iso", "interrupted by operator (Ctrl-C)",
+                             "may still be attached", "check with hdiutil info", "/dev/disk42"):
+                    self.assertIn(part, errors[0])
+
+    def test_a_mount_point_that_cannot_be_checked_is_still_detached(self):
+        root = Path(tempfile.mkdtemp(prefix="t144-mount-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        volume = root / "volume"
+        volume.mkdir()
+        calls, fired = [], []
+        error = OSError(errno.EIO, "synthetic: Input/output error")
+
+        def run_cmd(cmd, *args, **kwargs):
+            calls.append([str(c) for c in cmd])
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def failing(real):
+            def call(path, *args, **kwargs):
+                if not isinstance(path, int) and os.fsdecode(path) == str(volume):
+                    fired.append(real.__name__)
+                    raise error
+                return real(path, *args, **kwargs)
+            return call
+
+        mount = mv.ISOMount(root / "JPC_AV_00001.iso")
+        mount.mount_points, mount.devices = [volume], ["/dev/disk42"]
+        with mock.patch.object(mv, "run_cmd", run_cmd), \
+                mock.patch.object(mv, "log", lambda message: None), \
+                mock.patch.object(mv.os, "lstat", failing(os.lstat)), \
+                mock.patch.object(mv.os, "stat", failing(os.stat)), \
+                mock.patch.object(Path, "stat", failing(Path.stat)):
+            try:
+                mount.__exit__(None, None, None)
+            except OSError as e:
+                self.fail(f"the check of the mount point escaped: {e}")
+        self.assertEqual(calls, [["hdiutil", "detach", str(volume), "-force"]])
+        self.assertEqual(mount.detach_errors, [])
+        self.assertTrue(fired)
 
     def test_a_source_kept_attached_is_never_detached(self):
         root = Path(tempfile.mkdtemp(prefix="t129-mount-"))
@@ -2660,6 +2941,1892 @@ class SourceMountTests(unittest.TestCase):
                     mount.__exit__(None, None, None)
                 self.assertEqual(calls, expected)
 
+### === RUN-ENDING SCENARIOS (T-144, T-145, T-146) ===
+
+
+def seeded_disc(case, stem, titlesets=1, **encode):
+    """A disc whose titlesets 1..n pass (or end as encode says), over an
+    earlier canonical MP4 (titleset 1), log and manifest; answers y"""
+    disc = case.make_disc({vts: [4] for vts in range(1, titlesets + 1)}, stem=stem)
+    for vts in range(1, titlesets + 1):
+        case.vob_durations(vts, 600.0)
+        case.output(disc, vts, 600.0, **encode)
+    case.seed_canonical(disc)
+    return disc
+
+
+def new_disc(case, stem, seconds=600.0, **encode):
+    """A one-titleset disc with no earlier outputs"""
+    disc = case.make_disc({1: [4]}, stem=stem)
+    case.vob_durations(1, 600.0)
+    case.output(disc, 1, seconds, **encode)
+    return disc
+
+
+def mount_interrupting(interrupt, fired, on):
+    """The harness's fake mount, interrupted as it attaches ("enter") or
+    once it has detached ("exit")"""
+    base = mv.ISOMount
+
+    class Interrupting(base):
+        def __enter__(self):
+            if on == "enter":
+                fired.append("attach")
+                interrupt()
+            return super().__enter__()
+
+        def __exit__(self, *exc):
+            super().__exit__(*exc)
+            if on == "exit":
+                fired.append("detach")
+                interrupt()
+            return False
+
+    return mock.patch.object(mv, "ISOMount", Interrupting)
+
+
+def first_call_interrupting(obj, name, interrupt, fired, when=lambda *args, **kwargs: True):
+    """obj.name delivering the interrupt on its first call that `when`
+    selects, then (if that returns) doing what it does"""
+    real = getattr(obj, name)
+
+    def call(*args, **kwargs):
+        if not fired and when(*args, **kwargs):
+            fired.append(name)
+            interrupt()
+        return real(*args, **kwargs)
+
+    return mock.patch.object(obj, name, call)
+
+
+def log_interrupting(case, interrupt, fired, phrase):
+    """The harness's log, delivering the interrupt once the first message
+    containing phrase is shown"""
+    def log(message):
+        case.lines.append(str(message))
+        if not fired and phrase in str(message):
+            fired.append(phrase)
+            interrupt()
+
+    return mock.patch.object(mv, "log", log)
+
+
+def running(case, run, *patches, **extra):
+    """capture(run) with the patches applied; the outcome with extra"""
+    with contextlib.ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
+        outcome = capture(case, run)
+    outcome.update(extra)
+    return outcome
+
+
+@child_scenario
+def detach_after_promotion(case, interrupt):
+    """N3: Ctrl-C while the image is detached, once every titleset is promoted"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00101")
+    return running(case, lambda: case.convert(disc), mount_interrupting(interrupt, fired, "exit"),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def canonical_log_body(case, interrupt):
+    """N3: Ctrl-C while the canonical log is written (python_version runs in its body)"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00102")
+    return running(case, lambda: case.convert(disc),
+                   first_call_interrupting(mv.platform, "python_version", interrupt, fired),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def record_details(case, interrupt):
+    """N3: Ctrl-C while ffprobe reads the promoted MP4 for the manifest"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00103")
+    final = str(case.mp4(disc, 1))
+    return running(case, lambda: case.convert(disc),
+                   first_call_interrupting(mv, "get_video_info", interrupt, fired,
+                                           lambda target: str(target) == final),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def between_record_renames(case, interrupt):
+    """Ctrl-C once the canonical log is in place, as the manifest is renamed"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00104")
+    manifest = disc.out / f"{disc.stem}_access_manifest.json"
+    return running(case, lambda: case.convert(disc),
+                   first_call_interrupting(mv.os, "replace", interrupt, fired,
+                                           lambda src, dst, *args, **kwargs: Path(dst) == manifest),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def after_records(case, interrupt):
+    """Ctrl-C while the success summary is shown"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00105")
+    return running(case, lambda: case.convert(disc),
+                   log_interrupting(case, interrupt, fired, "Source ISO:"),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def titleset_outcomes(case, interrupt):
+    """Ctrl-C while the titleset outcomes are shown, before the detach"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00106")
+    return running(case, lambda: case.convert(disc),
+                   log_interrupting(case, interrupt, fired, "duration check passed; promoted"),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def failed_detach(case, interrupt):
+    """N7: a failed run; Ctrl-C while the image is detached"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00107", returncode=1)
+    return running(case, lambda: case.convert(disc), mount_interrupting(interrupt, fired, "exit"),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def failed_record_log(case, interrupt):
+    """N7: a failed run; Ctrl-C while its failure log is written"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00108", returncode=1)
+    return running(case, lambda: case.convert(disc),
+                   first_call_interrupting(mv.platform, "python_version", interrupt, fired),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def ffmpeg_error_output(case, interrupt):
+    """N17: Ctrl-C while ffmpeg's error output is shown"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00109", returncode=1)
+    return running(case, lambda: case.convert(disc),
+                   log_interrupting(case, interrupt, fired, "ffmpeg error:"),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def truncation_reason_output(case, interrupt):
+    """N17: Ctrl-C while a truncated encode's reason is shown"""
+    fired, disc = [], new_disc(case, "JPC_AV_00110", 300.0)
+    return running(case, lambda: case.convert(disc),
+                   log_interrupting(case, interrupt, fired, "truncated encode"),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def overwrite_prompt(case, interrupt):
+    """N15: a batch of two; Ctrl-C at the first ISO's overwrite prompt"""
+    fired = []
+    first, second = seeded_disc(case, "JPC_AV_00111"), new_disc(case, "JPC_AV_00112")
+    case.answers.clear()
+
+    def answer(prompt=""):
+        fired.append(prompt)
+        interrupt()
+        return "y"
+
+    return running(case, lambda: case.main_exit("--batch", str(case.root / "isos")),
+                   mock.patch("builtins.input", answer),
+                   fired=fired, stems=[first.stem, second.stem], launched=case.tools.launched)
+
+
+@child_scenario
+def batch_records(case, interrupt):
+    """A batch of two new ISOs; Ctrl-C while the first one's log is written"""
+    fired = []
+    first, second = new_disc(case, "JPC_AV_00113"), new_disc(case, "JPC_AV_00114")
+    return running(case, lambda: case.main_exit("--batch", str(case.root / "isos")),
+                   first_call_interrupting(mv.platform, "python_version", interrupt, fired),
+                   fired=fired, stems=[first.stem, second.stem], launched=case.tools.launched)
+
+
+@child_scenario
+def single_records(case, interrupt):
+    """One new ISO through main(); Ctrl-C while its log is written"""
+    fired, disc = [], new_disc(case, "JPC_AV_00115")
+    return running(case, lambda: case.main_exit("-i", str(disc.iso)),
+                   first_call_interrupting(mv.platform, "python_version", interrupt, fired),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def dependency_check(case, interrupt):
+    """Ctrl-C while ffprobe is checked, before the ISO is attached"""
+    fired, disc = [], new_disc(case, "JPC_AV_00116")
+    return running(case, lambda: case.main_exit("-i", str(disc.iso)),
+                   first_call_interrupting(mv, "check_ffprobe", interrupt, fired),
+                   fired=fired, stem=disc.stem, launched=case.tools.launched)
+
+
+@child_scenario
+def attach(case, interrupt):
+    """Ctrl-C while the ISO is attached"""
+    fired, disc = [], new_disc(case, "JPC_AV_00117")
+    return running(case, lambda: case.main_exit("-i", str(disc.iso)),
+                   mount_interrupting(interrupt, fired, "enter"), fired=fired, stem=disc.stem,
+                   launched=case.tools.launched)
+
+
+@child_scenario
+def analysis(case, interrupt):
+    """Ctrl-C while the disc is analysed"""
+    fired, disc = [], new_disc(case, "JPC_AV_00118")
+    return running(case, lambda: case.main_exit("-i", str(disc.iso)),
+                   first_call_interrupting(mv, "analyze_iso_content", interrupt, fired),
+                   fired=fired, stem=disc.stem, launched=case.tools.launched)
+
+
+@child_scenario
+def real_detach_batch(case, interrupt):
+    """A batch of two through main(), the real ISOMount detaching (attach
+    skipped: the harness's folder; hdiutil faked at run_cmd and recorded):
+    Ctrl-C during the first ISO's hdiutil detach"""
+    fired, detaches = [], []
+    first, second = new_disc(case, "JPC_AV_00191"), new_disc(case, "JPC_AV_00192")
+    mounts, real_run_cmd = case.mounts, mv.run_cmd
+
+    class AttachedMount(REAL_ISOMOUNT):
+        def __enter__(self):
+            mount_point = mounts.get(Path(self.iso_path))
+            self.mount_points, self.devices = [mount_point], ["/dev/disk42"]
+            self.mount_point = mount_point
+            return mount_point
+
+    def run_cmd(cmd, *args, **kwargs):
+        if [str(c) for c in cmd[:2]] == ["hdiutil", "detach"]:
+            detaches.append([str(c) for c in cmd])
+            if not fired:
+                fired.append("hdiutil detach")
+                interrupt()
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return real_run_cmd(cmd, *args, **kwargs)
+
+    return running(case, lambda: case.main_exit("--batch", str(case.root / "isos")),
+                   mock.patch.object(mv, "ISOMount", AttachedMount),
+                   mock.patch.object(mv, "run_cmd", run_cmd),
+                   fired=fired, stems=[first.stem, second.stem], launched=case.tools.launched,
+                   detaches=detaches)
+
+
+@child_scenario
+def batch_accounting(case, interrupt):
+    """A batch of two new ISOs; Ctrl-C while the first one's outcome is
+    counted (bookkeeping the batch holds Ctrl-C over)"""
+    fired = []
+    first, second = new_disc(case, "JPC_AV_00193"), new_disc(case, "JPC_AV_00194")
+    patches = []
+    if hasattr(mv, "_count_batch_result"):  # the earlier version has no such step
+        patches.append(first_call_interrupting(mv, "_count_batch_result", interrupt, fired))
+    return running(case, lambda: case.main_exit("--batch", str(case.root / "isos")), *patches,
+                   fired=fired, stems=[first.stem, second.stem], launched=case.tools.launched)
+
+
+@child_scenario
+def reservation_unremovable(case, interrupt):
+    """MV-13: Ctrl-C while a failed attempt's kept name is reserved, and
+    the empty placeholder then cannot be removed"""
+    fired, disc = [], new_disc(case, "JPC_AV_00142", 300.0)
+    code = mv.ISOToMP4Converter._retain_attempt.__code__
+    real_unlink = os.unlink
+
+    def unlink(path, *args, **kwargs):
+        if fired and os.fsdecode(path).endswith(".mp4.partial"):
+            fired.append("unlink refused")
+            raise PermissionError(errno.EACCES, "synthetic: Permission denied", os.fsdecode(path))
+        return real_unlink(path, *args, **kwargs)
+
+    return running(case, lambda: case.convert(disc),
+                   first_call_interrupting(mv.os, "fstat", interrupt, fired,
+                                           lambda fd: sys._getframe(2).f_code is code),
+                   mock.patch.object(mv.os, "unlink", unlink),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def between_titlesets(case, interrupt):
+    """N7 (MV-3): Ctrl-C as the second titleset's encode is announced,
+    outside any per-titleset handling, after the first one passed"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00119", titlesets=2)
+    return running(case, lambda: case.convert(disc),
+                   log_interrupting(case, interrupt, fired, "Encoding title 02"),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def after_the_record_hold(case, interrupt):
+    """Ctrl-C the moment the record write's hold has ended, between its
+    held steps (found by the code object of the step that holds it)"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00120")
+    code = getattr(getattr(mv.ISOToMP4Converter, "_write_run_records", None), "__code__", None)
+    real_exit = mv.DeferredInterrupt.__exit__
+
+    def exit_then_interrupt(hold, *exc):
+        outcome = real_exit(hold, *exc)
+        if not fired and code is not None and sys._getframe(1).f_code is code:
+            fired.append("after the record hold")
+            interrupt()
+        return outcome
+
+    return running(case, lambda: case.convert(disc),
+                   mock.patch.object(mv.DeferredInterrupt, "__exit__", exit_then_interrupt),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def promotion_after_rename(case, interrupt):
+    """K2(a): Ctrl-C at the first line event in _promote_titlesets' frame
+    once its first rename returned (found by code object and a pass-through
+    os.replace, not by line numbers)"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00121", titlesets=2)
+    code = mv.ISOToMP4Converter._promote_titlesets.__code__
+    real_replace, state = os.replace, {"returned": False}
+
+    def replace(src, dst, *args, **kwargs):
+        mine = sys._getframe(1).f_code is code
+        real_replace(src, dst, *args, **kwargs)
+        if mine:
+            state["returned"] = True
+
+    def local(frame, event, arg):
+        if state["returned"] and not fired and event == "line":
+            fired.append("after the rename")
+            interrupt()
+        return local
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code is code else None
+
+    previous = sys.gettrace()
+    with mock.patch.object(mv.os, "replace", replace):
+        sys.settrace(tracer)
+        try:
+            outcome = capture(case, lambda: case.convert(disc))
+        finally:
+            sys.settrace(previous)
+    return dict(outcome, fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def promotion_in_rename(case, interrupt):
+    """Ctrl-C inside the first title's promotion rename, once it is done"""
+    fired, disc = [], seeded_disc(case, "JPC_AV_00122", titlesets=2)
+    final, real_replace = case.mp4(disc, 1), os.replace
+
+    def replace(src, dst, *args, **kwargs):
+        real_replace(src, dst, *args, **kwargs)
+        if not fired and Path(dst) == final:
+            fired.append("in the rename")
+            interrupt()
+
+    return running(case, lambda: case.convert(disc), mock.patch.object(mv.os, "replace", replace),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def reservation(case, interrupt):
+    """MV-13: Ctrl-C while a failed attempt's kept name is reserved"""
+    fired, disc = [], new_disc(case, "JPC_AV_00141", 300.0)
+    code = mv.ISOToMP4Converter._retain_attempt.__code__
+    return running(case, lambda: case.convert(disc),
+                   first_call_interrupting(mv.os, "fstat", interrupt, fired,
+                                           lambda fd: sys._getframe(2).f_code is code),
+                   fired=fired, stem=disc.stem)
+
+
+@child_scenario
+def detach_command(case, interrupt):
+    """The real ISOMount detaching two volumes; Ctrl-C during the first
+    hdiutil detach (faked at run_cmd and only recorded)"""
+    volumes = [case.root / "volume1", case.root / "volume2"]
+    for volume in volumes:
+        volume.mkdir()
+    fired, calls = [], []
+
+    def run_cmd(cmd, *args, **kwargs):
+        calls.append([str(c) for c in cmd])
+        if not fired:
+            fired.append("hdiutil detach")
+            interrupt()
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    mount = REAL_ISOMOUNT(case.root / "JPC_AV_00131.iso")
+    mount.mount_points, mount.devices = list(volumes), ["/dev/disk42"]
+    outcome = running(case, lambda: mount.__exit__(None, None, None),
+                      mock.patch.object(mv, "run_cmd", run_cmd), fired=fired, calls=calls)
+    outcome.update(detach_interrupted=getattr(mount, "detach_interrupted", None),
+                   detach_errors=list(mount.detach_errors))
+    return outcome
+
+
+class FinalizationTests(ScenarioRunner, Scenario):
+    """T-144, T-145: convert() is the one place a run ends. Wherever a
+    Ctrl-C lands, none leaves convert() and the ISO ends with truthful
+    records; the canonical log and manifest are written to temporary files
+    and renamed into place, log first, so neither is left half-written; a
+    failure's cause is never replaced; a batch stops with a summary and
+    exits 130. Each boundary runs with a real SIGINT in a child and with
+    KeyboardInterrupt raised directly, and asserts that its fault fired."""
+
+    def scenario(self, name, mode):
+        folder = self.root / f"{name}-{'real' if mode == REAL else 'raised'}"
+        outcome = self.run_scenario(name, mode, folder)
+        self.assertNotIn("escaped", outcome, f"{outcome.get('escaped')} escaped")
+        return outcome, folder
+
+    def run_convert(self, disc):
+        try:
+            return self.convert(disc)
+        except KeyboardInterrupt:
+            self.fail("Ctrl-C escaped convert()")
+
+    def run_main(self, *args):
+        try:
+            return self.main_exit(*args)
+        except KeyboardInterrupt:
+            self.fail("Ctrl-C escaped main()")
+
+    @staticmethod
+    def canonical_records(disc):
+        return disc.out / f"{disc.stem}.mp4.log.txt", disc.out / f"{disc.stem}_access_manifest.json"
+
+    def assert_earlier_records(self, disc):
+        for path in self.canonical_records(disc):
+            self.assertEqual(path.read_bytes(), b"EARLIER CANONICAL " + path.name.encode(),
+                             f"{path.name} was changed")
+
+    def assert_no_staging_left(self, disc):
+        self.assertEqual(self.glob(disc, "*.writing-*"), [], "a temporary record was left")
+
+    def assert_records_are_this_runs(self, disc):
+        """The canonical log and manifest are whole, this run's, and match the MP4"""
+        log_path, manifest_path = self.canonical_records(disc)
+        manifest, log_text = json.loads(manifest_path.read_text()), log_path.read_text()
+        self.assertIn(f"Run ID:           {manifest['conversion_metadata']['run_id']}", log_text)
+        self.assertIn("Log generated:", log_text)
+        self.assertTrue(log_text.endswith("=" * 70 + "\n"), "the log is not complete")
+        self.assertEqual(self.mp4(disc, 1).read_bytes(), self.encoded_bytes(disc, 1))
+        self.assertEqual(manifest["output_mp4"]["sha256_checksum"],
+                         hashlib.sha256(self.mp4(disc, 1).read_bytes()).hexdigest())
+        self.assert_no_staging_left(disc)
+        return manifest, log_text
+
+    def assert_stale_warning(self, warnings, disc, *phrases):
+        stale = [w for w in warnings if w.startswith(f"this run replaced or created {disc.stem}.mp4")]
+        self.assertEqual(len(stale), 1, warnings)
+        for phrase in phrases:
+            self.assertIn(phrase, stale[0])
+        return stale[0]
+
+    @staticmethod
+    def summary_line(stem, of):
+        return (f"Interrupted by operator (Ctrl-C) at {stem}.iso (1 of {of}); "
+                f"{of - 1} ISO(s) not started")
+
+    @contextlib.contextmanager
+    def json_dump_failing_once(self):
+        """json.dump writes part of the first record it is given, then fails"""
+        real, fired = json.dump, []
+
+        def dump(obj, fp, *args, **kwargs):
+            if not fired:
+                fired.append("json.dump")
+                fp.write('{"conversion_metadata": {')
+                raise OSError(errno.ENOSPC, "synthetic: No space left on device")
+            return real(obj, fp, *args, **kwargs)
+
+        with mock.patch.object(mv.json, "dump", dump):
+            yield fired
+
+    # --- N3: a Ctrl-C once every titleset is promoted keeps the outcome ---
+
+    def test_ctrl_c_during_the_detach_after_promotion_keeps_the_outcome(self):
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("detach_after_promotion", mode)
+                disc = self.disc_at(folder, outcome["stem"])
+                self.assertTrue(outcome["success"] and outcome["interrupted"], outcome)
+                manifest, _ = self.assert_records_are_this_runs(disc)
+                status = manifest["conversion_status"]
+                self.assertEqual(status["overall_status"], "success_with_warnings")
+                self.assertIn("Interrupted by operator (Ctrl-C) while the ISO was being detached; "
+                              "it may still be attached: check with hdiutil info", status["warnings"])
+                self.assertEqual(self.records(disc, "failed"), ([], []))
+                self.assertTrue(outcome["handler_restored"])
+
+    def test_ctrl_c_while_the_canonical_log_is_written(self):
+        # A real one is held until both records are in place. Raised
+        # directly, it fails the write: the earlier records stay whole, and
+        # the run's failure records say they no longer match the new MP4
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("canonical_log_body", mode)
+                disc = self.disc_at(folder, outcome["stem"])
+                self.assertTrue(outcome["interrupted"])
+                self.assertEqual(self.mp4(disc, 1).read_bytes(), self.encoded_bytes(disc, 1))
+                self.assert_no_staging_left(disc)
+                self.assertTrue(outcome["handler_restored"])
+                if mode == REAL:
+                    self.assertTrue(outcome["success"], outcome)
+                    manifest, _ = self.assert_records_are_this_runs(disc)
+                    self.assertEqual(manifest["conversion_status"]["overall_status"], "success")
+                    self.assertEqual(self.records(disc, "failed"), ([], []))
+                    self.assertTrue(any("held until they were finished" in line
+                                        for line in outcome["lines"]), outcome["lines"])
+                    continue
+                self.assertFalse(outcome["success"])
+                self.assertTrue(outcome["error"].startswith(
+                    "Run records could not be written: interrupted by operator (Ctrl-C)"), outcome)
+                self.assert_earlier_records(disc)
+                manifest, log_text = self.tokened_manifest(disc, "failed")
+                self.assertIn("Log generated:", log_text)
+                status = manifest["conversion_status"]
+                self.assertEqual(status["canonical_files_changed"], [str(self.mp4(disc, 1))])
+                self.assert_stale_warning(status["warnings"], disc,
+                                          f"{disc.stem}_access_manifest.json and {disc.stem}.mp4.log.txt "
+                                          f"describe an earlier run and no longer match it")
+
+    def test_ctrl_c_while_record_details_are_gathered(self):
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("record_details", mode)
+                disc = self.disc_at(folder, outcome["stem"])
+                self.assertTrue(outcome["success"] and outcome["interrupted"], outcome)
+                manifest, _ = self.assert_records_are_this_runs(disc)
+                status = manifest["conversion_status"]
+                self.assertEqual(status["overall_status"], "success_with_warnings")
+                self.assertIn("video technical information and processor not gathered for the "
+                              "records: interrupted by operator (Ctrl-C)", status["warnings"])
+                self.assertEqual(manifest["video_technical_info"], {})
+                self.assertIsNone(manifest["system_environment"]["processor"])
+                self.assertEqual(self.records(disc, "failed"), ([], []))
+
+    def test_ctrl_c_between_the_canonical_record_renames(self):
+        # The pair is not one transaction: raised directly between the two
+        # renames, the new log is in place beside the earlier manifest, and
+        # the failure records say exactly that
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("between_record_renames", mode)
+                disc = self.disc_at(folder, outcome["stem"])
+                self.assertTrue(outcome["interrupted"])
+                self.assert_no_staging_left(disc)
+                if mode == REAL:
+                    self.assertTrue(outcome["success"], outcome)
+                    self.assert_records_are_this_runs(disc)
+                    self.assertEqual(self.records(disc, "failed"), ([], []))
+                    continue
+                self.assertFalse(outcome["success"])
+                log_path, manifest_path = self.canonical_records(disc)
+                self.assertEqual(manifest_path.read_bytes(),
+                                 b"EARLIER CANONICAL " + manifest_path.name.encode())
+                manifest, _ = self.tokened_manifest(disc, "failed")
+                log_text = log_path.read_text()
+                self.assertIn(f"Run ID:           {manifest['conversion_metadata']['run_id']}", log_text)
+                self.assertTrue(log_text.endswith("=" * 70 + "\n"))
+                self.assert_stale_warning(manifest["conversion_status"]["warnings"], disc,
+                                          f"{log_path.name} was written by this run",
+                                          f"the existing {manifest_path.name} describes an earlier "
+                                          f"run and no longer matches it")
+
+    def test_ctrl_c_once_the_outcome_is_decided_keeps_it(self):
+        for name, warning in (("titleset_outcomes", "Interrupted by operator (Ctrl-C) while the "
+                                                    "titleset outcomes were being shown"),
+                              ("after_records", None)):
+            for mode in (REAL, RAISED):
+                with self.subTest(name, mode=mode):
+                    outcome, folder = self.scenario(name, mode)
+                    disc = self.disc_at(folder, outcome["stem"])
+                    self.assertTrue(outcome["success"] and outcome["interrupted"], outcome)
+                    manifest, _ = self.assert_records_are_this_runs(disc)
+                    status = manifest["conversion_status"]
+                    if warning:
+                        self.assertIn(warning, status["warnings"])
+                    else:  # the records were final before the Ctrl-C
+                        self.assertEqual(status["overall_status"], "success")
+                    self.assertEqual(self.records(disc, "failed"), ([], []))
+
+    def test_ctrl_c_between_the_held_record_steps_is_not_lost(self):
+        # Landing just as the record write's hold ends (outside every hold),
+        # it is noted and the remaining steps still run
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("after_the_record_hold", mode)
+                disc = self.disc_at(folder, outcome["stem"])
+                self.assertTrue(outcome["success"] and outcome["interrupted"], outcome)
+                self.assert_records_are_this_runs(disc)
+                self.assertEqual(self.records(disc, "failed"), ([], []))
+                self.assertIn("Conversion completed successfully!", outcome["lines"])
+
+    # --- N7: a failed run keeps its failure records ---
+
+    def test_ctrl_c_between_titlesets_keeps_the_checked_output(self):
+        # The run had its result but no outcome yet: it is settled as an
+        # interrupted encode is (nothing promoted, the passed first titleset
+        # kept as a review copy, the second not attempted)
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("between_titlesets", mode)
+                disc = self.disc_at(folder, outcome["stem"])
+                self.assertFalse(outcome["success"])
+                self.assertTrue(outcome["interrupted"])
+                self.assertEqual([t["status"] for t in outcome["titles"]], ["held", "not_attempted"])
+                self.assertEqual([p.read_bytes() for p in self.review_copies(disc)],
+                                 [self.encoded_bytes(disc, 1)])
+                self.assertEqual(self.temps(disc), [])
+                self.assertEqual(self.mp4(disc, 1).read_bytes(),
+                                 b"EARLIER CANONICAL " + self.mp4(disc, 1).name.encode())
+                self.assertFalse(self.mp4(disc, 2).exists())
+                self.assert_earlier_records(disc)
+                manifest, _ = self.tokened_manifest(disc, "failed")
+                status = manifest["conversion_status"]
+                self.assertTrue(status["interrupted"])
+                self.assertIn("Interrupted by operator (Ctrl-C)", status["error_message"])
+                self.assertEqual(status["canonical_files_changed"], [])
+
+    def assert_failure_kept(self, disc, outcome):
+        self.assertFalse(outcome["success"])
+        self.assertTrue(outcome["interrupted"])
+        self.assertIn("ffmpeg failed with return code 1", outcome["error"])
+        partials = self.partials(disc)
+        self.assertEqual(len(partials), 1)
+        self.assertEqual(outcome["titles"][0]["retained_path"], str(partials[0]))
+        self.assertEqual(self.mp4(disc, 1).read_bytes(), b"EARLIER CANONICAL " + self.mp4(disc, 1).name.encode())
+        self.assert_earlier_records(disc)
+        return partials[0]
+
+    def test_failed_run_ctrl_c_during_the_detach_keeps_its_failure_records(self):
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("failed_detach", mode)
+                disc = self.disc_at(folder, outcome["stem"])
+                partial = self.assert_failure_kept(disc, outcome)
+                manifest, log_text = self.tokened_manifest(disc, "failed")
+                status = manifest["conversion_status"]
+                self.assertTrue(status["interrupted"])
+                self.assertIn("ffmpeg failed with return code 1", status["error_message"])
+                self.assertIn("Interrupted by operator (Ctrl-C) while the ISO was being detached; "
+                              "it may still be attached: check with hdiutil info", status["warnings"])
+                self.assertEqual(manifest["titlesets"]["outputs"][0]["partial_renamed_to"], str(partial))
+                self.assertTrue(log_text.endswith("=" * 70 + "\n"))
+
+    def test_failed_run_ctrl_c_while_its_records_are_written(self):
+        # A real one is held until the failure records are complete. Raised
+        # directly, the half-written log is removed and, as nothing else can
+        # record a failure, the screen says what the records would have
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("failed_record_log", mode)
+                disc = self.disc_at(folder, outcome["stem"])
+                partial = self.assert_failure_kept(disc, outcome)
+                if mode == REAL:
+                    manifest, log_text = self.tokened_manifest(disc, "failed")
+                    self.assertIn("ffmpeg failed with return code 1",
+                                  manifest["conversion_status"]["error_message"])
+                    self.assertTrue(log_text.endswith("=" * 70 + "\n"))
+                    self.assertEqual(manifest["titlesets"]["outputs"][0]["partial_renamed_to"],
+                                     str(partial))
+                    continue
+                self.assertEqual(self.records(disc, "failed"), ([], []))
+                lines = outcome["lines"]
+                self.assertIn("Could not write run records: interrupted by operator (Ctrl-C)", lines)
+                self.assertTrue(any(line.startswith("Not recorded: ") and "return code 1" in line
+                                    for line in lines), lines)
+                self.assertTrue(any(str(partial) in line for line in lines), lines)
+
+    # --- N17: a recorded cause is never replaced ---
+
+    def test_ctrl_c_while_a_failure_is_shown_keeps_its_cause(self):
+        cases = (("ffmpeg_error_output", "ffmpeg failed with return code 1",
+                  "; then Interrupted by operator (Ctrl-C)"),
+                 ("truncation_reason_output", "output is shorter than expected",
+                  "; then Interrupted by operator (Ctrl-C) during post-encode verification"))
+        for name, cause, then in cases:
+            for mode in (REAL, RAISED):
+                with self.subTest(name, mode=mode):
+                    outcome, folder = self.scenario(name, mode)
+                    disc = self.disc_at(folder, outcome["stem"])
+                    self.assertTrue(outcome["interrupted"])
+                    error = outcome["titles"][0]["error"]
+                    self.assertTrue(error.startswith(cause), error)
+                    self.assertIn(then, error)
+                    manifest, log_text = self.tokened_manifest(disc, "failed")
+                    self.assertIn(cause, manifest["conversion_status"]["error_message"])
+                    self.assertIn(cause, log_text)
+                    self.assertEqual(len(self.partials(disc)), 1)
+
+    # --- N15: the overwrite prompt ---
+
+    def test_end_of_input_at_the_overwrite_prompt_counts_as_no(self):
+        first = self.make_disc({1: [4]}, stem="JPC_AV_00151")
+        second = self.make_disc({1: [4]}, stem="JPC_AV_00152")
+        self.vob_durations(1, 600.0)
+        for disc in (first, second):
+            self.output(disc, 1, 600.0)
+        seeded = self.seed_canonical(first)
+        self.answers.clear()
+        with mock.patch("builtins.input", side_effect=EOFError) as answer:
+            results = mv.process_batch(self.root / "isos", self.root / "isos", "T071")
+        self.assertEqual(answer.call_count, 1)
+        self.assertEqual((results["failed"], results["success"]), (1, 1))
+        self.assertIsNone(results["interrupted"])
+        self.assertEqual(self.tools.launched, [self.mp4(second, 1).name], "the batch did not go on")
+        self.assert_unchanged(seeded)
+        detail = results["details"][0]
+        self.assertTrue(detail["aborted"])
+        self.assertFalse(detail["interrupted"])
+        manifest, _ = self.tokened_manifest(first, "aborted")
+        status = manifest["conversion_status"]
+        self.assertEqual(status["overall_status"], "aborted")
+        self.assertFalse(status["interrupted"])
+        self.assertEqual(status["error_message"], "No answer to the overwrite prompt (end of input); "
+                                                  "nothing was overwritten")
+        self.assertEqual(manifest["archival_notes"]["note"], "No answer to the overwrite prompt "
+                         "(end of input), so nothing was encoded or overwritten")
+        with mock.patch("builtins.input", side_effect=EOFError) as answer:
+            self.assertEqual(self.main_exit("-i", str(first.iso)), 1)
+        self.assertEqual(answer.call_count, 1)
+        self.assert_unchanged(seeded)
+
+    def test_ctrl_c_at_the_overwrite_prompt_stops_the_batch(self):
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("overwrite_prompt", mode)
+                first, second = (self.disc_at(folder, stem) for stem in outcome["stems"])
+                self.assertEqual(outcome["exit"], 130)
+                self.assertEqual(outcome["launched"], [])
+                self.assertFalse(second.out.exists(), "the next ISO was started")
+                self.assert_earlier_records(first)
+                manifest, _ = self.tokened_manifest(first, "aborted")
+                status = manifest["conversion_status"]
+                self.assertEqual(status["overall_status"], "aborted")
+                self.assertTrue(status["interrupted"])
+                self.assertEqual(status["error_message"],
+                                 "Cancelled at the overwrite prompt (Ctrl-C); nothing was overwritten")
+                self.assertIn("Batch Summary", [line.strip() for line in outcome["lines"]])
+                self.assertIn(self.summary_line(first.stem, 2), outcome["lines"])
+
+    # --- the batch and main() ---
+
+    def test_ctrl_c_while_records_are_written_stops_the_batch_with_a_summary(self):
+        for mode in (REAL, RAISED):
+            with self.subTest("batch", mode=mode):
+                outcome, folder = self.scenario("batch_records", mode)
+                first, second = (self.disc_at(folder, stem) for stem in outcome["stems"])
+                self.assertEqual(outcome["exit"], 130)
+                self.assertEqual(outcome["launched"], [self.mp4(first, 1).name])
+                self.assertFalse(second.out.exists(), "the next ISO was started")
+                self.assertIn(self.summary_line(first.stem, 2), outcome["lines"])
+                if mode == REAL:
+                    self.assert_records_are_this_runs(first)
+                else:
+                    manifest, _ = self.tokened_manifest(first, "failed")
+                    self.assert_stale_warning(manifest["conversion_status"]["warnings"], first,
+                                              "no canonical manifest describes it")
+            with self.subTest("single ISO", mode=mode):
+                outcome, folder = self.scenario("single_records", mode)
+                self.assertEqual(outcome["exit"], 130)
+
+    def test_a_ctrl_c_that_reaches_the_batch_or_main_stops_it(self):
+        # A Ctrl-C can leave convert() only before its boundary (between
+        # ISOs) or as a further one while an interruption is being settled;
+        # simulated here by convert() raising it, before or after entering.
+        # The batch stops there with its summary (an ISO that never started
+        # is counted as not started, never as failed), and main() exits 130
+        first = new_disc(self, "JPC_AV_00181")
+        new_disc(self, "JPC_AV_00182")
+        isos = self.root / "isos"
+        for entered in (False, True):
+            with self.subTest("further Ctrl-C after entering" if entered else "between ISOs"):
+                calls, self.lines[:] = [], []
+
+                def convert(converter):
+                    calls.append(converter.config.iso_name)
+                    converter._entered = entered
+                    raise KeyboardInterrupt
+
+                with mock.patch.object(mv.ISOToMP4Converter, "convert", convert):
+                    try:
+                        results = mv.process_batch(isos, isos, "T071")
+                        self.assertEqual(self.main_exit("--batch", str(isos)), 130)
+                        self.assertEqual(self.main_exit("-i", str(first.iso)), 130)
+                    except KeyboardInterrupt:
+                        self.fail("Ctrl-C escaped the batch or main()")
+                self.assertEqual(calls, [first.stem] * 3, "the batch went on to the next ISO")
+                self.assertEqual(results["interrupted"], first.iso.name)
+                if entered:
+                    self.assertEqual((results["processed"], results["failed"], results["not_started"]),
+                                     (1, 1, 1))
+                    self.assertTrue(results["details"][0]["interrupted"])
+                    self.assertIn(self.summary_line(first.stem, 2), self.lines)
+                else:
+                    self.assertEqual((results["processed"], results["failed"], results["not_started"],
+                                      results["details"]), (0, 0, 2, []))
+                    self.assertIn(f"Interrupted by operator (Ctrl-C) before {first.iso.name} started "
+                                  f"(0 of 2 processed); 2 ISO(s) not started", self.lines)
+        self.assertEqual(self.tools.launched, [])
+
+    def test_help_gives_the_ctrl_c_and_end_of_input_rules(self):
+        shown = io.StringIO()
+        with contextlib.redirect_stdout(shown):
+            mv.print_help()
+        text = " ".join(shown.getvalue().split())
+        for phrase in ("130 a Ctrl-C stopped the run or batch", 'no answer (end of input) counts as "n"',
+                       "CTRL-C:", "renamed into place, log first", "*_failed-<token> records instead",
+                       "held until they finish", "takes precedence over 0 and 1",
+                       "An outcome already decided (a skip, dry run, unverified result or failure) "
+                       "stands", "at the overwrite prompt the ISO is recorded as aborted",
+                       "being attached or detached", "an attach cut short is not detached",
+                       "never leaves either half-written under its final name",
+                       "a power loss, or a volume that does not rename atomically, is not covered"):
+            self.assertIn(phrase, text)
+        self.assertNotIn("so neither is left half-written", text)
+
+    def test_ctrl_c_before_the_outcome_is_decided_fails_the_run_with_records(self):
+        phases = (("dependency_check", "while ffmpeg and ffprobe were being checked"),
+                  ("attach", "while the ISO was being attached; it may be attached: "
+                             "check with hdiutil info"),
+                  ("analysis", "during the disc analysis"))
+        for name, phase in phases:
+            for mode in (REAL, RAISED):
+                with self.subTest(name, mode=mode):
+                    outcome, folder = self.scenario(name, mode)
+                    disc = self.disc_at(folder, outcome["stem"])
+                    self.assertEqual(outcome["exit"], 130)
+                    manifest, log_text = self.tokened_manifest(disc, "failed")
+                    status = manifest["conversion_status"]
+                    self.assertEqual(status["error_message"], f"Interrupted by operator (Ctrl-C) {phase}")
+                    self.assertTrue(status["interrupted"])
+                    self.assertTrue(log_text.endswith("=" * 70 + "\n"))
+                    self.assertEqual(outcome["launched"], [])
+
+    # --- records that cannot be written (decision G2-D3) ---
+
+    def test_records_that_cannot_be_written_after_promotion_stay_whole(self):
+        for stem, seed in (("JPC_AV_00161", True), ("JPC_AV_00162", False)):
+            with self.subTest("over an earlier bundle" if seed else "first conversion"):
+                disc = new_disc(self, stem)
+                if seed:
+                    self.seed_canonical(disc)
+                with self.json_dump_failing_once() as fired:
+                    result = self.run_convert(disc)
+                self.assertFalse(result.success)
+                self.assertTrue(result.error_message.startswith("Run records could not be written: "),
+                                result.error_message)
+                self.assertIn("No space left on device", result.error_message)
+                self.assertEqual(self.mp4(disc, 1).read_bytes(), self.encoded_bytes(disc, 1))
+                if seed:
+                    self.assert_earlier_records(disc)
+                else:
+                    self.assertEqual([p.exists() for p in self.canonical_records(disc)], [False, False])
+                self.assert_no_staging_left(disc)
+                manifest, _ = self.tokened_manifest(disc, "failed")
+                status = manifest["conversion_status"]
+                self.assertEqual(status["canonical_files_changed"], [str(self.mp4(disc, 1))])
+                self.assertTrue(status["error_message"].startswith("Run records could not be written"))
+                self.assert_stale_warning(
+                    status["warnings"], disc,
+                    f"{disc.stem}_access_manifest.json and {disc.stem}.mp4.log.txt describe an "
+                    f"earlier run and no longer match it" if seed else
+                    "no canonical manifest describes it")
+                self.assertTrue(fired)
+
+    def test_a_stale_record_that_cannot_be_checked_is_named_as_such(self):
+        disc = new_disc(self, "JPC_AV_00163")
+        self.seed_canonical(disc)
+        log_path, manifest_path = self.canonical_records(disc)
+        error = OSError(errno.EIO, "synthetic: Input/output error")
+        real_lstat, checked = os.lstat, []
+
+        def lstat(path, *args, **kwargs):
+            # Armed once the manifest write has failed (after promotion): a
+            # planned output that cannot be checked before the run is
+            # refused there instead (T-150)
+            if fired and not isinstance(path, int) and Path(os.fsdecode(path)) == manifest_path:
+                checked.append(path)
+                raise error
+            return real_lstat(path, *args, **kwargs)
+
+        with self.json_dump_failing_once() as fired, mock.patch.object(mv.os, "lstat", lstat):
+            result = self.run_convert(disc)
+        self.assertFalse(result.success)
+        stale = [w for w in result.warnings if w.startswith("this run replaced or created")]
+        self.assertEqual(len(stale), 1, result.warnings)
+        self.assertIn(f"{manifest_path.name} could not be checked ({error})", stale[0])
+        self.assertNotIn("no canonical manifest describes", stale[0])
+        self.assertIn(f"the existing {log_path.name} describes an earlier run and no longer "
+                      f"matches it", stale[0])
+        manifest, _ = self.tokened_manifest(disc, "failed")
+        self.assertIn(stale[0], manifest["conversion_status"]["warnings"])
+        self.assertTrue(fired)
+        self.assertTrue(checked, "the canonical manifest was never checked")
+
+    def test_a_temporary_record_that_cannot_be_removed_is_named(self):
+        disc = new_disc(self, "JPC_AV_00164")
+        self.seed_canonical(disc)
+        real_unlink, refused = os.unlink, []
+
+        def unlink(path, *args, **kwargs):
+            if ".writing-" in os.fsdecode(path):
+                refused.append(Path(os.fsdecode(path)))
+                raise PermissionError(errno.EACCES, "synthetic: Permission denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with self.json_dump_failing_once() as fired, mock.patch.object(mv.os, "unlink", unlink):
+            result = self.run_convert(disc)
+        self.assertFalse(result.success)
+        self.assert_earlier_records(disc)
+        left = self.glob(disc, "*.writing-*")
+        self.assertEqual(len(left), 2, "both temporary records should be left (removal refused)")
+        manifest, _ = self.tokened_manifest(disc, "failed")
+        warnings = manifest["conversion_status"]["warnings"]
+        for path in left:
+            self.assertTrue(any(str(path) in w and "could not be removed" in w and "not a record" in w
+                                for w in warnings), warnings)
+        self.assertTrue(fired and refused)
+
+    def test_failure_records_that_cannot_be_completed_keep_the_complete_log(self):
+        # Nothing else can record a failure: the complete failure log is
+        # kept, its unfinished manifest removed, and the screen says so
+        disc = seeded_disc(self, "JPC_AV_00165", returncode=1)
+        with self.json_dump_failing_once() as fired:
+            result = self.run_convert(disc)
+        self.assertFalse(result.success)
+        self.assertIn("ffmpeg failed with return code 1", result.error_message)
+        logs, manifests = self.records(disc, "failed")
+        self.assertEqual((len(logs), manifests), (1, []))
+        self.assertTrue(logs[0].read_text().endswith("=" * 70 + "\n"))
+        self.assertIn(f"Written, without the rest of its records: {logs[0]}", self.lines)
+        self.assertTrue(any(line.startswith("Not recorded: ") and "return code 1" in line
+                            for line in self.lines), self.lines)
+        self.assertTrue(fired)
+
+    def test_record_details_that_cannot_be_gathered_are_left_out(self):
+        # Optional details: a tool that fails (not only a Ctrl-C) leaves its
+        # detail out with a warning naming the cause; the records are
+        # written and a batch goes on
+        first, second = new_disc(self, "JPC_AV_00166"), new_disc(self, "JPC_AV_00167")
+        final = str(self.mp4(first, 1))
+        error = BlockingIOError(errno.EAGAIN, "synthetic: Resource temporarily unavailable")
+        real_info, fired = mv.get_video_info, []
+
+        def info(target):
+            if str(target) == final:
+                fired.append(target)
+                raise error
+            return real_info(target)
+
+        with mock.patch.object(mv, "get_video_info", info):
+            results = mv.process_batch(self.root / "isos", self.root / "isos", "T071")
+        self.assertEqual((results["success"], results["failed"]), (2, 0))
+        self.assertEqual(self.tools.launched, [self.mp4(first, 1).name, self.mp4(second, 1).name])
+        manifest, _ = self.assert_records_are_this_runs(first)
+        status = manifest["conversion_status"]
+        self.assertEqual(status["overall_status"], "success_with_warnings")
+        self.assertIn(f"video technical information not gathered for the records: {error}",
+                      status["warnings"])
+        self.assertEqual(manifest["video_technical_info"], {})
+        self.assertTrue(fired)
+        # The ffmpeg version, for a run that never checked it (no such ISO)
+        missing = self.root / "isos" / "JPC_AV_00168.iso"
+        config = mv.ConversionConfig(iso_path=missing, output_dir=self.root / "isos" / "access_JPC_AV_00168",
+                                     operator="T071")
+        with mock.patch.object(mv, "check_ffmpeg",
+                               side_effect=ValueError("synthetic: undecodable version output")) as check:
+            result = mv.ISOToMP4Converter(config).convert()
+        self.assertTrue(result.error_message.startswith("ISO file not found"), result.error_message)
+        disc = self.disc_at(self.root, "JPC_AV_00168")
+        manifest, log_text = self.tokened_manifest(disc, "failed")
+        self.assertIn("ffmpeg version not gathered for the records: synthetic: undecodable version "
+                      "output", manifest["conversion_status"]["warnings"])
+        self.assertIn("FFmpeg Version:   None", log_text)
+        self.assertEqual(check.call_count, 1)
+
+    def test_end_of_input_at_the_operator_prompt_exits_1(self):
+        disc = new_disc(self, "JPC_AV_00169")
+        with mock.patch.object(sys, "argv", ["makeiso-video.py", "-i", str(disc.iso)]), \
+                mock.patch("builtins.input", side_effect=EOFError) as answer:
+            with self.assertRaises(SystemExit) as caught:
+                mv.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("\nNo answer (end of input): cancelled.", self.lines)
+        self.assertEqual(self.tools.launched, [])
+        self.assertFalse(disc.out.exists())
+        self.assertEqual(answer.call_count, 1)
+
+    # --- the exit rule: 130 after a Ctrl-C, unless an ffmpeg was not confirmed stopped ---
+
+    def test_ctrl_c_during_the_real_detach_stops_the_batch(self):
+        # The real ISOMount records a Ctrl-C during hdiutil detach instead of
+        # raising it; the run takes it up (interrupted), so the batch stops,
+        # exits 130, and the ISO's records name the detach
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("real_detach_batch", mode)
+                first, second = (self.disc_at(folder, stem) for stem in outcome["stems"])
+                self.assertEqual(outcome["exit"], 130)
+                self.assertEqual(outcome["launched"], [self.mp4(first, 1).name])
+                self.assertFalse(second.out.exists(), "the next ISO was started")
+                self.assertEqual(len(outcome["detaches"]), 1, "detaching went on after the Ctrl-C")
+                self.assertIn(self.summary_line(first.stem, 2), outcome["lines"])
+                manifest, _ = self.assert_records_are_this_runs(first)
+                status = manifest["conversion_status"]
+                self.assertEqual(status["overall_status"], "success_with_warnings")
+                self.assertTrue(any(w.startswith(f"unmount of {first.iso.name}: interrupted by operator "
+                                                 f"(Ctrl-C); it may still be attached")
+                                    and "check with hdiutil info" in w for w in status["warnings"]),
+                                status["warnings"])
+
+    def test_ctrl_c_while_an_iso_is_counted_stops_the_batch_after_it(self):
+        # The batch's own bookkeeping holds Ctrl-C: the ISO is counted, the
+        # summary still prints, and no further ISO is started
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, folder = self.scenario("batch_accounting", mode)
+                first, second = (self.disc_at(folder, stem) for stem in outcome["stems"])
+                self.assertEqual(outcome["exit"], 130)
+                self.assertEqual(outcome["launched"], [self.mp4(first, 1).name])
+                self.assertFalse(second.out.exists(), "the next ISO was started")
+                for line in (self.summary_line(first.stem, 2), "Total processed: 1",
+                             "Successfully converted: 1"):
+                    self.assertIn(line, outcome["lines"])
+                self.assert_records_are_this_runs(first)
+
+    def test_an_interrupted_run_whose_ffmpeg_was_not_confirmed_stopped_exits_1(self):
+        unstoppable = dict(live=True, data=b"LAUNCH", never_exits=True, interrupt=True)
+        first = new_disc(self, "JPC_AV_00183", **unstoppable)
+        second = new_disc(self, "JPC_AV_00184")
+        with self.subTest("batch"):
+            self.assertEqual(self.run_main("--batch", str(self.root / "isos")), 1)
+            self.assertEqual(self.tools.launched, [self.mp4(first, 1).name])
+            self.assertFalse(second.out.exists(), "the next ISO was started")
+            status = self.tokened_manifest(first, "failed")[0]["conversion_status"]
+            self.assertTrue(status["interrupted"] and status["cleanup_incomplete"], status)
+            self.assertIn("Batch interrupted by operator — stopping.", self.lines)
+            self.assertTrue(any(line.startswith("Batch stopped: an ffmpeg could not be confirmed")
+                                for line in self.lines), self.lines)
+        with self.subTest("single ISO"):
+            third = new_disc(self, "JPC_AV_00185", **unstoppable)
+            self.assertEqual(self.run_main("-i", str(third.iso)), 1)
+            status = self.tokened_manifest(third, "failed")[0]["conversion_status"]
+            self.assertTrue(status["interrupted"] and status["cleanup_incomplete"], status)
+        self.assertFalse(any("exit status 130" in line for line in self.lines), self.lines)
+
+    def test_the_ctrl_c_backstops_keep_exit_1_for_an_ffmpeg_not_confirmed_stopped(self):
+        unstoppable = dict(live=True, data=b"LAUNCH", never_exits=True, interrupt=True)
+        first = new_disc(self, "JPC_AV_00186", **unstoppable)
+        new_disc(self, "JPC_AV_00187")
+        real_convert, calls = mv.ISOToMP4Converter.convert, []
+
+        def convert_then_interrupt(converter):
+            calls.append(converter.config.iso_name)
+            real_convert(converter)
+            raise KeyboardInterrupt  # a further Ctrl-C once the run is recorded
+
+        with mock.patch.object(mv.ISOToMP4Converter, "convert", convert_then_interrupt):
+            for args in (("--batch", str(self.root / "isos")), ("-i", str(first.iso))):
+                with self.subTest(args[0]):
+                    self.assertEqual(self.run_main(*args), 1)
+        self.assertEqual(calls, [first.stem] * 2, "the batch went on to the next ISO")
+        self.assertIn(self.summary_line(first.stem, 2), self.lines)
+        self.assertEqual(sum("An ffmpeg could not be confirmed stopped (see above): exit status 1."
+                             in line for line in self.lines), 1, self.lines)
+        with self.subTest("Ctrl-C while the batch says the ffmpeg was not confirmed stopped"):
+            self.root = self.root / "stopped"
+            self.root.mkdir()
+            third = new_disc(self, "JPC_AV_00188", live=True, data=b"LAUNCH", never_exits=True,
+                             stderr_error=EncoderLifetimeTests.READ_ERROR)
+            new_disc(self, "JPC_AV_00189")
+            fired, lines = [], self.lines
+
+            def log(message):
+                lines.append(str(message))
+                if not fired and str(message).startswith("Batch stopped:"):
+                    fired.append(message)
+                    raise KeyboardInterrupt
+
+            with mock.patch.object(mv, "log", log):
+                self.assertEqual(self.run_main("--batch", str(self.root / "isos")), 1)
+            self.assertIn("Batch Summary", [line.strip() for line in lines])
+            self.assertIn(self.summary_line(third.stem, 2), lines)
+            self.assertTrue(fired)
+
+    # --- healthy controls ---
+
+    def test_control_a_healthy_run_over_an_earlier_bundle(self):
+        disc = seeded_disc(self, "JPC_AV_00171")
+        handler = signal.getsignal(signal.SIGINT)
+        result = self.run_convert(disc)
+        self.assertTrue(result.success, result.error_message)
+        self.assertFalse(result.interrupted)
+        manifest, _ = self.assert_records_are_this_runs(disc)
+        self.assertEqual(manifest["conversion_status"]["overall_status"], "success")
+        self.assertEqual(self.records(disc, "failed"), ([], []))
+        self.assertIs(signal.getsignal(signal.SIGINT), handler, "the SIGINT handler was not restored")
+        other = new_disc(self, "JPC_AV_00172")
+        self.assertEqual(self.main_exit("-i", str(other.iso)), 0)
+        self.assert_records_are_this_runs(other)
+
+    def test_control_a_first_conversion_leaves_no_staging(self):
+        disc = new_disc(self, "JPC_AV_00173")
+        self.assertEqual(self.main_exit("-i", str(disc.iso)), 0)
+        self.assert_records_are_this_runs(disc)
+        self.assertEqual(sorted(p.name for p in disc.out.iterdir()),
+                         sorted([f"{disc.stem}.mp4", f"{disc.stem}.mp4.log.txt",
+                                 f"{disc.stem}_access_manifest.json"]))
+
+
+class PromotionWindowTests(ScenarioRunner, Scenario):
+    """T-146 (decision G2-D1): Ctrl-C is held across the promotion renames,
+    so a real one never stops promotion partway: the run keeps its outcome,
+    with the interruption as a warning. One raised directly (as off the main
+    thread) still stops promotion, once where the output is has been
+    settled by device and inode; a failed check is never taken as absence.
+    The earlier version let the Ctrl-C escape, stopped promotion partway,
+    or recorded a title as promoted that was not."""
+
+    def scenario(self, name, mode):
+        folder = self.root / f"{name}-{'real' if mode == REAL else 'raised'}"
+        outcome = self.run_scenario(name, mode, folder)
+        self.assertNotIn("escaped", outcome, f"{outcome.get('escaped')} escaped")
+        return outcome, self.disc_at(folder, outcome["stem"])
+
+    def run_convert(self, disc):
+        try:
+            return self.convert(disc)
+        except KeyboardInterrupt:
+            self.fail("Ctrl-C escaped convert()")
+
+    def assert_promotion_finished(self, outcome, disc):
+        self.assertTrue(outcome["success"] and outcome["interrupted"], outcome)
+        self.assertEqual([(t["status"], t["promoted"]) for t in outcome["titles"]],
+                         [("completed", True), ("completed", True)])
+        for vts in (1, 2):
+            self.assertEqual(self.mp4(disc, vts).read_bytes(), self.encoded_bytes(disc, vts))
+        manifest = json.loads((disc.out / f"{disc.stem}_access_manifest.json").read_text())
+        status = manifest["conversion_status"]
+        self.assertEqual(status["canonical_files_changed"],
+                         [str(self.mp4(disc, 1)), str(self.mp4(disc, 2))])
+        self.assertIn("Interrupted by operator (Ctrl-C) during promotion; it was held until "
+                      "every titleset was promoted", status["warnings"])
+        self.assertEqual(self.temps(disc) + self.review_copies(disc), [])
+        self.assertEqual(self.records(disc, "failed"), ([], []))
+
+    def assert_stopped_after_the_first(self, outcome, disc):
+        self.assertFalse(outcome["success"])
+        self.assertTrue(outcome["interrupted"])
+        self.assertEqual([(t["status"], t["promoted"]) for t in outcome["titles"]],
+                         [("completed", True), ("held", False)])
+        self.assertEqual(self.mp4(disc, 1).read_bytes(), self.encoded_bytes(disc, 1))
+        self.assertFalse(self.mp4(disc, 2).exists())
+        self.assertEqual([p.read_bytes() for p in self.review_copies(disc)], [self.encoded_bytes(disc, 2)])
+        manifest, _ = self.tokened_manifest(disc, "failed")
+        status = manifest["conversion_status"]
+        self.assertEqual(status["promotion_error"], "Interrupted by operator (Ctrl-C) during promotion")
+        self.assertEqual(status["canonical_files_changed"], [str(self.mp4(disc, 1))])
+        self.assertTrue(any("describe an earlier run and no longer match it" in w
+                            for w in status["warnings"]), status["warnings"])
+        self.assertEqual(self.temps(disc), [])
+
+    def test_a_ctrl_c_just_after_a_rename_is_held_until_promotion_finishes(self):
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, disc = self.scenario("promotion_after_rename", mode)
+                if mode == REAL:
+                    self.assert_promotion_finished(outcome, disc)
+                else:  # reconciled by device and inode: the first title is promoted
+                    self.assert_stopped_after_the_first(outcome, disc)
+
+    def test_a_ctrl_c_inside_a_rename_is_held_until_promotion_finishes(self):
+        for mode in (REAL, RAISED):
+            with self.subTest(mode):
+                outcome, disc = self.scenario("promotion_in_rename", mode)
+                if mode == REAL:
+                    self.assert_promotion_finished(outcome, disc)
+                else:
+                    self.assert_stopped_after_the_first(outcome, disc)
+
+    def test_an_interrupted_rename_with_an_unreadable_temp_is_not_promoted(self):
+        # K2(c): the rename is interrupted before it happens, and the temp
+        # then cannot be checked once: never recorded as promoted
+        disc = new_disc(self, "JPC_AV_00123")
+        seeded = self.seed_canonical(disc)
+        state = {"armed": False, "fired": 0, "raised": False}
+        real_replace, real_lstat = os.replace, os.lstat
+
+        def replace(src, dst, *args, **kwargs):
+            if not state["raised"] and Path(dst) == self.mp4(disc, 1):
+                state["raised"] = state["armed"] = True
+                raise KeyboardInterrupt  # before any rename
+            return real_replace(src, dst, *args, **kwargs)
+
+        def lstat(path, *args, **kwargs):
+            if state["armed"] and not isinstance(path, int) and TEMP_NAME.search(os.fsdecode(path)):
+                state["armed"], state["fired"] = False, state["fired"] + 1
+                raise OSError(errno.EIO, "synthetic: Input/output error", os.fsdecode(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(mv.os, "replace", replace), mock.patch.object(mv.os, "lstat", lstat):
+            result = self.run_convert(disc)
+        title = result.titles[0]
+        self.assertFalse(title.promoted_this_run)
+        self.assertEqual(result.canonical_files_changed, [])
+        self.assert_unchanged(seeded)
+        self.assertTrue(state["raised"] and state["fired"], state)
+        self.assertTrue(result.interrupted)
+        self.assertFalse(result.success)
+        # The record names where the output really is: kept as a review copy
+        self.assertEqual(title.retained_as, "review_copy")
+        self.assertEqual(title.retained_path.read_bytes(), self.encoded_bytes(disc, 1))
+        self.assertEqual(self.temps(disc), [])
+        manifest, _ = self.tokened_manifest(disc, "failed")
+        record = manifest["titlesets"]["outputs"][0]
+        self.assertEqual((record["promoted_this_run"], record["retained_as"]), (False, "review_copy"))
+        self.assertFalse(any("no longer match" in w for w in manifest["conversion_status"]["warnings"]))
+
+    def test_an_interrupted_rename_whose_final_name_cannot_be_checked_is_not_kept_at_its_temp(self):
+        # The rename happened, then KeyboardInterrupt is raised directly and
+        # the final name cannot be checked: the location is unverified, the
+        # final MP4 is named as possibly replaced, and the temp name (found
+        # not to hold the output) is never recorded as where it is
+        disc = new_disc(self, "JPC_AV_00126")
+        self.seed_canonical(disc)
+        final = self.mp4(disc, 1)
+        state = {"raised": False, "armed": False, "fired": 0, "temp": None}
+        real_replace, real_lstat = os.replace, os.lstat
+
+        def replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if not state["raised"] and Path(dst) == final:
+                state.update(raised=True, armed=True, temp=Path(src))
+                raise KeyboardInterrupt  # after the rename itself
+
+        def lstat(path, *args, **kwargs):
+            if state["armed"] and not isinstance(path, int) and Path(os.fsdecode(path)) == final:
+                state["armed"], state["fired"] = False, state["fired"] + 1
+                raise OSError(errno.EIO, "synthetic: Input/output error", os.fsdecode(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(mv.os, "replace", replace), mock.patch.object(mv.os, "lstat", lstat):
+            result = self.run_convert(disc)
+        title = result.titles[0]
+        self.assertEqual(final.read_bytes(), self.encoded_bytes(disc, 1), "the rename did happen")
+        self.assertTrue(title.location_unverified)
+        self.assertIsNone(title.retained_path, "a name found not to hold the output was recorded")
+        for part in (str(state["temp"]), str(final), "synthetic: Input/output error"):
+            self.assertIn(part, title.retention_error)
+        self.assertTrue(any(w.startswith(f"{final.name} may have been replaced by this run")
+                            for w in result.warnings), result.warnings)
+        manifest, log_text = self.tokened_manifest(disc, "failed")
+        record = manifest["titlesets"]["outputs"][0]
+        self.assertEqual((record["retained_path"], record["retained_as"], record["location_unverified"]),
+                         (None, None, True))
+        self.assertNotIn(f"Kept as:  {state['temp']}", log_text)
+        # Never "nothing promoted" when the final name may hold this run's output
+        self.assertIn(f"Final MP4s:       none confirmed promoted or changed by this run; "
+                      f"{final.name} may have been replaced (could not be checked)", log_text)
+        self.assertNotIn("none promoted or changed by this run", log_text)
+        self.assertIn(f"Final MP4s this run may have replaced (could not be checked): {final.name}",
+                      self.lines)
+        self.assertFalse(any(line.startswith("Nothing was promoted") for line in self.lines), self.lines)
+        self.assertTrue(state["fired"])
+
+    def test_a_temp_that_cannot_be_checked_is_not_renamed(self):
+        disc = seeded_disc(self, "JPC_AV_00124", titlesets=2)
+        seeded = {self.mp4(disc, 1): b"EARLIER CANONICAL " + self.mp4(disc, 1).name.encode()}
+        state = {"armed": False, "fired": 0}
+        real_promote, real_lstat = mv.ISOToMP4Converter._promote_titlesets, os.lstat
+
+        def promote(converter, result):
+            state["armed"] = True
+            return real_promote(converter, result)
+
+        def lstat(path, *args, **kwargs):
+            if state["armed"] and not state["fired"] and not isinstance(path, int) \
+                    and TEMP_NAME.search(os.fsdecode(path)):
+                state["fired"] += 1
+                raise OSError(errno.EIO, "synthetic: Input/output error", os.fsdecode(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(mv.ISOToMP4Converter, "_promote_titlesets", promote), \
+                mock.patch.object(mv.os, "lstat", lstat):
+            result = self.run_convert(disc)
+        self.assertEqual(result.canonical_files_changed, [])
+        self.assert_unchanged(seeded)
+        self.assertFalse(self.mp4(disc, 2).exists())
+        self.assertEqual([t.status for t in result.titles], ["held", "held"])
+        self.assertIn("could not check", result.promotion_error or "")
+        self.assertIn("not promoted", result.promotion_error)
+        self.assertEqual(len(self.review_copies(disc)), 2)
+        self.assertTrue(state["fired"])
+        manifest, _ = self.tokened_manifest(disc, "failed")
+        self.assertEqual(manifest["conversion_status"]["promotion_error"], result.promotion_error)
+
+### === INSPECTION, CLASSIFICATION AND INVOCATION (T-150, T-151, T-155) ===
+
+
+@contextlib.contextmanager
+def stat_failing(wanted, code, calls=("os.stat", "os.lstat", "Path.stat", "Path.lstat")):
+    """The named stat calls fail with errno code (an OSError naming the
+    path, as a real one does) for the paths wanted(path) selects, and
+    delegate everything else: os.stat and os.lstat at module level (what
+    the script's own checks call, on every interpreter) and Path.stat and
+    Path.lstat at class level (what pathlib's predicates call; on 3.9 they
+    never reach os.stat, which pathlib bound at import). Yields the
+    (call, path) pairs it failed."""
+    fired = []
+
+    def failing(label, real):
+        def call(path, *args, **kwargs):
+            if not isinstance(path, int) and wanted(Path(os.fsdecode(path))):
+                fired.append((label, Path(os.fsdecode(path))))
+                raise OSError(code, f"synthetic: {os.strerror(code)}", os.fsdecode(path))
+            return real(path, *args, **kwargs)
+        return call
+
+    owners = {"os.stat": (os, "stat"), "os.lstat": (os, "lstat"),
+              "Path.stat": (Path, "stat"), "Path.lstat": (Path, "lstat")}
+    with contextlib.ExitStack() as stack:
+        for label in calls:
+            owner, name = owners[label]
+            stack.enter_context(mock.patch.object(owner, name, failing(label, getattr(owner, name))))
+        yield fired
+
+
+class InspectionTests(Scenario):
+    """T-150: only "no such file" means absent. A check of the source ISO, a
+    VOB/IFO/BUP file, a volume's VIDEO_TS, a planned output, an encoded
+    output or a final name that fails otherwise stops that step with a
+    recorded cause, the same on every interpreter: no content is silently
+    left out and no existing access copy is replaced without the prompt.
+    T-155: a VIDEO_TS without VOB files is a truthful skip (N21) and a gap
+    in content VOB numbering is an advisory warning (A1). Faults go through
+    the combined stat seam (stat_failing), and each asserts that it fired."""
+
+    def run_convert(self, disc):
+        try:
+            return self.convert(disc)
+        except OSError as e:
+            self.fail(f"an inspection error escaped convert(): {e!r}")
+
+    def assert_refused_before_encoding(self, result, disc, prefix, *phrases):
+        """Failed with the cause recorded, nothing encoded, failure records written"""
+        self.assertFalse(result.success or result.skipped or result.aborted, result.error_message)
+        self.assertTrue((result.error_message or "").startswith(prefix), result.error_message)
+        for phrase in phrases:
+            self.assertIn(phrase, result.error_message)
+        self.assertEqual(self.tools.launched, [], "something was encoded")
+        manifest, log_text = self.tokened_manifest(disc, "failed")
+        self.assertEqual(manifest["conversion_status"]["overall_status"], "error")
+        self.assertEqual(manifest["conversion_status"]["error_message"], result.error_message)
+        self.assertIn(result.error_message, log_text)
+        return manifest
+
+    # --- the C2 helper ---
+
+    def test_only_no_such_file_counts_as_absent(self):
+        target = self.root / "checked"
+        target.write_bytes(b"synthetic")
+        for follow in (False, True):
+            for code in (errno.ENOENT, errno.EACCES, errno.EIO, errno.ENOTDIR, errno.ELOOP):
+                with self.subTest(errno.errorcode[code], follow_symlinks=follow):
+                    with stat_failing(lambda p: p == target, code, ("os.stat", "os.lstat")) as fired:
+                        found, problem = (mv.inspect_path(target, follow_symlinks=True) if follow
+                                          else mv.inspect_path(target))
+                    self.assertEqual(fired, [("os.stat" if follow else "os.lstat", target)])
+                    self.assertIsNone(found)
+                    if code == errno.ENOENT:
+                        self.assertIsNone(problem)
+                    else:
+                        self.assertIn(os.strerror(code), problem or "")
+            with self.subTest("control: present", follow_symlinks=follow):
+                found, problem = (mv.inspect_path(target, follow_symlinks=True) if follow
+                                  else mv.inspect_path(target))
+                self.assertEqual((found.st_size, problem), (9, None))
+
+    # --- N4: the disc inventory ---
+
+    def test_a_vob_that_cannot_be_checked_stops_the_analysis(self):
+        # mv2_vob: the VIDEO_TS listing works, one VOB's check fails
+        disc = self.make_disc({1: [3, 2, 3]}, ifos={1: straight_ifo([200, 100, 200], [3, 2, 3])})
+        self.vob_durations(1, 200.0, 100.0, 200.0)
+        self.output(disc, 1, 400.0)
+        vob = disc.video_ts / "VTS_01_2.VOB"
+        with stat_failing(lambda p: p == vob, errno.EIO) as fired:
+            result = self.run_convert(disc)
+        self.assertTrue(fired, "the fault never fired")
+        manifest = self.assert_refused_before_encoding(result, disc, "Analysis error", str(vob),
+                                                       "Input/output error")
+        self.assertIn(str(vob), manifest["disc_analysis"]["error"])
+        self.assertEqual(self.temps(disc) + self.partials(disc), [])
+        self.assertFalse(self.mp4(disc, 1).exists())
+
+    def test_video_ts_entries_that_cannot_be_checked_stop_the_analysis(self):
+        disc = self.make_disc({1: [4, 4]}, ifos={1: straight_ifo([200, 400], [4, 4])})
+        with stat_failing(lambda p: p.parent == disc.video_ts, errno.EACCES) as fired:
+            result = self.run_convert(disc)
+        self.assertTrue(fired, "the fault never fired")
+        self.assert_refused_before_encoding(result, disc, "Analysis error", "Permission denied")
+        named = [p for p in disc.video_ts.iterdir() if str(p) in result.error_message]
+        self.assertTrue(named, f"no VIDEO_TS entry named: {result.error_message}")
+
+    def test_a_vob_listed_and_then_not_found_stops_the_analysis(self):
+        # Strict C2 (G4-D2): a listed VOB that is then "not found" means the
+        # inventory cannot be trusted; it is never silently left out
+        disc = self.make_disc({1: [3, 2, 3]})
+        self.vob_durations(1, 200.0, 100.0, 200.0)
+        self.output(disc, 1, 400.0)
+        vob = disc.video_ts / "VTS_01_2.VOB"
+        with stat_failing(lambda p: p == vob, errno.ENOENT) as fired:
+            result = self.run_convert(disc)
+        self.assertTrue(fired, "the fault never fired")
+        self.assert_refused_before_encoding(result, disc, "Analysis error", str(vob), "not found")
+
+    def test_a_volume_that_cannot_be_checked_for_video_ts_fails_the_run(self):
+        # The real ISOMount, attaching two volumes (hdiutil faked at run_cmd
+        # and only recorded): the second's VIDEO_TS cannot be checked, so
+        # the right volume is unknown; never the data volume by default
+        disc = new_disc(self, "JPC_AV_00151")
+        data_volume, video_volume = self.root / "volumes" / "data", self.mounts[disc.iso]
+        data_volume.mkdir(parents=True)
+        (data_volume / "README.TXT").write_text("synthetic data volume\n")
+        plist = plistlib.dumps({"system-entities": [
+            {"mount-point": str(data_volume), "dev-entry": "/dev/disk42s1"},
+            {"mount-point": str(video_volume), "dev-entry": "/dev/disk42s2"}]}).decode()
+        real_run_cmd, hdiutil = mv.run_cmd, []
+
+        def run_cmd(cmd, *args, **kwargs):
+            if cmd[0] == "hdiutil":
+                hdiutil.append([str(c) for c in cmd])
+                return subprocess.CompletedProcess(cmd, 0, plist if cmd[1] == "attach" else "", "")
+            return real_run_cmd(cmd, *args, **kwargs)
+
+        target = video_volume / "VIDEO_TS"
+        with mock.patch.object(mv, "ISOMount", REAL_ISOMOUNT), mock.patch.object(mv, "run_cmd", run_cmd), \
+                stat_failing(lambda p: p == target, errno.EIO) as fired:
+            result = self.run_convert(disc)
+        self.assertTrue(fired, "the fault never fired")
+        self.assert_refused_before_encoding(result, disc, "Analysis error: could not check volume",
+                                            str(video_volume), "Input/output error")
+        self.assertEqual([c[1:3] for c in hdiutil if c[1] == "detach"],
+                         [["detach", str(data_volume)], ["detach", str(video_volume)]])
+
+    def test_vob_sizes_that_cannot_be_read_are_never_left_out(self):
+        # The expected-duration bitrate check sums every content VOB: one
+        # that cannot be read raises (the titleset then fails) - it is never
+        # silently left out of the sum
+        vobs = []
+        for index in (1, 2):
+            vob = self.root / f"VTS_01_{index}.VOB"
+            with open(vob, "wb") as f:
+                f.truncate(4 * SECTOR)
+            vobs.append(vob)
+        with stat_failing(lambda p: p == vobs[1], errno.EIO, ("os.stat", "Path.stat")) as fired:
+            with self.assertRaises(OSError):
+                mv.expected_titleset_duration(vobs, None)
+        self.assertTrue(fired, "the fault never fired")
+
+    # --- N4: the source ISO and the planned outputs ---
+
+    def test_a_source_iso_that_cannot_be_checked_is_an_inspection_error(self):
+        disc = new_disc(self, "JPC_AV_00152")
+        with stat_failing(lambda p: p == disc.iso, errno.EIO) as fired:
+            result = self.run_convert(disc)
+        self.assertTrue(fired, "the fault never fired")
+        self.assert_refused_before_encoding(result, disc, f"Inspection error: could not check ISO {disc.iso}",
+                                            "Input/output error")
+        self.assertEqual(self.mount_objects, [], "the ISO was attached")
+        # Control: a symlink to the ISO is followed and converts
+        link = disc.iso.with_name("JPC_AV_00153.iso")
+        os.symlink(disc.iso, link)
+        self.mounts[link] = self.mounts[disc.iso]
+        linked = types.SimpleNamespace(iso=link, video_ts=disc.video_ts, stem="JPC_AV_00153",
+                                       out=link.parent / "access_JPC_AV_00153")
+        self.output(linked, 1, 600.0)
+        result = self.run_convert(linked)
+        self.assertTrue(result.success, result.error_message)
+
+    def test_an_iso_given_with_i_that_cannot_be_checked_stops_main(self):
+        # main()'s own checks of -i: the path and the error are named (never
+        # "not found", never a traceback) before anything is started or
+        # recorded. Control: a missing ISO is still "not found"
+        disc = new_disc(self, "JPC_AV_00158")
+        folder = self.root / "given"
+        folder.mkdir()
+        inner = folder / "JPC_AV_00159.iso"
+        inner.write_bytes(b"SYNTHETIC ISO PLACEHOLDER")
+        cases = (("ISO, EIO", disc.iso, disc.iso, errno.EIO),
+                 ("ISO, EACCES", disc.iso, disc.iso, errno.EACCES),
+                 ("the ISO in a folder given with -i", folder, inner, errno.EIO))
+        for label, given, target, code in cases:
+            with self.subTest(label):
+                self.lines.clear()
+                with stat_failing(lambda p, t=target: p == t, code) as fired:
+                    try:
+                        status = self.main_exit("-i", str(given))
+                    except OSError as e:
+                        self.fail(f"an inspection error escaped main(): {e!r}")
+                self.assertTrue(fired, "the fault never fired")
+                self.assertEqual(status, 1)
+                errors = [line for line in self.lines if line.startswith("Error: ")]
+                self.assertEqual(len(errors), 1, self.lines)
+                self.assertTrue(errors[0].startswith(f"Error: could not check {target}: "), errors[0])
+                self.assertIn(os.strerror(code), errors[0])
+                self.assertNotIn("not found", errors[0])
+                self.assertEqual(self.mount_objects, [], "the ISO was attached")
+                self.assertEqual(sorted(self.root.rglob("*_manifest.json")), [], "records were written")
+        with self.subTest("control: a missing ISO"):
+            self.lines.clear()
+            missing = self.root / "isos" / "JPC_AV_00160.iso"
+            self.assertEqual(self.main_exit("-i", str(missing)), 1)
+            self.assertIn(f"Error: ISO file not found: {missing}", self.lines)
+
+    def test_an_output_that_cannot_be_checked_fails_before_the_prompt(self):
+        # mv2_canon and the other planned outputs: an existing access copy
+        # is never replaced without the prompt, and nothing escapes
+        targets = (("canonical MP4", (1,), lambda d: self.mp4(d, 1)),
+                   ("canonical log", (1,), lambda d: d.out / f"{d.stem}.mp4.log.txt"),
+                   ("canonical manifest", (1,), lambda d: d.out / f"{d.stem}_access_manifest.json"),
+                   ("second titleset's MP4", (1, 2), lambda d: self.mp4(d, 2)))
+        for n, (label, titlesets, target) in enumerate(targets):
+            with self.subTest(label):
+                disc = self.make_disc({vts: [4] for vts in titlesets}, stem=f"JPC_AV_0016{n}")
+                seeded = self.seed_canonical(disc, vts_list=titlesets)
+                for vts in titlesets:
+                    self.vob_durations(vts, 600.0)
+                    self.output(disc, vts, 600.0)
+                self.answers[:] = ["n"]  # were the prompt shown, it would be declined
+                self.tools.launched.clear()
+                path = target(disc)
+                with stat_failing(lambda p: p == path, errno.EIO) as fired:
+                    result = self.run_convert(disc)
+                self.assertTrue(fired, "the fault never fired")
+                self.assertEqual(self.answers, ["n"], "the overwrite prompt was shown")
+                self.assert_refused_before_encoding(
+                    result, disc, f"Inspection error: could not check planned output {path.name}",
+                    "Input/output error")
+                self.assert_unchanged(seeded)
+
+    # --- N4: after ffmpeg, and at promotion ---
+
+    def test_a_temporary_name_that_cannot_be_checked_is_never_taken_as_free(self):
+        disc = new_disc(self, "JPC_AV_00154")
+        with stat_failing(lambda p: TEMP_NAME.search(p.name) is not None, errno.EIO,
+                          ("os.stat", "Path.stat")) as fired:
+            result = self.run_convert(disc)
+        self.assertTrue(fired, "the fault never fired")
+        title = result.titles[0]
+        self.assertEqual(title.status, "failed")
+        self.assertIn("could not prepare the encode", title.error)
+        self.assertIn("Input/output error", title.error)
+        self.assertEqual(self.tools.launched, [], "ffmpeg was started on a name that could not be checked")
+        self.assertEqual(self.temps(disc), [])
+
+    def test_an_output_that_cannot_be_checked_after_ffmpeg_is_failed_and_located(self):
+        # Observation 12: never recorded as "not created", and the record
+        # names where the output may be
+        disc = new_disc(self, "JPC_AV_00155")
+        armed, real_popen = [], self.tools.popen
+
+        def popen(cmd, **kwargs):
+            process = real_popen(cmd, **kwargs)
+            armed.append(cmd[-1])
+            return process
+
+        with mock.patch.object(subprocess, "Popen", popen), \
+                stat_failing(lambda p: bool(armed) and TEMP_NAME.search(p.name) is not None,
+                             errno.EIO) as fired:
+            result = self.run_convert(disc)
+        self.assertTrue(armed and fired, "the fault never fired")
+        title = result.titles[0]
+        self.assertEqual(title.status, "failed")
+        self.assertIn("Input/output error", title.error)
+        self.assertNotIn("not created", title.error)
+        self.assertTrue(title.location_unverified)
+        temps = self.temps(disc)
+        self.assertEqual([p.read_bytes() for p in temps], [self.encoded_bytes(disc, 1)])
+        self.assertIn(str(temps[0]), title.retention_error)
+        manifest, log_text = self.tokened_manifest(disc, "failed")
+        record = manifest["titlesets"]["outputs"][0]
+        self.assertTrue(record["location_unverified"])
+        self.assertIn(str(temps[0]), record["retention_error"])
+        self.assertFalse(self.mp4(disc, 1).exists())
+        # Control: an unknown location before promotion never touched the
+        # final name, so nothing is named as possibly replaced
+        self.assertIn("Final MP4s:       none promoted or changed by this run\n", log_text)
+        self.assertNotIn("may have been replaced", log_text)
+
+    def test_a_final_name_that_cannot_be_checked_stops_promotion_before_its_rename(self):
+        # G4-D3: title 1 is promoted; title 2's final name then cannot be
+        # checked, so promotion stops before its rename (T-071's stop path)
+        disc = self.make_disc({1: [4], 2: [4]}, stem="JPC_AV_00156")
+        seeded = self.seed_canonical(disc, vts_list=(1, 2))
+        for vts in (1, 2):
+            self.vob_durations(vts, 600.0)
+            self.output(disc, vts, 600.0)
+        title02, real_replace, renamed = self.mp4(disc, 2), os.replace, []
+
+        def replace(src, dst, *args, **kwargs):
+            real_replace(src, dst, *args, **kwargs)
+            if Path(dst) == self.mp4(disc, 1):
+                renamed.append(dst)
+
+        with mock.patch.object(mv.os, "replace", replace), \
+                stat_failing(lambda p: bool(renamed) and p == title02, errno.EIO,
+                             ("os.lstat", "Path.lstat")) as fired:
+            result = self.run_convert(disc)
+        self.assertTrue(renamed and fired, "the fault never fired")
+        self.assertFalse(result.success)
+        self.assertIn(title02.name, result.promotion_error)
+        self.assertIn("Input/output error", result.promotion_error)
+        first, second = result.titles
+        self.assertEqual((first.status, first.promoted_this_run), ("completed", True))
+        self.assertEqual((second.status, second.promoted_this_run, second.retained_as),
+                         ("held", False, "review_copy"))
+        self.assertEqual(title02.read_bytes(), seeded[title02], "title02 was replaced")
+        self.assertEqual(second.retained_path.read_bytes(), self.encoded_bytes(disc, 2))
+        self.assertEqual(result.canonical_files_changed, [self.mp4(disc, 1)])
+        self.assertTrue(any("no longer match" in w for w in result.warnings), result.warnings)
+        manifest, _ = self.tokened_manifest(disc, "failed")
+        self.assertEqual(manifest["conversion_status"]["promotion_error"], result.promotion_error)
+
+    # --- N21 and A1 (T-155) ---
+
+    def test_a_video_ts_without_vob_files_is_a_truthful_skip(self):
+        cases = (("IFO only", {1: straight_ifo([600], [4])}, [], "1 IFO, 0 BUP"),
+                 ("IFO and BUP", {1: straight_ifo([600], [4])}, ["VTS_01_0.BUP"], "1 IFO, 1 BUP"),
+                 ("empty", {}, [], "0 IFO, 0 BUP"))
+        for n, (label, ifos, bups, counts) in enumerate(cases):
+            with self.subTest(label):
+                disc = self.make_disc({}, stem=f"JPC_AV_0017{n}", ifos=ifos)
+                for name in bups:
+                    (disc.video_ts / name).write_bytes(b"SYNTHETIC BUP")
+                self.lines.clear()  # this subTest's console only
+                result = self.run_convert(disc)
+                self.assertTrue(result.success and result.skipped, result.error_message)
+                self.assertEqual(result.skip_reason,
+                                 f"No VOB files found in VIDEO_TS ({counts}); nothing to convert")
+                manifest, log_text = self.tokened_manifest(disc, "skipped")
+                self.assertEqual((manifest["disc_analysis"]["disc_type"],
+                                  manifest["disc_analysis"]["has_video_ts"]),
+                                 ("video_ts_without_vobs", True))
+                self.assertIn("verify the ISO", manifest["disc_analysis"]["recommendation"])
+                self.assertIn(result.skip_reason, log_text)
+                self.assertTrue(any("verify the ISO" in line for line in self.lines))
+                self.assertEqual(self.tools.launched, [])
+                self.assertEqual(self.main_exit("-i", str(disc.iso)), 0)
+
+    def test_a_dvd_audio_skip_says_its_video_ts_has_no_vob_files(self):
+        # N21 with AUDIO_TS (VB.json: still a DVD-Audio skip, whose reason
+        # says the VIDEO_TS has no VOB files). DVD-Video discs often carry
+        # an empty AUDIO_TS, so the "verify the image" guidance is kept too
+        disc = self.make_disc({}, stem="JPC_AV_00175", ifos={1: straight_ifo([600], [4])})
+        (disc.video_ts.parent / "AUDIO_TS").mkdir()
+        result = self.run_convert(disc)
+        self.assertTrue(result.success and result.skipped, result.error_message)
+        self.assertEqual(result.skip_reason,
+                         "DVD-Audio disc (AUDIO_TS; its VIDEO_TS has no VOB files: 1 IFO, 0 BUP)")
+        manifest, log_text = self.tokened_manifest(disc, "skipped")
+        analysis = manifest["disc_analysis"]
+        self.assertEqual((analysis["disc_type"], analysis["has_video_ts"], analysis["has_audio_ts"]),
+                         ("dvd_audio", True, True))
+        for phrase in ("incomplete DVD-Video image", "verify the ISO", "DVD-Audio"):
+            self.assertIn(phrase, analysis["recommendation"])
+        self.assertIn(result.skip_reason, log_text)
+        self.assertTrue(any("verify the ISO" in line for line in self.lines), self.lines)
+        self.assertEqual(self.tools.launched, [])
+
+    def test_a_vob_numbering_gap_is_an_advisory_warning(self):
+        # A1 / MV-12: VTS_01_2.VOB is missing; the outcome does not change
+        disc = self.make_disc({1: [3, 3]}, stem="JPC_AV_00176",
+                              ifos={1: straight_ifo([200, 100, 200], [3, 2, 3])})
+        (disc.video_ts / "VTS_01_2.VOB").rename(disc.video_ts / "VTS_01_3.VOB")
+        self.vob_durations(1, 200.0, 100.0, 200.0)
+        self.output(disc, 1, 400.0)
+        gap = "VTS_01: content VOB numbering has a gap (found 1, 3; missing 2)"
+        result = self.run_convert(disc)
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual([t.status for t in result.titles], ["completed"])
+        self.assertIn(gap, result.warnings)
+        manifest = json.loads((disc.out / f"{disc.stem}_access_manifest.json").read_text())
+        self.assertEqual(manifest["conversion_status"]["overall_status"], "success_with_warnings")
+        self.assertIn(gap, manifest["conversion_status"]["warnings"])
+        self.assertTrue(any(gap in line for line in self.lines))
+
+    # --- healthy controls ---
+
+    def test_control_an_irrelevant_root_entry_does_not_fail_the_analysis(self):
+        # A deliberate narrowing: only VIDEO_TS/AUDIO_TS decide the disc
+        # type, so a root entry that cannot be checked no longer fails it
+        # (it is not checked at all)
+        disc = new_disc(self, "JPC_AV_00177")
+        readme = disc.video_ts.parent / "README.TXT"
+        readme.write_text("synthetic notes\n")
+        with stat_failing(lambda p: p == readme, errno.EIO) as fired:
+            with self.assertRaises(OSError):
+                os.stat(readme)
+            self.assertTrue(fired, "the fault is not live")
+            result = self.run_convert(disc)
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual([t.status for t in result.titles], ["completed"])
+
+    def test_control_other_disc_types_keep_their_reasons(self):
+        cases = (("data disc", "Data disc (no VIDEO_TS folder)"),
+                 ("DVD-Audio only", "DVD-Audio disc (AUDIO_TS only, no VIDEO_TS)"),
+                 ("empty image", "Empty or unreadable disc"),
+                 ("menu-only VIDEO_TS", "Menu-only VIDEO_TS structure (no content VOBs)"))
+        for n, (label, reason) in enumerate(cases):
+            with self.subTest(label):
+                disc = self.make_disc({}, stem=f"JPC_AV_0018{n}")
+                root = disc.video_ts.parent
+                if label == "menu-only VIDEO_TS":
+                    for name in ("VIDEO_TS.VOB", "VTS_01_0.VOB"):
+                        (disc.video_ts / name).write_bytes(b"SYNTHETIC MENU")
+                else:
+                    shutil.rmtree(disc.video_ts)
+                    if label == "data disc":
+                        (root / "photo.jpg").write_bytes(b"SYNTHETIC DATA FILE")
+                    elif label == "DVD-Audio only":
+                        (root / "AUDIO_TS").mkdir()
+                result = self.run_convert(disc)
+                self.assertTrue(result.success and result.skipped, result.error_message)
+                self.assertEqual(result.skip_reason, reason)
+        disc = self.make_disc({1: [4, 4]}, stem="JPC_AV_00189")
+        self.vob_durations(1, 300.0, 300.0)
+        self.output(disc, 1, 600.0)
+        result = self.run_convert(disc)
+        self.assertTrue(result.success, result.error_message)
+        self.assertFalse(any("numbering has a gap" in w for w in result.warnings), result.warnings)
+        manifest = json.loads((disc.out / f"{disc.stem}_access_manifest.json").read_text())
+        self.assertEqual(manifest["conversion_status"]["overall_status"], "success")
+
+
+class InvocationTests(Scenario):
+    """T-155: ffmpeg starts with -nostdin and its standard input on
+    /dev/null (N19, hardening only: no terminal behaviour is claimed or
+    tested), and the command shown is shell-quoted (MV-14). The help gives
+    the T-150/T-151 rules"""
+
+    def ffmpeg_argv(self):
+        encodes = [c for c in self.tools.calls if c[0] == "ffmpeg" and "-i" in c]
+        self.assertEqual(len(encodes), 1, encodes)
+        return encodes[0]
+
+    def test_ffmpeg_takes_no_terminal_input(self):
+        disc = new_disc(self, "JPC_AV_00191")
+        result = self.convert(disc)
+        self.assertTrue(result.success, result.error_message)
+        kwargs = self.tools.popen_kwargs[0]
+        self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
+        self.assertIs(kwargs.get("stdout"), subprocess.DEVNULL)
+        argv = self.ffmpeg_argv()
+        self.assertIn("-nostdin", argv)
+        self.assertLess(argv.index("-nostdin"), argv.index("-i"))
+
+    def test_the_shown_ffmpeg_command_is_quoted(self):
+        disc = new_disc(self, "JPC AV 00192")
+        result = self.convert(disc)
+        self.assertTrue(result.success, result.error_message)
+        shown = [line[len("Command: "):] for line in self.lines if line.startswith("Command: ")]
+        self.assertEqual(len(shown), 1, shown)
+        self.assertEqual(shlex.split(shown[0]), self.ffmpeg_argv())
+
+    def test_help_gives_the_inspection_and_batch_rules(self):
+        shown = io.StringIO()
+        with contextlib.redirect_stdout(shown):
+            mv.print_help()
+        text = " ".join(shown.getvalue().split())
+        for phrase in ('any error other than "no such file"', "VIDEO_TS without VOB files:",
+                       "a batch search that was incomplete or refused an ISO",
+                       "AppleDouble ._*.iso", "*_attempt-*.iso",
+                       "Symlinked folders inside the batch folder are not followed (they are "
+                       "listed); an .iso symlink to a regular file is converted",
+                       "the ISOs found are still converted, and the batch exits 1 unless a Ctrl-C "
+                       "stops it", "130 a Ctrl-C stopped the run or batch"):
+            self.assertIn(phrase, text)
+        self.assertNotIn("Symlinks inside the batch folder are not followed", text)
+        self.assertIn("a batch that has started converting starts no further ISO and shows its "
+                      "summary; during the search for ISOs it stops the batch with no summary",
+                      text)
+
+    def operator_prompt(self, args, answer):
+        """main() without --operator, the operator-name prompt answered by
+        answer (an exception it raises); returns the exit status"""
+        with mock.patch.object(sys, "argv", ["makeiso-video.py", *args]), \
+                mock.patch("builtins.input", side_effect=answer) as prompt:
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    mv.main()
+            except KeyboardInterrupt:
+                self.fail("Ctrl-C escaped main()")
+        self.assertEqual(prompt.call_count, 1, "the operator prompt was not shown once")
+        return caught.exception.code
+
+    def test_ctrl_c_at_the_operator_prompt_exits_130_with_nothing_started(self):
+        # The adopted rule: a Ctrl-C that stops a run exits 130. End of
+        # input there still exits 1: nothing can start without an operator
+        disc = new_disc(self, "JPC_AV_00196")
+        for label, args, answer, status in (
+                ("Ctrl-C, single ISO", ("-i", str(disc.iso)), KeyboardInterrupt, 130),
+                ("Ctrl-C, batch", ("--batch", str(self.root / "isos")), KeyboardInterrupt, 130),
+                ("end of input, batch", ("--batch", str(self.root / "isos")), EOFError, 1)):
+            with self.subTest(label):
+                self.lines.clear()
+                self.assertEqual(self.operator_prompt(args, answer), status)
+                self.assertEqual((self.tools.launched, self.mount_objects), ([], []))
+                self.assertFalse(disc.out.exists(), "records were written")
+                self.assertFalse(any("Batch" in line for line in self.lines), "the batch started")
+
+    def interrupting_enumerate(self, after):
+        """enumerate for process_batch's loop over the ISOs only: a Ctrl-C as
+        the loop moves on once `after` ISOs were handed out (the boundary
+        between ISOs); every other call is the builtin. Yields the fired list"""
+        code, real, fired = mv.process_batch.__code__, enumerate, []
+
+        def patched(iterable, start=0):
+            if sys._getframe(1).f_code is not code:
+                return real(iterable, start)
+
+            def items():
+                for n, item in real(iterable, start):
+                    if n > after:
+                        break
+                    yield n, item
+                fired.append(after)
+                raise KeyboardInterrupt
+
+            return items()
+
+        return mock.patch.object(mv, "enumerate", patched, create=True), fired
+
+    def test_a_ctrl_c_between_isos_counts_the_rest_as_not_started(self):
+        discs = [new_disc(self, f"JPC_AV_0019{n}") for n in (7, 8, 9)]
+        patch, fired = self.interrupting_enumerate(after=1)
+        with patch:
+            try:
+                status = self.main_exit("--batch", str(self.root / "isos"))
+            except KeyboardInterrupt:
+                self.fail("Ctrl-C escaped main()")
+        self.assertTrue(fired, "the Ctrl-C never came")
+        self.assertEqual(status, 130)
+        self.assertEqual(self.tools.launched, [self.mp4(discs[0], 1).name])
+        self.assertIn(f"Interrupted by operator (Ctrl-C) before {discs[1].stem}.iso started "
+                      f"(1 of 3 processed); 2 ISO(s) not started", self.lines)
+
+    def test_a_ctrl_c_after_the_last_iso_counts_none_as_not_started(self):
+        discs = [new_disc(self, f"JPC_AV_0020{n}") for n in (1, 2)]
+        patch, fired = self.interrupting_enumerate(after=2)
+        with patch:
+            try:
+                status = self.main_exit("--batch", str(self.root / "isos"))
+            except KeyboardInterrupt:
+                self.fail("Ctrl-C escaped main()")
+        self.assertTrue(fired, "the Ctrl-C never came")
+        self.assertEqual(status, 130)
+        self.assertEqual(self.tools.launched, [self.mp4(d, 1).name for d in discs])
+        self.assertIn("Interrupted by operator (Ctrl-C) at the end of the batch (2 of 2); "
+                      "0 ISO(s) not started", self.lines)
+
+
 class GuardTests(unittest.TestCase):
     def test_only_tripwires_on_path(self):
         self.assertEqual(os.environ["PATH"], str(TRIPWIRE_DIR))
@@ -2668,4 +4835,6 @@ class GuardTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--sigint-child":
+        sys.exit(_child_main(sys.argv[2], Path(sys.argv[3])))
     unittest.main()
